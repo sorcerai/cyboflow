@@ -56,6 +56,8 @@ export const ALL_PANEL_LANES = [
   'codex-pty',
   'omp-sdk',
   'omp-pty',
+  'pi-sdk',
+  'pi-pty',
 ] as const;
 
 export type PanelLane = (typeof ALL_PANEL_LANES)[number];
@@ -72,6 +74,7 @@ const PROVIDER_LANES: Readonly<
   claude: { sdk: 'claude-sdk', interactive: 'claude-interactive' },
   codex: { sdk: 'codex-sdk', interactive: 'codex-pty' },
   omp: { sdk: 'omp-sdk', interactive: 'omp-pty' },
+  pi: { sdk: 'pi-sdk', interactive: 'pi-pty' },
 };
 
 /** The lanes served by a PTY manager — each provider's interactive lane. */
