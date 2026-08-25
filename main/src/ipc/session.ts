@@ -64,6 +64,7 @@ import {
   QUICK_CODEX_PTY_BRIEFING,
   QUICK_CODEX_SDK_BRIEFING,
   QUICK_OMP_PTY_BRIEFING,
+  QUICK_PI_PTY_BRIEFING,
 } from './quickSessionBriefings';
 import { relayOrSpawnPtyPanel } from './ptyPanelDispatch';
 import { agentProviderDisabledMessage, assertAgentProviderAllowed } from '../services/agentProviderGuard';
@@ -326,10 +327,12 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     codexPtyManager, // Codex PTY quick-session runtime
     ompSdkManager, // Structured OMP RPC quick-session runtime
     ompPtyManager, // OMP PTY quick-session runtime
+    piPtyManager, // Pi PTY quick-session runtime
     killLiveSession, // hard-kill seam for a dismissed PTY quick session's REPL
     registerLivePanel, // at-spawn runId→panelId seed for the facade's relay translation
     registerCodexPtyPanel, // at-spawn runId→panelId seed for Codex PTY quick sessions
     registerOmpPtyPanel, // the OMP twin of registerCodexPtyPanel
+    registerPiPtyPanel, // the Pi twin of registerOmpPtyPanel
     gitStatusManager,
     gitDiffManager, // git-derived session file stats for sessions:get-statistics
     archiveProgressManager,
@@ -793,6 +796,28 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         briefing: QUICK_OMP_PTY_BRIEFING,
       },
     ],
+    [
+      'pi-pty',
+      {
+        label: AGENT_PROVIDER_LABELS.pi,
+        isPanelRunning: (panelId) => piPtyManager.isPanelRunning(panelId),
+        relayUserTurn: (panelId, input) => piPtyManager.relayUserTurn(panelId, input),
+        registerPanel: registerPiPtyPanel,
+        // pi's TUI takes no per-turn thinking flag on this lane (the level is
+        // spawn-baked via --thinking only), so reasoningEffort is not forwarded.
+        startPanel: (o) =>
+          piPtyManager.startPanel(
+            o.panelId,
+            o.sessionId,
+            o.worktreePath,
+            o.prompt,
+            o.permissionMode,
+            o.model,
+            o.runId,
+          ),
+        briefing: QUICK_PI_PTY_BRIEFING,
+      },
+    ],
   ]);
 
   /**
@@ -812,6 +837,8 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         return ompSdkManager;
       case 'omp-pty':
         return ompPtyManager;
+      case 'pi-pty':
+        return piPtyManager;
       default:
         return undefined;
     }
@@ -841,6 +868,7 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
   for (const [ptyLane, manager] of [
     ['codex-pty', codexPtyManager],
     ['omp-pty', ompPtyManager],
+    ['pi-pty', piPtyManager],
   ] as const) {
     manager?.on?.('exit', (payload: { panelId?: string; sessionId?: string; exitCode?: number }) => {
       handlePtyLaneExit(ptyLane, payload);
