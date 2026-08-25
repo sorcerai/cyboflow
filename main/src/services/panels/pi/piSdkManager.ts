@@ -141,7 +141,13 @@ export class PiSdkManager extends AbstractCliManager {
     // Deterministic per-panel pi session id: `--session-id` creates it on the
     // first turn and RESUMES it on every later turn.
     this.turns.set(panelId, {
-      piSessionId: `cyboflow-${randomUUID()}`,
+      // Pinned to `<cyboflow session>-<panel>`: BOTH halves are restart-
+      // stable (tool_panels.id is a persisted PK; sessions.active_panel_id
+      // carries it), so each panel gets its own pi conversation that survives
+      // relaunch. Random ids made resume die whenever the in-memory map was
+      // lost; bare-session pins would cross-wire two panels onto one
+      // conversation.
+      piSessionId: `cyboflow-${sessionId}-${panelId}`,
       model,
       cwd: worktreePath,
       child: null,
@@ -161,13 +167,16 @@ export class PiSdkManager extends AbstractCliManager {
     prompt: string,
     _conversationHistory: ConversationMessage[],
     _permissionMode?: 'approve' | 'ignore',
-    _model?: string,
+    model?: string,
   ): Promise<void> {
     let state = this.turns.get(panelId);
     if (!state) {
-      state = { piSessionId: `cyboflow-${randomUUID()}`, cwd: worktreePath, child: null };
+      // Post-restart path: rehydrate from the DETERMINISTIC pin instead of
+      // minting a fresh id (which silently restarted the conversation).
+      state = { piSessionId: `cyboflow-${sessionId}-${panelId}`, cwd: worktreePath, child: null };
       this.turns.set(panelId, state);
     }
+    if (model && model.trim().length > 0) state.model = model;
     await this.runTurn(panelId, sessionId, worktreePath, prompt, undefined);
   }
 
@@ -193,7 +202,8 @@ export class PiSdkManager extends AbstractCliManager {
     const prior = this.turns.get(panelId);
     await this.stopPanel(panelId);
     this.turns.set(panelId, {
-      piSessionId: prior?.piSessionId ?? `cyboflow-${randomUUID()}`,
+      // Deterministic pin survives even a lost in-memory record.
+      piSessionId: prior?.piSessionId ?? `cyboflow-${sessionId}-${panelId}`,
       model: prior?.model,
       cwd: worktreePath,
       child: null,
@@ -369,7 +379,7 @@ export class PiSdkManager extends AbstractCliManager {
     let state = this.turns.get(panelId);
     if (!state) {
       state = {
-        piSessionId: `cyboflow-${randomUUID()}`,
+        piSessionId: `cyboflow-${sessionId}-${panelId}`,
         model: typeof options.model === 'string' ? options.model : undefined,
         cwd: options.worktreePath ?? process.cwd(),
         child: null,

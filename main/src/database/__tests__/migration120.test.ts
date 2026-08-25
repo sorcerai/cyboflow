@@ -1,5 +1,5 @@
 /**
- * Migration 120_widen_agent_runtime_pi.sql — admitting 'omp-fleet'.
+ * Migration 120_widen_agent_runtime_pi.sql — admitting the pi runtimes.
  *
  * The regression this file exists to prevent: an earlier attempt shipped the
  * widening as a NEW file numbered 101 (a gap below the already-released 103)
@@ -50,7 +50,7 @@ afterEach(() => {
 });
 
 /**
- * A migrations dir holding every real migration EXCEPT 119 — i.e. a shipped
+ * A migrations dir holding every real migration EXCEPT 120 — i.e. a shipped
  * 0.2.3 install, with 103 and 104 already applied. This is the distinction that
  * matters: excluding everything at-or-above the new file's number (as the 101
  * attempt's own test did) fabricates a pre-state that no user is ever in.
