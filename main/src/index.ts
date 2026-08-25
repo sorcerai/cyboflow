@@ -60,10 +60,12 @@ import {
   isCodexSdkManagerLike,
   isOmpPtyManagerLike,
   isPiPtyManagerLike,
+  isPiSdkManagerLike,
   isOmpSdkManagerLike,
   type CodexPtyManagerLike,
   type OmpPtyManagerLike,
   type PiPtyManagerLike,
+  type PiSdkManagerLike,
 } from './services/cliManagerFactory';
 import { AbstractCliManager } from './services/panels/cli/AbstractCliManager';
 import { panelManager } from './services/panelManager';
@@ -585,6 +587,7 @@ let defaultCliManager: AbstractCliManager;
 let codexPtyManager: CodexPtyManagerLike;
 let ompPtyManager: OmpPtyManagerLike;
 let piPtyManager: PiPtyManagerLike;
+let piSdkManager: PiSdkManagerLike;
 let gitDiffManager: GitDiffManager;
 let gitStatusManager: GitStatusManager;
 let executionTracker: ExecutionTracker;
@@ -1673,6 +1676,17 @@ async function initializeServices(): Promise<boolean> {
     throw new Error('[Main] cliManagerFactory returned a manager without the Pi PTY seams for pi-pty');
   }
   piPtyManager = createdPiPtyManager;
+
+  const createdPiSdkManager = await cliManagerFactory.createManager('pi-sdk', {
+    sessionManager,
+    logger,
+    configManager,
+    skipValidation: true,
+  });
+  if (!isPiSdkManagerLike(createdPiSdkManager)) {
+    throw new Error('[Main] cliManagerFactory returned a manager without the Pi SDK seams for pi-sdk');
+  }
+  piSdkManager = createdPiSdkManager;
   gitDiffManager = new GitDiffManager(logger);
   gitStatusManager = new GitStatusManager(sessionManager, worktreeManager, gitDiffManager, logger);
   executionTracker = new ExecutionTracker(sessionManager, gitDiffManager);
@@ -3104,6 +3118,7 @@ async function initializeServices(): Promise<boolean> {
     { lane: 'omp-sdk', manager: createdOmpSdkManager },
     { lane: 'omp-pty', manager: ompPtyManager },
     { lane: 'pi-pty', manager: piPtyManager },
+    { lane: 'pi-sdk', manager: piSdkManager },
   ];
   const managerByLane = new Map<PanelLane, AbstractCliManager>(
     laneManagers.map(({ lane, manager }) => [lane, manager]),
@@ -4096,6 +4111,7 @@ async function initializeServices(): Promise<boolean> {
     ompSessionManager,
     ompSdkManager: createdOmpSdkManager,
     ompPtyManager,
+    piSdkManager: createdPiSdkManager,
     piPtyManager,
     claudeModelCatalogService: new ClaudeModelCatalogService(cyboflowLogger),
     // Live-session close-out seams for quick sessions (IDEA-030): route the

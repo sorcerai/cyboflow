@@ -328,6 +328,7 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     ompSdkManager, // Structured OMP RPC quick-session runtime
     ompPtyManager, // OMP PTY quick-session runtime
     piPtyManager, // Pi PTY quick-session runtime
+    piSdkManager, // Pi structured runtime (quick sessions + workflow runs)
     killLiveSession, // hard-kill seam for a dismissed PTY quick session's REPL
     registerLivePanel, // at-spawn runId→panelId seed for the facade's relay translation
     registerCodexPtyPanel, // at-spawn runId→panelId seed for Codex PTY quick sessions
@@ -839,6 +840,8 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         return ompPtyManager;
       case 'pi-pty':
         return piPtyManager;
+      case 'pi-sdk':
+        return piSdkManager;
       default:
         return undefined;
     }

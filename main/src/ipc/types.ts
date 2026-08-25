@@ -18,6 +18,7 @@ import type {
   CodexSdkManagerLike,
   OmpPtyManagerLike,
   PiPtyManagerLike,
+  PiSdkManagerLike,
   OmpSdkManagerLike,
 } from '../services/cliManagerFactory';
 import type { AbstractCliManager } from '../services/panels/cli/AbstractCliManager';
@@ -63,6 +64,8 @@ export interface AppServices {
   ompPtyManager: OmpPtyManagerLike;
   /** Interactive Pi PTY runtime for quick sessions only. Seam-typed — see above. */
   piPtyManager: PiPtyManagerLike;
+  /** Structured pi runtime (turn-spawn, --session-id resume) for quick sessions AND workflow runs. */
+  piSdkManager: PiSdkManagerLike;
   /**
    * OMP fleet runtime (Phase 4 coexistence, omp-phase4-coexistence-adr.md). A
    * SIBLING to the process managers — a remote worker supervised over the Prime

@@ -10,6 +10,7 @@ import { CodexSdkManager } from './panels/codex/codexSdkManager';
 import { OmpPtyManager } from './panels/omp/ompPtyManager';
 import { OmpSdkManager } from './panels/omp/ompSdkManager';
 import { PiPtyManager } from './panels/pi/piPtyManager';
+import { PiSdkManager } from './panels/pi/piSdkManager';
 import {
   CliToolRegistry,
   CliToolDefinition,
@@ -114,6 +115,9 @@ type OmpPtySeams = Pick<OmpPtyManager, 'startPanel' | 'relayUserTurn'>;
 /** The Pi PTY seams — identical shape to the OMP/Codex PTY pair. */
 type PiPtySeams = Pick<PiPtyManager, 'startPanel' | 'relayUserTurn'>;
 
+/** The Pi SDK seams: the lifecycle is all on AbstractCliManager in v1. */
+type PiSdkSeams = Record<string, never>;
+
 /** What the app needs of an OMP RPC manager — the CLI base plus its seams. */
 export type OmpSdkManagerLike = AbstractCliManager & OmpSdkSeams;
 
@@ -122,10 +126,21 @@ export type OmpPtyManagerLike = AbstractCliManager & OmpPtySeams;
 
 export type PiPtyManagerLike = AbstractCliManager & PiPtySeams;
 
+export type PiSdkManagerLike = AbstractCliManager & PiSdkSeams;
+
 /** Does this manager expose the Pi PTY seams? */
 export function isPiPtyManagerLike(manager: AbstractCliManager): manager is PiPtyManagerLike {
   const seams = manager as Partial<PiPtySeams>;
   return typeof seams.startPanel === 'function' && typeof seams.relayUserTurn === 'function';
+}
+
+/**
+ * Every AbstractCliManager instance satisfies PiSdkSeams (it is empty), but the
+ * guard keeps call sites symmetric with the other lanes and future-proof.
+ */
+export function isPiSdkManagerLike(manager: AbstractCliManager): manager is PiSdkManagerLike {
+  void manager;
+  return true;
 }
 /** Does this manager expose the OMP SDK seams? */
 export function isOmpSdkManagerLike(manager: AbstractCliManager): manager is OmpSdkManagerLike {
@@ -420,6 +435,7 @@ export class CliManagerFactory {
     // Priority below OMP's so getDefaultTool() ordering is unchanged by its
     // arrival; the provider toggle gates reachability anyway.
     this.registerPiPtyTool();
+    this.registerPiSdkTool();
 
     // this.registerAiderTool();
     // this.registerContinueTool();
@@ -808,6 +824,59 @@ export class CliManagerFactory {
 
     this.registry.registerTool(piPtyDefinition, {
       priority: 25,
+      validateOnRegister: false,
+    });
+  }
+
+
+  private registerPiSdkTool(): void {
+    const piSdkManagerFactory: ManagerFactoryFunction = (
+      sessionManager: unknown,
+      logger?: Logger,
+      configManager?: ConfigManager,
+    ) => {
+      return new PiSdkManager(
+        sessionManager as SessionManager,
+        logger,
+        configManager,
+      );
+    };
+
+    const piSdkDefinition: CliToolDefinition = {
+      id: 'pi-sdk',
+      name: 'Pi',
+      description: 'pi (@earendil-works/pi-coding-agent) structured json-events runtime (turn-spawn, --session-id resume)',
+      version: '1.0.0',
+      capabilities: {
+        // Resume is deterministic (--session-id), so this lane genuinely
+        // supports picking a conversation back up.
+        supportsResume: true,
+        supportsMultipleModels: true,
+        supportsPermissions: false,
+        supportsFileOperations: true,
+        supportsGitIntegration: true,
+        supportsSystemPrompts: false,
+        supportsStructuredOutput: true,
+        outputFormats: [
+          CLI_OUTPUT_FORMATS.JSON,
+          CLI_OUTPUT_FORMATS.TEXT,
+        ],
+        supportedPanelTypes: ['claude'],
+      },
+      config: {
+        requiredEnvVars: [],
+        optionalEnvVars: [],
+        requiredConfigKeys: [],
+        optionalConfigKeys: [],
+        defaultExecutable: 'pi',
+        alternativeExecutables: ['pi'],
+        minimumVersion: undefined,
+      },
+      managerFactory: piSdkManagerFactory,
+    };
+
+    this.registry.registerTool(piSdkDefinition, {
+      priority: 26,
       validateOnRegister: false,
     });
   }
