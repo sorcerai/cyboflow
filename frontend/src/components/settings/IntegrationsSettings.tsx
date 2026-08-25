@@ -381,10 +381,14 @@ export function IntegrationsSettings(): React.JSX.Element {
   // unlike claude/codex — isAgentProviderEnabled already applies that per-
   // provider default, so this reads correctly with no special-casing here.
   const ompEnabled = isAgentProviderEnabled(providerAccess, 'omp');
+  // Pi floors to DISABLED on an absent key, same as omp — the registry's
+  // defaultEnabled policy is applied inside isAgentProviderEnabled.
+  const piEnabled = isAgentProviderEnabled(providerAccess, 'pi');
   const enabledByProvider: Record<AgentProvider, boolean> = {
     claude: claudeEnabled,
     codex: codexEnabled,
     omp: ompEnabled,
+    pi: piEnabled,
   };
   const [savingProvider, setSavingProvider] = useState<AgentProvider | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);

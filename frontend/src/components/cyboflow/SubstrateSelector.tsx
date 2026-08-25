@@ -111,10 +111,21 @@ const RUNTIME_SCOPE_SUFFIXES: Partial<Record<LaunchAgentRuntime, string>> = {
   'claude-sdk': ' (default)',
   'codex-pty': ' — quick sessions only',
   'omp-fleet': ' — quick sessions only',
+  'pi-pty': ' — quick sessions only',
 };
 
 const RUNTIME_OPTIONS: readonly { runtime: LaunchAgentRuntime; label: string }[] = (
-  ['claude-sdk', 'claude-interactive', 'codex-sdk', 'codex-pty', 'omp-sdk', 'omp-pty', 'omp-fleet'] as const
+  [
+    'claude-sdk',
+    'claude-interactive',
+    'codex-sdk',
+    'codex-pty',
+    'omp-sdk',
+    'omp-pty',
+    'omp-fleet',
+    'pi-sdk',
+    'pi-pty',
+  ] as const
 ).map((runtime) => ({
   runtime,
   label: `${AGENT_RUNTIME_LABELS[runtime]}${RUNTIME_SCOPE_SUFFIXES[runtime] ?? ''}`,

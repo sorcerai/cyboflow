@@ -136,3 +136,6 @@ frontend/dist-harness/
 
 # Perf profiling artifacts (scripts/profile-electron.mjs)
 .perf/
+
+# Local review/build worktrees (git worktree dirs live here)
+/.worktrees/
