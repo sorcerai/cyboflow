@@ -5,14 +5,12 @@
  * the USER's binary, so a hard equality pin would rot immediately.
  *
  *   - PI_MIN_SUPPORTED_VERSION — hard floor; below it probes report
- *     'unavailable' because behavior this integration depends on may be absent
- *     (`--mode json` event stream incl. session header v3, `--session <id>`
- *     resume, extension `tool_call` blocking).
+ *     'unavailable' because behavior this integration depends on may be
+ *     absent: `--mode json` (session-header v3 event stream),
+ *     `--session-id <id>` create-or-resume-by-exact-id (verified live: turn 2
+ *     answered from turn-1 context under the pinned id), and the extension
+ *     `tool_call` blocking hook.
  *   - PI_TESTED_VERSION — newest verified version; newer binaries are accepted
- *     with a one-time warning, never refused.
- *
- * 0.84.2 is the install this integration was written and smoked against
- * (docs/json.md session-header version 3 matches).
  */
 
 /** Hard floor: a probed pi binary below this version is refused. */
