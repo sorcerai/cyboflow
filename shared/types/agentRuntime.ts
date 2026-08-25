@@ -103,6 +103,13 @@ export const WORKFLOW_LAUNCHABLE_RUNTIMES = [
   // tool results reach Cyboflow the same way the SDK lanes of claude/codex/omp
   // do, so workflows may deploy on it. pi-pty stays excluded for the same
   // keystroke-TUI reason as codex-pty/omp-pty.
+  //
+  // ACCEPTED LIMITATION, headless gating: pi has no sandbox and no
+  // approval-mode surface, so a workflow step on pi-sdk executes tools
+  // ungated. The extension-based tool_call bridge that will carry cyboflow's
+  // permission router is designed but not built; until it ships, treat a
+  // pi-sdk workflow step like an attended terminal — run it on a worktree
+  // you are watching.
   'pi-sdk',
 ] as const;
 
