@@ -1,16 +1,28 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
 import type { Writable, Readable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { AgentProvider } from '../../../../../shared/types/agentRuntime';
 import type { ConversationMessage } from '../../../database/models';
 import type { PermissionMode } from '../../../../../shared/types/workflows';
+import { isPermissionMode } from '../../../../../shared/types/workflows';
 import type { CliSpawnOutcome } from '../../../../../shared/types/cliPanels';
 import type { ClaudeSpawnerOptions } from '../../../orchestrator/runExecutor';
 import { getShellPath, findExecutableInPath } from '../../../utils/shellPath';
 import { AbstractCliManager } from '../cli/AbstractCliManager';
 import { probeCliVersion, type CliVersionProbeResult } from '../cli/cliVersionProbe';
 import { evaluatePiVersionPolicy, PI_MIN_SUPPORTED_VERSION, PI_TESTED_VERSION } from './piVersions';
+import {
+  PI_GATE_ENV_KEYS,
+  PI_GATE_EXTENSION_SOURCE,
+  piGateModeForMode,
+} from './piGateExtension';
 import { assertPiRequiredSpawnFlags } from './piPtyManager';
+
+/** The gate mode stashed per turn; 'gated' is the fail-closed default. */
+type PiGateModeLike = 'dontAsk' | 'gated';
 
 interface PiSdkSpawnOptions {
   panelId: string;
@@ -24,6 +36,7 @@ interface PiSdkSpawnOptions {
 }
 
 interface PiTurnState {
+  gateMode: PiGateModeLike;
   /** The pi-side session id WE chose (`--session-id` creates-if-missing), so
    *  resume across turns is deterministic instead of most-recent-wins. */
   piSessionId: string;
@@ -136,7 +149,7 @@ export class PiSdkManager extends AbstractCliManager {
     sessionId: string,
     worktreePath: string,
     prompt: string,
-    _permissionMode?: 'approve' | 'ignore',
+    permissionMode?: 'approve' | 'ignore',
     model?: string,
     runId?: string,
   ): Promise<void> {
@@ -153,7 +166,9 @@ export class PiSdkManager extends AbstractCliManager {
       model,
       cwd: worktreePath,
       child: null,
+      gateMode: this.resolveGateMode(sessionId, permissionMode),
     });
+    this.ensureGateFile();
     await this.runTurn(panelId, sessionId, worktreePath, prompt, runId);
   }
 
@@ -168,16 +183,22 @@ export class PiSdkManager extends AbstractCliManager {
     worktreePath: string,
     prompt: string,
     _conversationHistory: ConversationMessage[],
-    _permissionMode?: 'approve' | 'ignore',
+    permissionMode?: 'approve' | 'ignore',
     model?: string,
   ): Promise<void> {
     let state = this.turns.get(panelId);
     if (!state) {
       // Post-restart path: rehydrate from the DETERMINISTIC pin instead of
       // minting a fresh id (which silently restarted the conversation).
-      state = { piSessionId: `cyboflow-${sessionId}-${panelId}`, cwd: worktreePath, child: null };
+      state = {
+        piSessionId: `cyboflow-${sessionId}-${panelId}`,
+        cwd: worktreePath,
+        child: null,
+        gateMode: 'gated',
+      };
       this.turns.set(panelId, state);
     }
+    state.gateMode = this.resolveGateMode(sessionId, permissionMode);
     if (model && model.trim().length > 0) state.model = model;
     await this.runTurn(panelId, sessionId, worktreePath, prompt, undefined);
   }
@@ -212,6 +233,7 @@ export class PiSdkManager extends AbstractCliManager {
       model: prior?.model,
       cwd: worktreePath,
       child: null,
+      gateMode: prior?.gateMode ?? 'gated',
     });
     await this.runTurn(panelId, sessionId, worktreePath, initialPrompt, undefined);
   }
@@ -236,6 +258,9 @@ export class PiSdkManager extends AbstractCliManager {
       '--mode', 'json',
       '--session-id', state.piSessionId,
       '--no-extensions', '--no-skills',
+      // The tool-call gate rides as an EXPLICIT extension: --no-extensions
+      // disables DISCOVERY only, explicit -e paths still load (pi --help).
+      '-e', this.ensureGateFile(),
     ];
     if (state.model && state.model.trim().length > 0) {
       args.push('--model', state.model);
@@ -261,7 +286,11 @@ export class PiSdkManager extends AbstractCliManager {
         args,
         {
           cwd: worktreePath,
-          env: { ...process.env, PATH: getShellPath() },
+          env: {
+            ...process.env,
+            PATH: getShellPath(),
+            [PI_GATE_ENV_KEYS.mode]: state.gateMode,
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
         },
       );
@@ -417,6 +446,9 @@ export class PiSdkManager extends AbstractCliManager {
         model: typeof options.model === 'string' ? options.model : undefined,
         cwd: options.worktreePath ?? process.cwd(),
         child: null,
+        // Workflow steps are HEADLESS: no TUI to approve in, so the fail-
+        // closed answer is 'gated' regardless of any run-level mode snapshot.
+        gateMode: 'gated',
       };
       this.turns.set(panelId, state);
     } else {
@@ -440,6 +472,7 @@ export class PiSdkManager extends AbstractCliManager {
     const child = this.turns.get(panelId)?.child;
     return child !== null && child !== undefined && !child.killed;
   }
+
 
   // ── AbstractCliManager abstract members ────────────────────────────────
   // The turn-spawn lane never drives the PTY argv machinery, but the base
@@ -470,5 +503,32 @@ export class PiSdkManager extends AbstractCliManager {
 
   protected async cleanupCliResources(sessionId: string): Promise<void> {
     void sessionId;
+  }
+
+  /** 'dontAsk' only when the session itself recorded it; everything else gated. */
+  private resolveGateMode(sessionId: string, legacyPermissionMode?: 'approve' | 'ignore'): PiGateModeLike {
+    if (legacyPermissionMode === 'ignore') return 'dontAsk';
+    const stored = this.sessionManager.getDbSession(sessionId)?.agent_permission_mode;
+    if (isPermissionMode(stored)) return piGateModeForMode(stored);
+    return this.configManager?.getDefaultAgentPermissionMode() === 'dontAsk'
+      ? 'dontAsk'
+      : 'gated';
+  }
+
+  private gateFilePathCached: string | null = null;
+
+  /**
+   * Write the gate extension once per manager and return its path. Idempotent:
+   * rewritten only when the embedded source changes, so concurrent spawns share
+   * one file and a version bump lands on the next boot.
+   */
+  private ensureGateFile(): string {
+    if (this.gateFilePathCached) return this.gateFilePathCached;
+    const dir = path.join(os.homedir(), '.cyboflow');
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, 'pi-gate.mjs');
+    fs.writeFileSync(filePath, PI_GATE_EXTENSION_SOURCE, { mode: 0o600 });
+    this.gateFilePathCached = filePath;
+    return filePath;
   }
 }
