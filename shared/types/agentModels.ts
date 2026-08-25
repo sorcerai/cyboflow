@@ -194,6 +194,22 @@ export const AGENT_MODEL_FAMILY_PREDICATES: Readonly<
   // If pi ever admits bare ids this becomes its own function.
   pi: isOmpModelFamily,
 };
+/**
+ * Families that SHARE a shape are non-competing: omp and pi both use
+ * `<vendor>/<model>`, so a slashed id claimed by one must not be dropped
+ * because the other also claims it. Without this pair, adding pi made
+ * `normalizeAgentModelSelection('omp', 'anthropic/x')` return undefined.
+ */
+const COMPATIBLE_FAMILIES: ReadonlyArray<readonly [AgentProvider, AgentProvider]> = [
+  ['omp', 'pi'],
+];
+
+function familiesCompatible(a: AgentProvider, b: AgentProvider): boolean {
+  return COMPATIBLE_FAMILIES.some(
+    ([x, y]) => (a === x && b === y) || (a === y && b === x),
+  );
+}
+
 
 /**
  * Normalize a persisted picker value against the provider that owns it.
@@ -220,6 +236,7 @@ export function normalizeAgentModelSelection(
 
   for (const other of AGENT_PROVIDERS) {
     if (other === provider) continue;
+    if (familiesCompatible(provider, other)) continue;
     if (AGENT_MODEL_FAMILY_PREDICATES[other](key)) return undefined;
   }
   return value;
