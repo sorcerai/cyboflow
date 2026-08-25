@@ -37,6 +37,52 @@ export interface Approval {
   createdAt: string;
   /** Current lifecycle state of the approval gate. */
   status: 'pending' | 'approved' | 'rejected' | 'expired';
+  /**
+   * The name of the session the asking agent is running in, or null when the
+   * run is not session-hosted (or the schema predates the link).
+   *
+   * WHY THIS EXISTS SEPARATELY FROM {@link workflowName}: every quick chat
+   * session shares the sentinel workflow `__quick__`, so `workflowName` on a
+   * chat approval is a constant, not an identity. A live smoke on 2026-08-20
+   * ended with a queue of cards that all read `__quick__` and were therefore
+   * mutually indistinguishable — the human could not tell which agent was
+   * asking, only that something was.
+   *
+   * Derived read-side by joining the run's session; there is no column on
+   * `approvals` and nothing new is written at approval time.
+   */
+  sessionName: string | null;
+  /**
+   * Which provider is asking (`claude` / `codex` / `omp`), or null when the run
+   * predates the provider axis.
+   *
+   * A provider is not a full attribution — it cannot separate two concurrent
+   * OMP sessions, and it CANNOT separate an OMP parent from its own subagent,
+   * because OMP's `tool_call` event carries no agent identity for the gate to
+   * forward (verified against omp v17.3.5: the event is exactly
+   * `{type, toolName, toolCallId, input}`). It is the identity that genuinely
+   * exists, stated at the precision it actually has.
+   */
+  agentProvider: string | null;
+  /**
+   * Is a requester actually blocked on this ask right now?
+   *
+   * True for every transport that holds its caller for the whole decision
+   * window (SDK PreToolUse, the interactive shell hook) — which is every
+   * transport but one, so this is `true` almost always.
+   *
+   * The omp-sdk lane is the exception. OMP kills an extension handler at 30s,
+   * so cyboflow's gate hangs up at ~25s and tells the model to retry; between
+   * that hangup and the next retry NOBODY is waiting, and the model may never
+   * retry at all. Such a row stays pending on purpose — a verdict is still
+   * collectable by a later retry, even in a later turn — but rendering it as a
+   * halted agent is a lie, and it is the lie that made a live smoke end with two
+   * cards claiming to block a run that had moved on. Surfaces MUST NOT show a
+   * `false` row as blocked: no "blocked Nm" badge, no blocking counter.
+   *
+   * Backed by `approvals.awaited` (migration 111).
+   */
+  awaited: boolean;
 }
 
 /**

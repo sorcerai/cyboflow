@@ -5,7 +5,8 @@
  * call — so the GraphQL request shape (headers, variables, pagination) and
  * the response-mapping/error-classification logic are asserted
  * deterministically. Covers: bare-key auth + happy-path identity mapping,
- * HTTP-401 → TrackerAuthError, listIssues cross-page pagination with the
+ * HTTP-401 → TrackerAuthError, listGroups' project×team pairing (and the whole-
+ * teams fallback), listIssues cross-page pagination with the
  * `updatedAt.gte` filter threaded through, Linear's "canceled" state type
  * mapping to the canonical "cancelled" group, createSubIssue's
  * client-key-as-id idempotency wiring, getIssue swallowing an
@@ -60,6 +61,8 @@ function issueNode(overrides: {
   id?: string;
   identifier?: string;
   parentId?: string | null;
+  /** Linear reads priority as a FLOAT — `2` arrives as `2.0`. */
+  priority?: number | null;
 }): unknown {
   return {
     id: overrides.id ?? 'issue-1',
@@ -73,6 +76,16 @@ function issueNode(overrides: {
     parent: overrides.parentId ? { id: overrides.parentId } : null,
     updatedAt: '2026-07-01T00:00:00.000Z',
     archivedAt: null,
+    priority: overrides.priority === undefined ? 3 : overrides.priority,
+    trashed: false,
+  };
+}
+
+/** One page of `issues`, for the single-page reads below. */
+function issuePage(nodes: unknown[]): { status: number; body: unknown } {
+  return {
+    status: 200,
+    body: { data: { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } },
   };
 }
 
@@ -127,6 +140,174 @@ describe('LinearAdapter auth failures', () => {
   });
 });
 
+/**
+ * A `FetchLike` that answers PER OPERATION rather than per call index, keyed by
+ * a substring of the query text. `listGroups` fires its two root queries
+ * concurrently, so the call ORDER the other tests rely on is not stable there.
+ * Each key's responses are consumed in order (the last repeats).
+ */
+function createQueryFetchMock(byOperation: Record<string, QueuedResponse[]>): {
+  fetchImpl: FetchLike;
+  calls: RecordedCall[];
+} {
+  const calls: RecordedCall[] = [];
+  const consumed = new Map<string, number>();
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const call = { url: String(input), init: init ?? {} };
+    calls.push(call);
+    const { query } = parseBody(call);
+    const key = Object.keys(byOperation).find((name) => query.includes(name));
+    if (key === undefined) throw new Error(`createQueryFetchMock: unhandled operation in ${query}`);
+    const responses = byOperation[key];
+    const index = consumed.get(key) ?? 0;
+    consumed.set(key, index + 1);
+    const queued = responses[index] ?? responses[responses.length - 1];
+    return jsonResponse(queued.status, queued.body);
+  }) as FetchLike;
+  return { fetchImpl, calls };
+}
+
+describe('LinearAdapter.listGroups', () => {
+  it('pairs each project with every team it spans, and paginates the project query', async () => {
+    const { fetchImpl, calls } = createQueryFetchMock({
+      ListProjectsWithTeams: [
+        {
+          status: 200,
+          body: {
+            data: {
+              projects: {
+                nodes: [
+                  {
+                    id: 'proj-1',
+                    name: 'Platform',
+                    teams: { nodes: [{ id: 'team-core', name: 'Core', key: 'COR' }] },
+                  },
+                ],
+                pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
+              },
+            },
+          },
+        },
+        {
+          status: 200,
+          body: {
+            data: {
+              projects: {
+                nodes: [
+                  {
+                    id: 'proj-2',
+                    name: 'Redesign',
+                    teams: {
+                      nodes: [
+                        { id: 'team-core', name: 'Core', key: 'COR' },
+                        { id: 'team-web', name: 'Web', key: 'WEB' },
+                      ],
+                    },
+                  },
+                  // A project no team owns has no addressable filter.
+                  { id: 'proj-orphan', name: 'Orphan', teams: { nodes: [] } },
+                ],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      ],
+      ListTeams: [
+        {
+          status: 200,
+          body: {
+            data: {
+              teams: {
+                nodes: [{ id: 'team-core', name: 'Core', key: 'COR' }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    const { sections } = await adapter.listGroups();
+
+    expect(sections.map((section) => section.label)).toEqual(['Projects', 'Whole teams']);
+    expect(sections[0].groups).toEqual([
+      {
+        id: 'team-core/proj-1',
+        // Single-team project: the team is not spelled into the name.
+        name: 'Platform',
+        key: 'COR',
+        sourceLabel: 'Platform · Core',
+        selection: { containerId: 'team-core', narrowId: 'proj-1', narrowKind: 'project' },
+        stateScopeKey: 'team-core',
+      },
+      {
+        id: 'team-core/proj-2',
+        name: 'Redesign · Core',
+        key: 'COR',
+        sourceLabel: 'Redesign · Core',
+        selection: { containerId: 'team-core', narrowId: 'proj-2', narrowKind: 'project' },
+        stateScopeKey: 'team-core',
+      },
+      {
+        id: 'team-web/proj-2',
+        name: 'Redesign · Web',
+        key: 'WEB',
+        sourceLabel: 'Redesign · Web',
+        selection: { containerId: 'team-web', narrowId: 'proj-2', narrowKind: 'project' },
+        // Linear states are per-TEAM, so the same project maps under two scopes.
+        stateScopeKey: 'team-web',
+      },
+    ]);
+    expect(calls.filter((call) => parseBody(call).query.includes('ListProjectsWithTeams'))).toHaveLength(2);
+  });
+
+  it('offers whole teams as their own section, so an issue in no project is reachable', async () => {
+    const { fetchImpl } = createQueryFetchMock({
+      ListProjectsWithTeams: [
+        {
+          status: 200,
+          body: {
+            data: { projects: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+          },
+        },
+      ],
+      ListTeams: [
+        {
+          status: 200,
+          body: {
+            data: {
+              teams: {
+                nodes: [{ id: 'team-core', name: 'Core', key: 'COR' }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    const { sections } = await adapter.listGroups();
+
+    expect(sections[0].groups).toEqual([]);
+    expect(sections[1]).toEqual({
+      label: 'Whole teams',
+      groups: [
+        {
+          id: 'team:team-core',
+          name: 'Core',
+          key: 'COR',
+          sourceLabel: 'Core · whole team',
+          selection: { containerId: 'team-core', narrowId: 'all', narrowKind: 'all' },
+          stateScopeKey: 'team-core',
+        },
+      ],
+    });
+  });
+});
+
 describe('LinearAdapter.listIssues', () => {
   it('paginates across two pages and threads the updatedAt gte filter through', async () => {
     const { fetchImpl, calls } = createFetchMock([
@@ -175,6 +356,75 @@ describe('LinearAdapter.listIssues', () => {
     expect(secondVariables.filter).toMatchObject({
       updatedAt: { gte: '2026-06-01T00:00:00.000Z' },
     });
+  });
+});
+
+describe('LinearAdapter priority mapping', () => {
+  it('normalizes the Float priority to the raw string token', async () => {
+    const { fetchImpl } = createFetchMock([issuePage([issueNode({ priority: 2 })])]);
+    const [issue] = await new LinearAdapter({ apiKey: 'key', fetchImpl }).listIssues({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    expect(issue.priority).toBe('2');
+  });
+
+  it('treats 0 as the real "No priority" VALUE, never as an absence', async () => {
+    // The trap: `0` is falsy, and a `?? null` or a truthiness check would turn
+    // Linear's No-priority rung into "we did not read this field", which the
+    // merge would then take the never-synced arm on forever.
+    const { fetchImpl } = createFetchMock([issuePage([issueNode({ priority: 0 })])]);
+    const [issue] = await new LinearAdapter({ apiKey: 'key', fetchImpl }).listIssues({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    expect(issue.priority).toBe('0');
+  });
+
+  it('rounds a non-integral Float onto a rung the mapping knows', async () => {
+    const { fetchImpl } = createFetchMock([issuePage([issueNode({ priority: 1.9999 })])]);
+    const [issue] = await new LinearAdapter({ apiKey: 'key', fetchImpl }).listIssues({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    expect(issue.priority).toBe('2');
+  });
+
+  it('reads an absent priority as null and always reports no category', async () => {
+    const { fetchImpl } = createFetchMock([issuePage([issueNode({ priority: null })])]);
+    const [issue] = await new LinearAdapter({ apiKey: 'key', fetchImpl }).listIssues({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    expect(issue.priority).toBeNull();
+    // Linear models no issue type; category is structurally null.
+    expect(issue.category).toBeNull();
+  });
+
+  it('selects priority and trashed on the shared issue-node selection', async () => {
+    // One selection serves list/get/create, so this pins all three at once.
+    const { fetchImpl, calls } = createFetchMock([issuePage([issueNode({})])]);
+    await new LinearAdapter({ apiKey: 'key', fetchImpl }).listIssues({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    const { query } = parseBody(calls[0]);
+    expect(query).toContain('priority');
+    expect(query).toContain('trashed');
+  });
+});
+
+describe('LinearAdapter.listFieldOptions', () => {
+  it('states its fixed five-rung scale and no categories, without a request', async () => {
+    const { fetchImpl, calls } = createFetchMock([]);
+    const options = await new LinearAdapter({ apiKey: 'key', fetchImpl }).listFieldOptions();
+    expect(options).toEqual({ priorities: ['0', '1', '2', '3', '4'], categories: null });
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -331,6 +581,170 @@ describe('LinearAdapter.updateIssueState', () => {
     const body = parseBody(calls[0]);
     expect(body.query).toContain('mutation UpdateIssueState');
     expect(body.variables).toEqual({ id: 'issue-99', input: { stateId: 'state-done' } });
+  });
+});
+
+describe('LinearAdapter.updateIssueContent', () => {
+  it('sends only the patched keys, converts the priority TOKEN to an Int, and returns the mapped post-write issue', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      {
+        status: 200,
+        body: {
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: issueNode({ id: 'issue-99', identifier: 'COR-5', priority: 1 }),
+            },
+          },
+        },
+      },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    const issue = await adapter.updateIssueContent('issue-99', { title: 'New title', priority: '1' });
+
+    expect(calls).toHaveLength(1);
+    const body = parseBody(calls[0]);
+    expect(body.query).toContain('mutation UpdateIssueContent');
+    // The full issue node is selected — this write is the echo-suppression
+    // baseline's stamp source, and only the response carries it.
+    expect(body.query).toContain('trashed');
+    expect(body.variables).toEqual({ id: 'issue-99', input: { title: 'New title', priority: 1 } });
+    expect(issue?.priority).toBe('1');
+  });
+
+  it('converts the "0" (No priority) token to the Int 0, never dropping it', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      { status: 200, body: { data: { issueUpdate: { success: true, issue: issueNode({ priority: 0 }) } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await adapter.updateIssueContent('issue-1', { priority: '0' });
+
+    const body = parseBody(calls[0]);
+    expect((body.variables?.input as Record<string, unknown>).priority).toBe(0);
+  });
+
+  it('leaves an unpatched field out of the mutation input entirely', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      { status: 200, body: { data: { issueUpdate: { success: true, issue: issueNode({}) } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await adapter.updateIssueContent('issue-1', { description: 'new body' });
+
+    const body = parseBody(calls[0]);
+    expect(body.variables?.input).toEqual({ description: 'new body' });
+  });
+
+  it('passes description straight through with no marker composition (Linear never writes one)', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      { status: 200, body: { data: { issueUpdate: { success: true, issue: issueNode({}) } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await adapter.updateIssueContent('issue-1', { description: 'plain markdown body' });
+
+    const body = parseBody(calls[0]);
+    expect((body.variables?.input as Record<string, unknown>).description).toBe('plain markdown body');
+  });
+
+  it('throws when issueUpdate reports failure or returns no issue', async () => {
+    const { fetchImpl } = createFetchMock([
+      { status: 200, body: { data: { issueUpdate: { success: false, issue: null } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await expect(adapter.updateIssueContent('issue-1', { title: 'x' })).rejects.toThrow(
+      /issueUpdate reported failure/,
+    );
+  });
+});
+
+describe('LinearAdapter.archiveIssue', () => {
+  it('uses issueArchive(trash: true), never issueUpdate({ trashed: true })', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      { status: 200, body: { data: { issueArchive: { success: true } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await adapter.archiveIssue('issue-1');
+
+    expect(calls).toHaveLength(1);
+    const body = parseBody(calls[0]);
+    expect(body.query).toContain('issueArchive');
+    expect(body.query).toContain('trash: true');
+    expect(body.query).not.toContain('issueUpdate');
+    expect(body.variables).toEqual({ id: 'issue-1' });
+  });
+
+  it('tolerates an entity-not-found error as success — the twin was already trashed/deleted', async () => {
+    const { fetchImpl } = createFetchMock([
+      {
+        status: 200,
+        body: {
+          data: null,
+          errors: [{ message: 'Entity not found: Issue', extensions: { type: 'not_found' } }],
+        },
+      },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await expect(adapter.archiveIssue('missing-id')).resolves.toBeUndefined();
+  });
+
+  it('throws TrackerAuthError on an HTTP 401', async () => {
+    const { fetchImpl } = createFetchMock([{ status: 401, body: { errors: [] } }]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await expect(adapter.archiveIssue('issue-1')).rejects.toBeInstanceOf(TrackerAuthError);
+  });
+
+  it('throws when issueArchive reports failure', async () => {
+    const { fetchImpl } = createFetchMock([
+      { status: 200, body: { data: { issueArchive: { success: false } } } },
+    ]);
+    const adapter = new LinearAdapter({ apiKey: 'key', fetchImpl });
+
+    await expect(adapter.archiveIssue('issue-1')).rejects.toThrow(/issueArchive reported failure/);
+  });
+});
+
+describe('LinearAdapter creates — draft priority', () => {
+  it('converts IssueDraft.priority to Int on both createSubIssue and createIssue', async () => {
+    const { fetchImpl: subFetch, calls: subCalls } = createFetchMock([
+      { status: 200, body: { data: { issue: { team: { id: 'team-1' } } } } },
+      { status: 200, body: { data: { issueCreate: { success: true, issue: issueNode({}) } } } },
+    ]);
+    await new LinearAdapter({ apiKey: 'key', fetchImpl: subFetch }).createSubIssue(
+      'parent-1',
+      { title: 'Sub', priority: '2' },
+      'client-key-1',
+    );
+    expect((parseBody(subCalls[1]).variables?.input as Record<string, unknown>).priority).toBe(2);
+
+    const { fetchImpl: topFetch, calls: topCalls } = createFetchMock([
+      { status: 200, body: { data: { issueCreate: { success: true, issue: issueNode({}) } } } },
+    ]);
+    await new LinearAdapter({ apiKey: 'key', fetchImpl: topFetch }).createIssue(
+      { containerId: 'team-1', narrowId: 'all', narrowKind: 'all' },
+      { title: 'Top', priority: '4' },
+      'client-key-2',
+    );
+    expect((parseBody(topCalls[0]).variables?.input as Record<string, unknown>).priority).toBe(4);
+  });
+
+  it('leaves priority undefined on the input when the draft omits it', async () => {
+    const { fetchImpl, calls } = createFetchMock([
+      { status: 200, body: { data: { issueCreate: { success: true, issue: issueNode({}) } } } },
+    ]);
+    await new LinearAdapter({ apiKey: 'key', fetchImpl }).createIssue(
+      { containerId: 'team-1', narrowId: 'all', narrowKind: 'all' },
+      { title: 'No priority set' },
+      'client-key-3',
+    );
+    const input = parseBody(calls[0]).variables?.input as Record<string, unknown>;
+    expect(input.priority).toBeUndefined();
   });
 });
 

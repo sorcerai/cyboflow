@@ -26,9 +26,20 @@
  *     that reach past the tracker tables into ideas/epics/tasks, so a hard
  *     delete's zombie links are findable and its cascade is knowable up front.
  *   - resolveConflict's state/resolved_at stamping.
- *   - findDisconnectedConnection's revival identity, base_url included: a
- *     workspace slug is unique only within one tracker INSTANCE, so two
- *     self-hosted deployments sharing a slug must not revive each other's row.
+ *   - findDisconnectedConnection's revival identity, base_url and source
+ *     container included: a workspace slug is unique only within one tracker
+ *     INSTANCE, so two self-hosted deployments sharing a slug must not revive
+ *     each other's row — and under multi-project mapping one workspace owns N
+ *     sibling rows in a project that differ only in their source.
+ *   - listConnectionsByIdentity: the credential-rotation fan-out set, live rows
+ *     only, split by instance the same normalized way.
+ *   - push_target: the column that keeps N sibling mappings from each pushing
+ *     their own copy of one locally filed idea, plus the two queries that keep
+ *     it to ONE armed row per (project, provider) — claimPushTarget's atomic
+ *     arm-and-demote and listDuplicatePushTargets' boot-repair scan.
+ *   - findSiblingLinkForExternal: the cross-scope duplicate-import guard's
+ *     lookup — a live link another mapping on the same tracker identity holds,
+ *     with orphaned links, retired rows, and other workspaces/instances out.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
@@ -42,6 +53,10 @@ import {
   listConnections,
   updateConnectionSettings,
   findDisconnectedConnection,
+  listConnectionsByIdentity,
+  listConnectionsForProviderProject,
+  claimPushTarget,
+  listDuplicatePushTargets,
   reactivateConnection,
   advanceCursor,
   storeSecret,
@@ -49,6 +64,7 @@ import {
   upsertLink,
   getLinkByEntity,
   getLinkByExternal,
+  findSiblingLinkForExternal,
   listLinks,
   updateBaseline,
   markOrphaned,
@@ -66,7 +82,19 @@ import {
   resolveConflict,
   hasOpenConflictForLink,
   type NewConnectionRow,
+  type StoredSourceScope,
 } from '../store';
+
+/**
+ * A scope no seeded row's source contradicts: the identity-axis tests seed rows
+ * WITHOUT a source_json, and a stored null scope is a revival wildcard.
+ */
+const ANY_SCOPE: StoredSourceScope = { containerId: 'any', narrowId: 'all', narrowKind: 'all' };
+
+/** A whole-container scope for `containerId` — the shape the Map step's groups carry. */
+function scopeOf(containerId: string): StoredSourceScope {
+  return { containerId, narrowId: 'all', narrowKind: 'all' };
+}
 
 let tmpDir: string;
 let dbPath: string;
@@ -106,6 +134,11 @@ function makeConnectionRow(overrides: Partial<NewConnectionRow> = {}): NewConnec
     status_sync_mode: 'auto',
     pull_mode: 'auto',
     push_mode: 'auto',
+    push_target: 1,
+    content_sync_mode: 'off',
+    archive_sync_mode: 'off',
+    priority_mapping_json: '{}',
+    category_mapping_json: '{}',
     mirror_subissues: 1,
     conflict_mode: 'auto',
     cursor_updated_at: null,
@@ -203,6 +236,29 @@ describe('trackerSync store — connections', () => {
     expect(getConnection(raw, 'nope')).toBeNull();
   });
 
+  it('inserts the migration-112 columns verbatim, and a caller can override them off their default', () => {
+    const defaults = insertConnection(raw, makeConnectionRow({ id: 'conn-112-default' }));
+    expect(defaults.content_sync_mode).toBe('off');
+    expect(defaults.archive_sync_mode).toBe('off');
+    expect(defaults.priority_mapping_json).toBe('{}');
+    expect(defaults.category_mapping_json).toBe('{}');
+
+    const overridden = insertConnection(
+      raw,
+      makeConnectionRow({
+        id: 'conn-112-overridden',
+        content_sync_mode: 'auto',
+        archive_sync_mode: 'manual',
+        priority_mapping_json: '{"toProvider":{"P0":"urgent"}}',
+        category_mapping_json: '{"toProvider":{"bug":"Bug"}}',
+      }),
+    );
+    expect(overridden.content_sync_mode).toBe('auto');
+    expect(overridden.archive_sync_mode).toBe('manual');
+    expect(overridden.priority_mapping_json).toBe('{"toProvider":{"P0":"urgent"}}');
+    expect(overridden.category_mapping_json).toBe('{"toProvider":{"bug":"Bug"}}');
+  });
+
   it('listConnections excludes disconnected connections by default and includes them with the option', () => {
     seedConnection({ id: 'conn-a', status: 'active' });
     seedConnection({ id: 'conn-b', status: 'disconnected', provider: 'plane' });
@@ -239,6 +295,126 @@ describe('trackerSync store — connections', () => {
     expect(after.selection_mode).toBe(beforeRow.selection_mode);
   });
 
+  it('updateConnectionSettings patches content_sync_mode / archive_sync_mode independently', () => {
+    const id = seedConnection({ id: 'conn-1' });
+    expect(getConnection(raw, id)?.content_sync_mode).toBe('off');
+    expect(getConnection(raw, id)?.archive_sync_mode).toBe('off');
+
+    updateConnectionSettings(raw, id, { content_sync_mode: 'auto' });
+    expect(getConnection(raw, id)?.content_sync_mode).toBe('auto');
+    // The untouched direction keeps its stored value.
+    expect(getConnection(raw, id)?.archive_sync_mode).toBe('off');
+
+    updateConnectionSettings(raw, id, { archive_sync_mode: 'manual' });
+    expect(getConnection(raw, id)?.content_sync_mode).toBe('auto');
+    expect(getConnection(raw, id)?.archive_sync_mode).toBe('manual');
+  });
+
+  it('updateConnectionSettings patches priority_mapping_json / category_mapping_json independently', () => {
+    const id = seedConnection({ id: 'conn-1' });
+    expect(getConnection(raw, id)?.priority_mapping_json).toBe('{}');
+    expect(getConnection(raw, id)?.category_mapping_json).toBe('{}');
+
+    updateConnectionSettings(raw, id, {
+      priority_mapping_json: '{"toProvider":{"P0":"urgent"}}',
+    });
+    expect(getConnection(raw, id)?.priority_mapping_json).toBe('{"toProvider":{"P0":"urgent"}}');
+    // The untouched mapping keeps its stored value.
+    expect(getConnection(raw, id)?.category_mapping_json).toBe('{}');
+
+    updateConnectionSettings(raw, id, {
+      category_mapping_json: '{"toProvider":{"bug":"Bug"}}',
+    });
+    expect(getConnection(raw, id)?.priority_mapping_json).toBe('{"toProvider":{"P0":"urgent"}}');
+    expect(getConnection(raw, id)?.category_mapping_json).toBe('{"toProvider":{"bug":"Bug"}}');
+  });
+
+  it('push_target round-trips through insert and is patchable', () => {
+    // The sibling mappings a multi-project connect mints: one pushes, the rest
+    // are read + write-back only.
+    const pushing = seedConnection({ id: 'conn-push' });
+    const sibling = seedConnection({ id: 'conn-sibling', push_target: 0 });
+    expect(getConnection(raw, pushing)!.push_target).toBe(1);
+    expect(getConnection(raw, sibling)!.push_target).toBe(0);
+
+    // Patchable, so a later "make THIS one the push target" edit needs no
+    // re-connect.
+    updateConnectionSettings(raw, pushing, { push_target: 0 });
+    updateConnectionSettings(raw, sibling, { push_target: 1 });
+    expect(getConnection(raw, pushing)!.push_target).toBe(0);
+    expect(getConnection(raw, sibling)!.push_target).toBe(1);
+  });
+
+  it('claimPushTarget arms ONE row and demotes every live sibling of that (project, provider)', () => {
+    // The defect: connect() armed the new row without demoting the rest, so a
+    // later wizard run mapping a second group into an already-mapped project
+    // left two armed siblings and one filed idea became two remote issues.
+    raw.prepare('INSERT INTO projects (id, name, path) VALUES (2, ?, ?)').run('Proj 2', '/tmp/p2');
+    seedConnection({ id: 'first' });
+    seedConnection({ id: 'second' });
+    // A paused row is still LIVE — it resumes on the next key paste and would
+    // push from the moment it does.
+    seedConnection({ id: 'paused', status: 'paused' });
+    // Out of scope on every axis: retired, another provider, another project.
+    seedConnection({ id: 'retired', status: 'disconnected' });
+    seedConnection({ id: 'other-provider', provider: 'plane' });
+    insertConnection(raw, makeConnectionRow({ id: 'other-project', project_id: 2 }));
+
+    claimPushTarget(raw, 1, 'linear', 'second');
+
+    expect(getConnection(raw, 'second')!.push_target).toBe(1);
+    expect(getConnection(raw, 'first')!.push_target).toBe(0);
+    expect(getConnection(raw, 'paused')!.push_target).toBe(0);
+    expect(getConnection(raw, 'retired')!.push_target).toBe(1);
+    expect(getConnection(raw, 'other-provider')!.push_target).toBe(1);
+    expect(getConnection(raw, 'other-project')!.push_target).toBe(1);
+
+    // The winner is ARMED, not merely left alone: a re-pick promotes a row that
+    // was demoted a moment ago.
+    claimPushTarget(raw, 1, 'linear', 'first');
+    expect(getConnection(raw, 'first')!.push_target).toBe(1);
+    expect(getConnection(raw, 'second')!.push_target).toBe(0);
+  });
+
+  it('listDuplicatePushTargets reports only the pairs holding MORE THAN ONE armed live row', () => {
+    // Boot repair's input: a state connect() never leaves behind, but a
+    // ledger-wiped migration replay does (109 re-adds push_target at DEFAULT 1).
+    raw.prepare('INSERT INTO projects (id, name, path) VALUES (2, ?, ?)').run('Proj 2', '/tmp/p2');
+    // The broken pair: two armed live rows.
+    seedConnection({ id: 'dup-a' });
+    seedConnection({ id: 'dup-b', status: 'paused' });
+    // Healthy: one armed, one demoted.
+    seedConnection({ id: 'plane-armed', provider: 'plane' });
+    seedConnection({ id: 'plane-quiet', provider: 'plane', push_target: 0 });
+    // Not a duplicate either — the second armed row is retired.
+    insertConnection(raw, makeConnectionRow({ id: 'p2-live', project_id: 2 }));
+    insertConnection(
+      raw,
+      makeConnectionRow({ id: 'p2-retired', project_id: 2, status: 'disconnected' }),
+    );
+
+    expect(listDuplicatePushTargets(raw)).toEqual([{ project_id: 1, provider: 'linear' }]);
+  });
+
+  it('listConnectionsForProviderProject returns the live rows of one pair, OLDEST first', () => {
+    // The order boot repair picks its keeper from — the stable choice, and for
+    // any pre-replay state the row most likely to have held the flag.
+    seedConnection({ id: 'newer' });
+    seedConnection({ id: 'older' });
+    seedConnection({ id: 'retired', status: 'disconnected' });
+    seedConnection({ id: 'other-provider', provider: 'plane' });
+    // `datetime('now')` has one-second resolution, so two inserts in the same
+    // test tie — stamp them apart rather than sleeping.
+    const stamp = raw.prepare('UPDATE tracker_connections SET created_at = ? WHERE id = ?');
+    stamp.run('2026-07-02 00:00:00', 'newer');
+    stamp.run('2026-07-01 00:00:00', 'older');
+
+    expect(listConnectionsForProviderProject(raw, 1, 'linear').map((c) => c.id)).toEqual([
+      'older',
+      'newer',
+    ]);
+  });
+
   it('advanceCursor sets the compound cursor columns', () => {
     const id = seedConnection();
     advanceCursor(raw, id, '2026-07-30 12:00:00', 'LIN-999');
@@ -263,20 +439,20 @@ describe('trackerSync store — connections', () => {
     seedConnection({ id: 'conn-1', workspace_id: 'ws-1' });
     // An ACTIVE row is the project's live connection for that workspace — never
     // a revival candidate.
-    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null)).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, ANY_SCOPE)).toBeNull();
 
     updateConnectionSettings(raw, 'conn-1', { status: 'disconnected' });
-    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null)?.id).toBe('conn-1');
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, ANY_SCOPE)?.id).toBe('conn-1');
 
     // Every axis of the identity is load-bearing.
-    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-2', null)).toBeNull();
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'ws-1', null)).toBeNull();
-    expect(findDisconnectedConnection(raw, 2, 'linear', 'ws-1', null)).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-2', null, ANY_SCOPE)).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'ws-1', null, ANY_SCOPE)).toBeNull();
+    expect(findDisconnectedConnection(raw, 2, 'linear', 'ws-1', null, ANY_SCOPE)).toBeNull();
   });
 
   it('findDisconnectedConnection never claims a row whose workspace identity was never recorded', () => {
     seedConnection({ id: 'conn-1', status: 'disconnected', workspace_id: null });
-    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null)).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, ANY_SCOPE)).toBeNull();
   });
 
   it('findDisconnectedConnection returns the most recently updated candidate', () => {
@@ -288,7 +464,7 @@ describe('trackerSync store — connections', () => {
     stamp.run('2026-07-01 00:00:00', 'older');
     stamp.run('2026-07-02 00:00:00', 'newer');
 
-    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null)?.id).toBe('newer');
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, ANY_SCOPE)?.id).toBe('newer');
   });
 
   it('findDisconnectedConnection does NOT claim the same workspace slug on a DIFFERENT instance', () => {
@@ -306,17 +482,17 @@ describe('trackerSync store — connections', () => {
       base_url: 'https://plane.a.example',
     });
 
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.b.example')).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.b.example', ANY_SCOPE)).toBeNull();
 
     // The SAME instance spelled differently is still the same instance: a
     // trailing slash and origin case are not identity.
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example')?.id).toBe(
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example', ANY_SCOPE)?.id).toBe(
       'conn-a',
     );
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example/')?.id).toBe(
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example/', ANY_SCOPE)?.id).toBe(
       'conn-a',
     );
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'HTTPS://Plane.A.Example//')?.id).toBe(
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'HTTPS://Plane.A.Example//', ANY_SCOPE)?.id).toBe(
       'conn-a',
     );
   });
@@ -332,12 +508,12 @@ describe('trackerSync store — connections', () => {
       base_url: 'https://api.plane.so',
     });
 
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', null)?.id).toBe('conn-cloud');
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://api.plane.so/')?.id).toBe(
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', null, ANY_SCOPE)?.id).toBe('conn-cloud');
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://api.plane.so/', ANY_SCOPE)?.id).toBe(
       'conn-cloud',
     );
     // A self-hosted deployment of the same slug remains a different connection.
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.acme.dev')).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.acme.dev', ANY_SCOPE)).toBeNull();
   });
 
   it('findDisconnectedConnection prefers an OLDER row on the matching instance over a newer one elsewhere', () => {
@@ -359,9 +535,157 @@ describe('trackerSync store — connections', () => {
     stamp.run('2026-07-02 00:00:00', 'other-instance');
     stamp.run('2026-07-01 00:00:00', 'this-instance');
 
-    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example')?.id).toBe(
+    expect(findDisconnectedConnection(raw, 1, 'plane', 'acme', 'https://plane.a.example', ANY_SCOPE)?.id).toBe(
       'this-instance',
     );
+  });
+
+  it('findDisconnectedConnection does NOT claim a SIBLING mapping of the same workspace', () => {
+    // Multi-project mapping retires N rows that differ in nothing but their
+    // source. Reviving the wrong one would rewrite it onto another group's
+    // source and strand that group's links on a row now pointing elsewhere.
+    seedConnection({
+      id: 'conn-core',
+      status: 'disconnected',
+      workspace_id: 'ws-1',
+      source_json: JSON.stringify({ containerId: 'team-core', narrowId: 'all', narrowKind: 'all' }),
+    });
+
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, scopeOf('team-web'))).toBeNull();
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, scopeOf('team-core'))?.id).toBe(
+      'conn-core',
+    );
+    // The NARROW is not part of the key — re-picking a cycle under the same
+    // container is the same mapping, and its links cannot be stranded by it.
+    seedConnection({
+      id: 'conn-narrowed',
+      status: 'disconnected',
+      workspace_id: 'ws-2',
+      source_json: JSON.stringify({
+        containerId: 'team-web',
+        narrowId: 'cycle-12',
+        narrowKind: 'cycle',
+      }),
+    });
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-2', null, scopeOf('team-web'))?.id).toBe(
+      'conn-narrowed',
+    );
+  });
+
+  it('findDisconnectedConnection keys on the FULL scope, so two project groups under one team stay apart', () => {
+    // The defect: the revival key read only `containerId`, but every Linear
+    // project group under one team SHARES the team's container and differs only
+    // in the narrow. Mapping the team's second project group would then revive
+    // (and rewrite) the first one's retired row, repointing its links onto a
+    // mapping that no longer polls them.
+    seedConnection({
+      id: 'conn-proj-a',
+      status: 'disconnected',
+      workspace_id: 'ws-1',
+      source_json: JSON.stringify({
+        containerId: 'team-1',
+        narrowId: 'proj-A',
+        narrowKind: 'project',
+      }),
+    });
+
+    const sibling: StoredSourceScope = {
+      containerId: 'team-1',
+      narrowId: 'proj-B',
+      narrowKind: 'project',
+    };
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, sibling)).toBeNull();
+
+    // Its own scope claims it back…
+    expect(
+      findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, {
+        containerId: 'team-1',
+        narrowId: 'proj-A',
+        narrowKind: 'project',
+      })?.id,
+    ).toBe('conn-proj-a');
+    // …and so does the WIDER whole-team scope that contains it: a superset
+    // cannot strand a retained link, so re-mapping the team as a whole adopts
+    // the narrowed row rather than re-importing its backlog.
+    expect(findDisconnectedConnection(raw, 1, 'linear', 'ws-1', null, scopeOf('team-1'))?.id).toBe(
+      'conn-proj-a',
+    );
+  });
+
+  it('findDisconnectedConnection lets a Dart SPACE scope claim its own retired member board', () => {
+    // Pre-rev-4 Dart rows are board-scoped ("Engineering/Sprint") while the Map
+    // step now offers only the space ("Engineering"), so without the widening
+    // arm every existing Dart connection would mint a fresh row and re-import
+    // its whole backlog as duplicates.
+    seedConnection({
+      id: 'conn-board',
+      provider: 'dart',
+      status: 'disconnected',
+      workspace_id: 'acct-1',
+      source_json: JSON.stringify({
+        containerId: 'Engineering/Sprint',
+        narrowId: 'all',
+        narrowKind: 'all',
+      }),
+    });
+
+    expect(
+      findDisconnectedConnection(raw, 1, 'dart', 'acct-1', null, {
+        containerId: 'Engineering',
+        narrowId: 'all',
+        narrowKind: 'space',
+      })?.id,
+    ).toBe('conn-board');
+    // A DIFFERENT space owns none of it — the prefix must be a path segment.
+    expect(
+      findDisconnectedConnection(raw, 1, 'dart', 'acct-1', null, {
+        containerId: 'Design',
+        narrowId: 'all',
+        narrowKind: 'space',
+      }),
+    ).toBeNull();
+  });
+
+  it('listConnectionsByIdentity returns every LIVE row sharing one key, across projects', () => {
+    raw.prepare('INSERT INTO projects (id, name, path) VALUES (2, ?, ?)').run('Proj 2', '/tmp/p2');
+    // Two mappings of one Linear workspace onto two cyboflow projects, plus a
+    // paused one — a revoked key pauses exactly the rows a rotation must resume.
+    seedConnection({ id: 'map-a', workspace_id: 'ws-1' });
+    insertConnection(
+      raw,
+      makeConnectionRow({ id: 'map-b', project_id: 2, workspace_id: 'ws-1', status: 'paused' }),
+    );
+    // Not in the set: another workspace, another provider, and a retired row
+    // whose secret was deliberately cleared.
+    seedConnection({ id: 'other-ws', workspace_id: 'ws-2' });
+    seedConnection({ id: 'other-provider', provider: 'plane', workspace_id: 'ws-1' });
+    seedConnection({ id: 'retired', workspace_id: 'ws-1', status: 'disconnected' });
+
+    expect(listConnectionsByIdentity(raw, 'linear', 'ws-1', null).map((c) => c.id)).toEqual([
+      'map-a',
+      'map-b',
+    ]);
+  });
+
+  it('listConnectionsByIdentity splits two Plane instances that share a workspace slug', () => {
+    seedConnection({
+      id: 'plane-a',
+      provider: 'plane',
+      workspace_id: 'acme',
+      base_url: 'https://plane.a.example',
+    });
+    seedConnection({
+      id: 'plane-b',
+      provider: 'plane',
+      workspace_id: 'acme',
+      base_url: 'https://plane.b.example',
+    });
+
+    // Normalized comparison, same as the revival lookup: a trailing slash is
+    // not a different instance, a different host is.
+    expect(
+      listConnectionsByIdentity(raw, 'plane', 'acme', 'https://plane.a.example/').map((c) => c.id),
+    ).toEqual(['plane-a']);
   });
 
   it('reactivateConnection rewrites the retired row IN PLACE, keeping its id and clearing the cursor', () => {
@@ -667,6 +991,115 @@ describe('trackerSync store — links', () => {
     });
     expect(hasActiveLinkedDescendant(raw, 'idea', 'ide_1')).toBe(true);
     expect(hasActiveLinkedDescendant(raw, 'epic', 'epc_1')).toBe(false);
+  });
+
+  it('findSiblingLinkForExternal finds a link another mapping on the same identity holds — across projects', () => {
+    raw.prepare('INSERT INTO projects (id, name, path) VALUES (2, ?, ?)').run('Proj 2', '/tmp/p2');
+    const teamGroup = seedConnection({ id: 'conn-team', workspace_id: 'org-1' });
+    seedConnection({ id: 'conn-project', project_id: 2, workspace_id: 'org-1' });
+    const held = upsertLink(raw, {
+      connection_id: teamGroup,
+      entity_type: 'idea',
+      entity_id: 'idea-1',
+      provider: 'linear',
+      external_id: 'LIN-1',
+    });
+
+    const hit = findSiblingLinkForExternal(raw, {
+      provider: 'linear',
+      workspaceId: 'org-1',
+      baseUrl: null,
+      externalId: 'LIN-1',
+      excludeConnectionId: 'conn-project',
+    });
+    expect(hit?.id).toBe(held.id);
+    expect(hit?.entity_id).toBe('idea-1');
+
+    // The holder asking about its OWN link is not a duplicate.
+    expect(
+      findSiblingLinkForExternal(raw, {
+        provider: 'linear',
+        workspaceId: 'org-1',
+        baseUrl: null,
+        externalId: 'LIN-1',
+        excludeConnectionId: teamGroup,
+      }),
+    ).toBeNull();
+
+    // An unclaimed issue on the same identity.
+    expect(
+      findSiblingLinkForExternal(raw, {
+        provider: 'linear',
+        workspaceId: 'org-1',
+        baseUrl: null,
+        externalId: 'LIN-9',
+        excludeConnectionId: 'conn-project',
+      }),
+    ).toBeNull();
+  });
+
+  it('findSiblingLinkForExternal ignores orphaned links, disconnected rows, and another workspace or instance', () => {
+    const orphanHolder = seedConnection({ id: 'conn-orphan', workspace_id: 'ws-1', provider: 'plane' });
+    const retired = seedConnection({ id: 'conn-retired', workspace_id: 'ws-1', provider: 'plane' });
+    seedConnection({ id: 'conn-other-ws', workspace_id: 'ws-2', provider: 'plane' });
+    seedConnection({
+      id: 'conn-other-instance',
+      workspace_id: 'ws-1',
+      provider: 'plane',
+      base_url: 'https://plane.acme.dev',
+    });
+    const asker = {
+      provider: 'plane' as const,
+      workspaceId: 'ws-1',
+      baseUrl: null,
+      externalId: 'PLN-1',
+      excludeConnectionId: 'conn-asking',
+    };
+
+    const orphaned = upsertLink(raw, {
+      connection_id: orphanHolder,
+      entity_type: 'idea',
+      entity_id: 'idea-1',
+      provider: 'plane',
+      external_id: 'PLN-1',
+    });
+    markOrphaned(raw, orphaned.id);
+    expect(findSiblingLinkForExternal(raw, asker)).toBeNull();
+
+    // A retired mapping's retained links exist only for a revival to re-bind.
+    upsertLink(raw, {
+      connection_id: retired,
+      entity_type: 'epic',
+      entity_id: 'epic-1',
+      provider: 'plane',
+      external_id: 'PLN-1',
+    });
+    updateConnectionSettings(raw, retired, { status: 'disconnected' });
+    expect(findSiblingLinkForExternal(raw, asker)).toBeNull();
+
+    // Same external id, different workspace — a Plane id is unique only within one.
+    upsertLink(raw, {
+      connection_id: 'conn-other-ws',
+      entity_type: 'task',
+      entity_id: 'task-1',
+      provider: 'plane',
+      external_id: 'PLN-1',
+    });
+    expect(findSiblingLinkForExternal(raw, asker)).toBeNull();
+
+    // Same workspace slug on a SELF-HOSTED deployment is a different tracker.
+    upsertLink(raw, {
+      connection_id: 'conn-other-instance',
+      entity_type: 'task',
+      entity_id: 'task-2',
+      provider: 'plane',
+      external_id: 'PLN-1',
+    });
+    expect(findSiblingLinkForExternal(raw, asker)).toBeNull();
+    // ...and IS the sibling for a connection on that same deployment.
+    expect(
+      findSiblingLinkForExternal(raw, { ...asker, baseUrl: 'https://plane.acme.dev/' })?.entity_id,
+    ).toBe('task-2');
   });
 });
 

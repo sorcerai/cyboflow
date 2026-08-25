@@ -29,6 +29,10 @@ import { InteractiveMcpEnabler } from './interactiveMcpEnabler';
 import type { LoggerLike } from '../../../orchestrator/types';
 import { buildStepReportingAppend } from '../../../orchestrator/prompts/step-reporting-instructions';
 import { buildFanOutAppend } from '../../../orchestrator/prompts/fan-out-instructions';
+import {
+  DEFAULT_FAN_OUT_DISPATCH,
+  type FanOutDispatch,
+} from '../../../../../shared/types/fanOutDispatch';
 import { QUICK_WORKFLOW_NAME } from '../../../orchestrator/workflowRegistry';
 import { resolveRunFrozenSpec } from '../../../orchestrator/runFrozenSpec';
 import { resolveGateRunId } from '../../../orchestrator/chatSentinelProvider';
@@ -1037,7 +1041,15 @@ export class InteractiveClaudeManager extends AbstractCliManager {
     // Passive dynamic-workflow detection: watch this run's normalized event
     // stream for Workflow-tool launches. Fail-soft when the tracker singleton
     // is not initialized (unit tests / early boot).
-    DynamicWorkflowTracker.tryGetInstance()?.attachToRouter(router, { runId, sessionId });
+    // worktreePath is passed EXPLICITLY: a flow run has no `sessions` row (see the
+    // gate-vehicle discriminator above — getDbSession is undefined for it), so the
+    // tracker's sessions-keyed fallback resolves nothing and its launch watcher
+    // would never start for this run.
+    DynamicWorkflowTracker.tryGetInstance()?.attachToRouter(router, {
+      runId,
+      sessionId,
+      worktreePath: options.worktreePath,
+    });
 
     // The PreToolUse `'*'` shell-approval hook is delivered INLINE via the
     // `--settings '<json>'` flag assembled in buildCommandArgs (see the parity
@@ -1103,8 +1115,20 @@ export class InteractiveClaudeManager extends AbstractCliManager {
     // Gated for in-place sessions (mirrors the SDK sibling): a quick session has
     // no sibling bundle so this is fail-soft anyway, but the gate keeps the
     // user's real `.claude/` untouchable by construction, not by coincidence.
+    // ONE snapshot of the fan-out dispatch mode for this whole spawn: the same
+    // value gates stage-script installation below and the prompt's per-stage
+    // chain in composePromptBody, so the two can never disagree for this run.
+    const fanOutDispatch = this.resolveFanOutDispatch();
+
     if (!inPlaceSession) {
-      installWorkflowBundle(this.db, this.bundleWriter, runId, worktreePath, this.toLoggerLike(this.logger));
+      installWorkflowBundle(
+        this.db,
+        this.bundleWriter,
+        runId,
+        worktreePath,
+        this.toLoggerLike(this.logger),
+        fanOutDispatch,
+      );
     }
 
     // Write the per-run interactive MCP config (the path buildCommandArgs points
@@ -1142,7 +1166,7 @@ export class InteractiveClaudeManager extends AbstractCliManager {
     // variadic flags (--mcp-config, --add-dir, …) precede it. Verified against a
     // real worktree spawn: the `--` form removes the Invalid-MCP-config error
     // while keeping the prompt as the operand claude engages.
-    const composedPrompt = this.composePromptBody(runId, options.prompt);
+    const composedPrompt = this.composePromptBody(runId, options.prompt, fanOutDispatch);
     if (composedPrompt.length > 0) {
       args.push('--', composedPrompt);
     }
@@ -1372,12 +1396,43 @@ export class InteractiveClaudeManager extends AbstractCliManager {
    * broken/empty `spec_json` resolves to a `null` definition → both builders return
    * `''` → the prompt is sent UNCHANGED. Nothing is ever prepended as garbage.
    */
-  private composePromptBody(runId: string, prompt: string): string {
+  private composePromptBody(runId: string, prompt: string, dispatch: FanOutDispatch): string {
     const def = this.resolveRunEffectiveDefinition(runId);
-    const append = [buildStepReportingAppend(def), buildFanOutAppend(def)]
+    // The workflow NAME (not the definition's id) is what the install seam
+    // rendered stage-script names from — pass the same value so the names the
+    // prompt cites and the files on disk cannot drift. Fail-soft to the def id.
+    const workflowName = this.resolveRunWorkflowName(runId) ?? def?.id ?? '';
+    const append = [
+      buildStepReportingAppend(def),
+      buildFanOutAppend(def, { dispatch, workflowName }),
+    ]
       .filter((part) => part.length > 0)
       .join('\n\n');
     return append.length > 0 ? `${append}\n\n${prompt}` : prompt;
+  }
+
+  /**
+   * The run's `workflows.name` from its FROZEN spec row — the identity stage
+   * scripts are named from. `null` fail-soft (missing row / DB error), which
+   * degrades the prompt to the definition id.
+   */
+  private resolveRunWorkflowName(runId: string): string | null {
+    try {
+      return resolveRunFrozenSpec(this.db, runId)?.workflowName ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The run's effective fan-out dispatch mode, snapshotted ONCE per spawn.
+   *
+   * Resolved here rather than read at each use so a mid-run config flip cannot
+   * leave a run whose PROMPT cites stage scripts its worktree does not carry (or
+   * vice versa) — installation and prompt composition consume this one value.
+   */
+  private resolveFanOutDispatch(): FanOutDispatch {
+    return this.configManager?.getFanOutDispatch() ?? DEFAULT_FAN_OUT_DISPATCH;
   }
 
   /**

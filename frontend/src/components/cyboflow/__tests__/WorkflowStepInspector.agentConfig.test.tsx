@@ -279,11 +279,46 @@ describe('AgentConfigSection — runtime picker', () => {
     expect(screen.queryByTestId('inspector-codex-model-select')).not.toBeInTheDocument();
   });
 
-  it('does not render a runtime select when the provider is codex (single-model-per-run note instead)', () => {
-    renderInspector({ definition: makeDefinition(), selectedStepId: 'impl', agentProvider: 'codex' });
+  it('still renders the runtime select when the run provider is codex (a per-agent runtime pin is honoured on any run)', () => {
+    const { dispatch } = renderInspector({
+      definition: makeDefinition(),
+      selectedStepId: 'impl',
+      agentProvider: 'codex',
+    });
     openAgentTab();
 
-    expect(screen.queryByTestId('inspector-agent-runtime-select')).not.toBeInTheDocument();
+    const select = screen.getByTestId('inspector-agent-runtime-select') as HTMLSelectElement;
+    // Unpinned: inherits the run's provider, so the model control is the
+    // single-model-per-run note rather than a per-agent pin.
+    expect(select.value).toBe('');
+    expect(screen.getByTestId('inspector-model-select-codex-note')).toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: 'claude-sdk' } });
+    expect(dispatch).toHaveBeenCalledWith({ type: 'SET_AGENT_RUNTIME', agentKey: 'implement', runtime: 'claude-sdk' });
+  });
+
+  it('gives a codex-run agent pinned back to claude-sdk the Claude model select', () => {
+    renderInspector({
+      definition: makeDefinition({ implement: { runtime: 'claude-sdk' } }),
+      selectedStepId: 'impl',
+      agentProvider: 'codex',
+    });
+    openAgentTab();
+
+    expect(screen.getByTestId('inspector-model-select')).toBeInTheDocument();
+    expect(screen.queryByTestId('inspector-model-select-codex-note')).not.toBeInTheDocument();
+  });
+
+  it('gives a codex-run agent an explicit provider-model pin once it pins a runtime', () => {
+    renderInspector({
+      definition: makeDefinition({ implement: { runtime: 'codex-sdk' } }),
+      selectedStepId: 'impl',
+      agentProvider: 'codex',
+    });
+    openAgentTab();
+
+    expect(screen.getByTestId('inspector-codex-model-select')).toBeInTheDocument();
+    expect(screen.queryByTestId('inspector-model-select-codex-note')).not.toBeInTheDocument();
   });
 });
 

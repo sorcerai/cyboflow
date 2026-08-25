@@ -15,7 +15,12 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../../utils/runGit', () => ({
+// Spread the real module so only runGitAsync is faked; a hand-written factory
+// would silently drop the module's other exports (END_OF_OPTIONS, runGit), and
+// vitest turns reading a missing mock export into a throw INSIDE the helper's
+// try block — which these helpers would then classify as a semantic git failure.
+vi.mock('../../utils/runGit', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/runGit')>()),
   runGitAsync: vi.fn(),
 }));
 

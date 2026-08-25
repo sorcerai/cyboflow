@@ -8,6 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   shouldBlockArtifactFrameNavigation,
   isExternallyOpenable,
+  isSafeExternalOpenTarget,
   shouldBlockScriptedFrameNavigation,
   shouldBlockScriptedFrameNavigationFromRegistry,
   registerScriptedFrameOrigin,
@@ -209,5 +210,73 @@ describe('comment frames never reach the OS browser', () => {
     }
     expect(openExternal).not.toHaveBeenCalled();
     unregisterScriptedFrameOrigin(ORIGIN);
+  });
+});
+
+// ===========================================================================
+// isSafeExternalOpenTarget — the scheme allowlist in front of shell.openExternal
+// for RENDERER-SUPPLIED urls (the `openExternal` IPC channel and the main
+// window's setWindowOpenHandler). shell.openExternal is an OS launcher, not a
+// browser, so an unfiltered url is an OS-level launch primitive reachable from
+// a renderer XSS.
+// ===========================================================================
+describe('isSafeExternalOpenTarget', () => {
+  it('ALLOWS the web + mail schemes the app legitimately opens', () => {
+    for (const url of [
+      'https://github.com/kesteva/cyboflow',
+      'https://docs.anthropic.com/en/docs/claude-code',
+      'http://localhost:8081/preview',
+      'mailto:support@cyboflow.com?subject=Bug',
+    ]) {
+      expect(isSafeExternalOpenTarget(url)).toBe(true);
+    }
+  });
+
+  it('BLOCKS file: — shell.openExternal opens a local document in its registered app', () => {
+    expect(isSafeExternalOpenTarget('file:///Users/me/.ssh/id_rsa')).toBe(false);
+    expect(isSafeExternalOpenTarget('file:///Applications/Calculator.app')).toBe(false);
+  });
+
+  it('BLOCKS javascript: and data:', () => {
+    expect(isSafeExternalOpenTarget('javascript:alert(1)')).toBe(false);
+    expect(isSafeExternalOpenTarget('data:text/html,<script>alert(1)</script>')).toBe(false);
+  });
+
+  it('BLOCKS platform + custom schemes that drive system UI or another app', () => {
+    for (const url of [
+      'x-apple.systempreferences:com.apple.preference.security',
+      'ms-settings:privacy',
+      'smb://attacker.example/share',
+      'vscode://file/etc/passwd',
+      'chrome://settings',
+    ]) {
+      expect(isSafeExternalOpenTarget(url)).toBe(false);
+    }
+  });
+
+  it('BLOCKS anything that is not a parseable absolute URL', () => {
+    expect(isSafeExternalOpenTarget('')).toBe(false);
+    expect(isSafeExternalOpenTarget('/etc/passwd')).toBe(false);
+    expect(isSafeExternalOpenTarget('github.com')).toBe(false);
+  });
+
+  it('judges the PARSED scheme, so leading whitespace cannot smuggle one past', () => {
+    // The URL parser strips leading whitespace before determining the scheme,
+    // which is why the decision is made on `new URL(...).protocol` rather than a
+    // prefix match: a padded javascript: url is still javascript:.
+    expect(isSafeExternalOpenTarget('  https://ok.example')).toBe(true);
+    expect(isSafeExternalOpenTarget('  javascript:alert(1)')).toBe(false);
+    expect(isSafeExternalOpenTarget('\n\tfile:///etc/passwd')).toBe(false);
+  });
+
+  it('is deliberately WIDER than isExternallyOpenable by exactly mailto:', () => {
+    // isExternallyOpenable governs a HOSTILE artifact frame, where popping a
+    // mail composer is not something a mockup should be able to do.
+    expect(isExternallyOpenable('mailto:x@y.z')).toBe(false);
+    expect(isSafeExternalOpenTarget('mailto:x@y.z')).toBe(true);
+    // Everything else agrees.
+    for (const url of ['https://a.example', 'http://b.example', 'file:///x', 'javascript:1']) {
+      expect(isSafeExternalOpenTarget(url)).toBe(isExternallyOpenable(url));
+    }
   });
 });

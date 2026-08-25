@@ -1022,7 +1022,24 @@ function judgeAttribution(sample: PairwiseSample, verdictModel: string | null): 
   };
 }
 
-function SampleChip({ sample, verdictModel }: { sample: PairwiseSample; verdictModel: string | null }): React.JSX.Element {
+/**
+ * One ballot entry. `ordinal` is the chip's 1-based POSITION in the rendered
+ * ballot, deliberately NOT derived from `sample.sampleIndex`: since the pairwise
+ * panel landed, `sampleIndex` is an IDENTITY key, not an ordinal — panel
+ * survivors keep their slot index (so a dropped slot leaves a gap) and backfill
+ * samples are stamped at `panel.length + ordinal`. Rendering `sampleIndex + 1`
+ * showed a degraded three-sample ballot as "#1 #2 #4". `sampleIndex` stays the
+ * React key, where its uniqueness is what matters.
+ */
+function SampleChip({
+  sample,
+  ordinal,
+  verdictModel,
+}: {
+  sample: PairwiseSample;
+  ordinal: number;
+  verdictModel: string | null;
+}): React.JSX.Element {
   const label = sample.preference === 'tie' ? 'Tie' : `Arm ${sample.preference}`;
   const judge = judgeAttribution(sample, verdictModel);
   return (
@@ -1031,7 +1048,7 @@ function SampleChip({ sample, verdictModel }: { sample: PairwiseSample; verdictM
       data-testid="experiment-sample-chip"
       className="inline-flex items-center gap-1 rounded-full border border-border-primary bg-surface-secondary px-2 py-0.5 text-[11px] font-medium text-text-secondary"
     >
-      #{sample.sampleIndex + 1} {label} · {judge.compact}
+      #{ordinal} {label} · {judge.compact}
     </span>
   );
 }
@@ -1098,8 +1115,13 @@ function VerdictCard({
             </p>
           )}
           <div className="flex flex-wrap gap-1.5" data-testid="experiment-verdict-samples">
-            {payload.verdict.perSample.map((s) => (
-              <SampleChip key={s.sampleIndex} sample={s} verdictModel={payload.verdict?.judgeModel ?? null} />
+            {payload.verdict.perSample.map((s, i) => (
+              <SampleChip
+                key={s.sampleIndex}
+                sample={s}
+                ordinal={i + 1}
+                verdictModel={payload.verdict?.judgeModel ?? null}
+              />
             ))}
           </div>
           {(payload.verdict.sampleCount > 0 || payload.verdict.judgeModel !== null) && (

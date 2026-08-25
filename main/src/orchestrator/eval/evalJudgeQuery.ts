@@ -29,6 +29,7 @@ import { loadSdkQuery } from '../../utils/lazyAgentSdk';
 import type { LoggerLike } from '../types';
 import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
 import { EvalJudgeMaxTurnsError, EvalJudgeTimeoutError } from './judgeErrors';
+import { resolveJudgeDeadlineMs } from './judgeDeadline';
 
 /**
  * Default per-sample deadline. A hung claude binary must not stall the worker.
@@ -39,6 +40,10 @@ import { EvalJudgeMaxTurnsError, EvalJudgeTimeoutError } from './judgeErrors';
  * wall while its siblings landed, silently shrinking the jury to 2/3 samples;
  * the extra headroom (plus the trimmed JUDGE_MAX_TURNS below) keeps the common
  * case landing the FULL sample count, not just one.
+ *
+ * This is the BASE, applied verbatim to a small diff. A caller that reports
+ * `diffChars` gets it stretched by the shared judgeDeadline curve — a large diff
+ * is more reading, and a flat wall made exactly those evals time out.
  */
 export const EVAL_JUDGE_TIMEOUT_MS = 600_000;
 
@@ -49,13 +54,20 @@ const JUDGE_ALLOWED_TOOLS = ['Read', 'Grep', 'Glob'] as const;
  * Turn budget: enough to inspect the worktree (read-only) AND emit the final
  * structured verdict. The diff itself is already inlined in the prompt, so these
  * turns are only for supplementary evidence-gathering (grep the snapshot before
- * marking UNKNOWN) — 20 is ample for that. Trimmed from 32 because a generous
- * exploration budget let the judge loop through read-only tool round-trips long
- * enough to blow the deadline even on a SMALL (~35k-char) diff; fewer turns bounds
- * that wall-clock while still leaving room to emit the structured verdict. Diff-
- * only evals (worktree gone) need far fewer, and the hard deadline is the real bound.
+ * marking UNKNOWN). Diff-only evals (worktree gone) need far fewer, and the hard
+ * deadline is the real bound.
+ *
+ * History: 32 -> 20 because a generous exploration budget let the judge loop through
+ * read-only round-trips long enough to blow a FIXED deadline even on a small diff.
+ * Now 40, because both halves of that trade-off changed: the deadline scales with
+ * diff size (judgeDeadline) instead of being flat, and evalJury.MAX_DIFF_CHARS
+ * doubled, so far less is elided and the grep loop has less to chase. The trim
+ * treated the symptom — jurors were looping because they had been handed 9% of a
+ * large diff and told to go find the rest. Measured on the recorded eval history,
+ * 20 turns was itself a top failure mode (7 lost slots to max-turns vs 17 to the
+ * wall), so bounding exploration harder would have cost more samples, not fewer.
  */
-const JUDGE_MAX_TURNS = 20;
+const JUDGE_MAX_TURNS = 40;
 
 /**
  * A one-shot STRUCTURED SDK query: send `prompt`, enforce `schema` via the SDK's
@@ -69,6 +81,11 @@ export interface EvalStructuredQueryFn {
     cwd?: string;
     model?: string;
     signal?: AbortSignal;
+    /**
+     * Size of the graded diff, used to stretch the deadline (see judgeDeadline).
+     * Optional: a caller that omits it gets the plain base deadline.
+     */
+    diffChars?: number;
   }): Promise<unknown>;
 }
 
@@ -112,9 +129,10 @@ function makeDeadline(
  */
 export function makeEvalJudgeQuery(
   logger?: LoggerLike,
-  timeoutMs: number = EVAL_JUDGE_TIMEOUT_MS,
+  baseTimeoutMs: number = EVAL_JUDGE_TIMEOUT_MS,
 ): EvalStructuredQueryFn {
-  return async ({ prompt, schema, cwd, model, signal }) => {
+  return async ({ prompt, schema, cwd, model, signal, diffChars }) => {
+    const timeoutMs = resolveJudgeDeadlineMs(baseTimeoutMs, diffChars);
     const { controller, didTimeOut, cleanup } = makeDeadline(timeoutMs, signal);
     try {
       // Single-shot STRING prompt (not streaming-input): this is a bounded,

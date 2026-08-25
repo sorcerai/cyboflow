@@ -25,7 +25,11 @@
 import { effectiveMaxConcurrency } from '../../../../shared/types/workflows';
 import type { WorkflowAgentConfig, WorkflowDefinition, WorkflowPhase, WorkflowStep } from '../../../../shared/types/workflows';
 import { resolveStepAgentKey, HUMAN_GATE_AGENT } from '../../../../shared/types/agentIdentity';
-import { AGENT_MODEL_LABELS, type AgentModelAlias } from '../../../../shared/types/agents';
+import {
+  agentRunTargetLabel,
+  INHERIT_RUN_MODEL_LABEL,
+  type AgentRunTarget,
+} from '../../../../shared/types/agents';
 import type { WorkflowEditorAction, WorkflowEditorState } from '../../hooks/useWorkflowEditorState';
 import { PHASE_COLORS } from './workflowEditorOptions';
 
@@ -39,7 +43,7 @@ export interface WorkflowEditorCanvasProps {
    * model). Falls back to the literal "run model" when a key is absent.
    * Optional so the canvas compiles before the modal wires it through.
    */
-  agentModelPins?: Record<string, AgentModelAlias | null>;
+  agentRunTargets?: Record<string, AgentRunTarget>;
 }
 
 // Editor step-node width — matches the documented Direction A editor node (178px).
@@ -50,7 +54,7 @@ export function WorkflowEditorCanvas({
   selectedStepId,
   selectedFanOutInner,
   dispatch,
-  agentModelPins,
+  agentRunTargets,
 }: WorkflowEditorCanvasProps) {
   return (
     <div
@@ -80,7 +84,7 @@ export function WorkflowEditorCanvas({
           selectedStepId={selectedStepId}
           selectedFanOutInner={selectedFanOutInner}
           dispatch={dispatch}
-          agentModelPins={agentModelPins}
+          agentRunTargets={agentRunTargets}
         />
       ))}
 
@@ -122,7 +126,7 @@ interface PhaseBandProps {
   selectedStepId: string | null;
   selectedFanOutInner: WorkflowEditorState['selectedFanOutInner'];
   dispatch: React.Dispatch<WorkflowEditorAction>;
-  agentModelPins?: Record<string, AgentModelAlias | null>;
+  agentRunTargets?: Record<string, AgentRunTarget>;
 }
 
 function PhaseBand({
@@ -133,7 +137,7 @@ function PhaseBand({
   selectedStepId,
   selectedFanOutInner,
   dispatch,
-  agentModelPins,
+  agentRunTargets,
 }: PhaseBandProps) {
   return (
     <div
@@ -250,7 +254,7 @@ function PhaseBand({
             selected={step.id === selectedStepId}
             selectedFanOutInner={selectedFanOutInner?.stepId === step.id ? selectedFanOutInner : null}
             dispatch={dispatch}
-            agentModelPins={agentModelPins}
+            agentRunTargets={agentRunTargets}
           />
         ))}
       </div>
@@ -293,7 +297,7 @@ interface StepNodeProps {
   selected: boolean;
   selectedFanOutInner: WorkflowEditorState['selectedFanOutInner'];
   dispatch: React.Dispatch<WorkflowEditorAction>;
-  agentModelPins?: Record<string, AgentModelAlias | null>;
+  agentRunTargets?: Record<string, AgentRunTarget>;
 }
 
 function StepNode({
@@ -305,7 +309,7 @@ function StepNode({
   selected,
   selectedFanOutInner,
   dispatch,
-  agentModelPins,
+  agentRunTargets,
 }: StepNodeProps) {
   const isHuman = step.human === true;
   const isOptional = step.optional === true;
@@ -509,7 +513,7 @@ function StepNode({
             agentKey={agentKey}
             isHumanGate={isHumanGate}
             agentConfig={stepAgentConfig}
-            agentModelPins={agentModelPins}
+            agentRunTargets={agentRunTargets}
             labelWidth={42}
             testId={`editor-step-model-${step.id}`}
           />
@@ -688,7 +692,7 @@ function StepNode({
                               agentKey={innerAgentKey}
                               isHumanGate={innerIsHumanGate}
                               agentConfig={innerAgentConfig}
-                              agentModelPins={agentModelPins}
+                              agentRunTargets={agentRunTargets}
                               labelWidth={38}
                               testId={`editor-fanout-inner-model-${inner.id}`}
                             />
@@ -756,12 +760,22 @@ function StepNode({
 
 // ---------------------------------------------------------------------------
 // ModelMetaRow — shared "model" meta line for the outer step card and each
-// fan-out inner card. Effective value, in precedence order:
-//   (a) this workflow's agentConfigs override for the agent  → styled as an
-//       explicit override (var(--color-status-info), the reads-as-"set here"
-//       accent that is NOT the loop row's error red)
-//   (b) the agent's Agents-pane model pin                    → normal <b>
-//   (c) neither set                                           → literal
+// fan-out inner card.
+//
+// Resolves the run target the SAME per-field way applyWorkflowAgentConfigs does
+// at spawn: `config.<field> ?? agentPin.<field>` for runtime / model /
+// providerModel independently, then folds the three into one label via
+// agentRunTargetLabel. Reading only the Claude `model` alias (as this row used
+// to) rendered an agent pinned to a non-Claude runtime — a Codex- or OMP-pinned
+// `implement`, say — as "run model", the same bug agentRunTargetLabel was
+// written to fix for the Agents-catalogue chip.
+//
+// Styling:
+//   (a) any of the three fields set by THIS workflow's agentConfigs → explicit
+//       override (var(--color-status-info), the reads-as-"set here" accent that
+//       is NOT the loop row's error red)
+//   (b) resolved from the agent's own pin                           → normal <b>
+//   (c) nothing pinned anywhere                                     → literal
 //       "run model", tertiary + italic (inherits silently)
 // Always rendered except for the human gate, which has no model to pin.
 // ---------------------------------------------------------------------------
@@ -770,28 +784,42 @@ interface ModelMetaRowProps {
   agentKey: string;
   isHumanGate: boolean;
   agentConfig: WorkflowAgentConfig | undefined;
-  agentModelPins?: Record<string, AgentModelAlias | null>;
+  agentRunTargets?: Record<string, AgentRunTarget>;
   labelWidth: number;
   testId: string;
 }
 
-function ModelMetaRow({ isHumanGate, agentConfig, agentModelPins, agentKey, labelWidth, testId }: ModelMetaRowProps) {
+function ModelMetaRow({ isHumanGate, agentConfig, agentRunTargets, agentKey, labelWidth, testId }: ModelMetaRowProps) {
   if (isHumanGate) return null;
 
-  const override = agentConfig?.model;
-  const pin = agentModelPins?.[agentKey];
+  const pin = agentRunTargets?.[agentKey];
+  // READ-SEAM normalization, mirroring applyWorkflowAgentConfigs: an explicit
+  // `providerModel` wins over its deprecated `codexModel` alias.
+  const configProviderModel = agentConfig?.providerModel ?? agentConfig?.codexModel;
+  const overridden =
+    agentConfig?.model !== undefined ||
+    agentConfig?.runtime !== undefined ||
+    configProviderModel !== undefined;
+
+  const label = agentRunTargetLabel({
+    runtime: agentConfig?.runtime ?? pin?.runtime ?? null,
+    model: agentConfig?.model ?? pin?.model ?? null,
+    providerModel: configProviderModel ?? pin?.providerModel ?? null,
+  });
+  // A config that pins nothing resolvable (e.g. only `custom`) still inherits.
+  const inherits = label === INHERIT_RUN_MODEL_LABEL;
 
   let text: string;
   let valueStyle: React.CSSProperties;
-  if (override !== undefined) {
-    text = AGENT_MODEL_LABELS[override];
-    valueStyle = { color: 'var(--color-status-info)', fontWeight: 700 };
-  } else if (pin != null) {
-    text = AGENT_MODEL_LABELS[pin];
-    valueStyle = { color: 'var(--color-text-primary)', fontWeight: 600 };
-  } else {
+  if (inherits) {
     text = 'run model';
     valueStyle = { color: 'var(--color-text-tertiary)', fontStyle: 'italic', fontWeight: 400 };
+  } else if (overridden) {
+    text = label;
+    valueStyle = { color: 'var(--color-status-info)', fontWeight: 700 };
+  } else {
+    text = label;
+    valueStyle = { color: 'var(--color-text-primary)', fontWeight: 600 };
   }
 
   return (

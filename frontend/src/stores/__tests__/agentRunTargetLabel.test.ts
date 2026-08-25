@@ -71,7 +71,7 @@ describe('agentRunTargetLabel', () => {
     );
     expect(
       agentRunTargetLabel({ runtime: 'claude-interactive', model: null, providerModel: null }),
-    ).toBe('Claude interactive');
+    ).toBe('Claude Interactive (CLI)');
   });
 
   it('still shows a legacy model-without-runtime pin', () => {

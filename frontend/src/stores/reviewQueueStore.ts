@@ -17,7 +17,8 @@
  *
  * ## Idempotency guarantee
  *
- * `addApproval` is idempotent on duplicate `id` (subscription replay safety).
+ * `addApproval` upserts by `id` — idempotent for a replayed duplicate, and the
+ * path by which an `awaited` flip reaches an item already in the queue.
  * `removeApproval` is a no-op when the id is not present.
  * `replaceAll` is always atomic — it wipes the queue before inserting.
  */
@@ -130,9 +131,11 @@ export const useReviewQueueStore = create<ReviewQueueState>((set, get) => {
     // -- Reducers -------------------------------------------------------------
 
     addApproval: (approval) => {
-      const state = get();
-      if (state.queue.some((a) => a.id === approval.id)) return;
-      const next = [...state.queue, approval];
+      // Delegates to the pure reducer rather than repeating it. These two were
+      // separate implementations of the same rule, and only the pure one was
+      // under test — so a change to either could pass a green suite while
+      // production did the opposite.
+      const next = pureAddApproval(get().queue, approval);
       set({ queue: next });
       syncBadge(next);
     },
@@ -269,8 +272,17 @@ export function useReviewQueueView(): { blocking: QueueItem[]; normal: QueueItem
 
 /** Pure addApproval reducer — exported for unit testing. */
 export function pureAddApproval(queue: Approval[], approval: Approval): Approval[] {
-  if (queue.some((a) => a.id === approval.id)) return queue;
-  return [...queue, approval];
+  const idx = queue.findIndex((a) => a.id === approval.id);
+  if (idx === -1) return [...queue, approval];
+  // Same id, and literally the same record — a replayed subscription event.
+  // Nothing changed, so hand back the identical array and skip the render.
+  if (queue[idx] === approval) return queue;
+  // Same id, DIFFERENT record: ApprovalRouter re-announced an approval whose
+  // `awaited` flag flipped (the omp gate hung up, or a retry re-attached), and
+  // there is no separate "updated" channel for it to use. Replace in place —
+  // the queue is oldest-first and a flip is not a reordering event. Skipping it
+  // (the old behaviour) left the card stale until the next full resync.
+  return queue.map((a, i) => (i === idx ? approval : a));
 }
 
 /** Pure removeApproval reducer — exported for unit testing. */

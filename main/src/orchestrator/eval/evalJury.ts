@@ -38,8 +38,25 @@ export const DEFAULT_JUDGE_MODEL_ALIAS = 'opus';
  * at a stable byte boundary with an explicit in-prompt note so prompt_hash-adjacent
  * behavior stays reproducible and the judge is told the snapshot is partial (it can
  * still grep the worktree for the elided hunks when cwd is present).
+ *
+ * Raised 200k -> 400k. Eviction is what DRIVES the cost: an elided hunk turns into
+ * "grep the worktree", and that exploration loop is what burned the turn budget and
+ * the deadline on large diffs (measured: the Claude slots dying on max-turns or the
+ * wall while the Codex slot, same prompt, landed). Inlining more diff removes the
+ * reason to grep at all.
+ *
+ * Why 400k and not the ~1M an Opus-5[1m] juror could hold: this prompt is shared
+ * VERBATIM with the Codex slot, whose context budget is not ours to assume, and a
+ * per-provider cap would hand the jury slots with different evidence voting into one
+ * pass share. 400k (~100k tokens) is safely inside both. It also costs nothing in
+ * coverage — against the recorded eval history, 400k and 1M inline the exact same
+ * 21 of 24 diffs; only three (1.3M / 1.75M / 2.17M chars) exceed either, and those
+ * are the tail that wants sharding, not a bigger window.
+ *
+ * Note this is a PROMPT cap only. The deadline curve (judgeDeadline) is fed the
+ * PRE-truncation size, so a diff past this cap still buys its extra headroom.
  */
-export const MAX_DIFF_CHARS = 200_000;
+export const MAX_DIFF_CHARS = 400_000;
 
 // ---------------------------------------------------------------------------
 // JudgeClient seam
@@ -299,6 +316,10 @@ export class ClaudeJudge implements JudgeClient {
     const raw = await this.deps.structuredQuery({
       prompt,
       schema: JUDGE_OUTPUT_SCHEMA,
+      // Reported so the query boundary can stretch its deadline for a big diff
+      // (judgeDeadline). Pre-truncation length: the judge is told to grep the
+      // snapshot for elided hunks, so a truncated diff is MORE work, not less.
+      diffChars: input.diff.length,
       ...(input.cwd ? { cwd: input.cwd } : {}),
       ...(this.resolvedModel ? { model: this.resolvedModel } : {}),
       ...(input.signal ? { signal: input.signal } : {}),

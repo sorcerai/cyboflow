@@ -32,7 +32,7 @@ import { ensureSessionForLaunch } from '../../utils/ensureSessionForLaunch';
 import { trackEvent } from '../../utils/telemetry';
 import { isCyboflowWorkflowName } from '../../../../shared/types/workflows';
 import type { WorkflowDefinition, PermissionMode } from '../../../../shared/types/workflows';
-import type { AgentEntry, AgentModelAlias } from '../../../../shared/types/agents';
+import type { AgentEntry, AgentRunTarget } from '../../../../shared/types/agents';
 import { useWorkflowEditorState } from '../../hooks/useWorkflowEditorState';
 import { WorkflowEditorCanvas } from './WorkflowEditorCanvas';
 import { WorkflowStepInspector } from './WorkflowStepInspector';
@@ -153,7 +153,7 @@ export function WorkflowEditorModal({
    * editor's `projectId`. Fetched independently of the definition seed; a fetch
    * failure just yields an empty list — never a broken editor. Two derived views
    * feed the editor: the CUSTOM agent keys surfaced in the step picker, and the
-   * per-agent model pins (`agentModelPins`) the canvas + inspector read to show
+   * per-agent run targets (`agentRunTargets`) the canvas + inspector read to show
    * what each agent inherits. Scoped to `projectId` so a chosen custom key always
    * has a matching `cyboflow-<key>.md` overlay at runtime.
    */
@@ -162,8 +162,17 @@ export function WorkflowEditorModal({
     () => agentEntries.filter((e) => e.isCustom).map((e) => e.agentKey),
     [agentEntries],
   );
-  const agentModelPins = useMemo<Record<string, AgentModelAlias | null>>(
-    () => Object.fromEntries(agentEntries.map((e) => [e.agentKey, e.model])),
+  // The canvas step cards fold runtime + model + providerModel into ONE run-target
+  // label, so they need all three — a model-alias-only map rendered a non-Claude
+  // pinned agent as "run model".
+  const agentRunTargets = useMemo<Record<string, AgentRunTarget>>(
+    () =>
+      Object.fromEntries(
+        agentEntries.map((e) => [
+          e.agentKey,
+          { runtime: e.runtime, model: e.model, providerModel: e.providerModel },
+        ]),
+      ),
     [agentEntries],
   );
 
@@ -663,7 +672,7 @@ export function WorkflowEditorModal({
                 selectedStepId={state.selectedStepId}
                 selectedFanOutInner={state.selectedFanOutInner}
                 dispatch={dispatch}
-                agentModelPins={agentModelPins}
+                agentRunTargets={agentRunTargets}
               />
               <WorkflowStepInspector
                 definition={state.definition}

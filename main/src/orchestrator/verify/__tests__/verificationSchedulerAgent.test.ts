@@ -15,6 +15,9 @@ import {
   AWAIT_TERMINAL_NOT_FOUND_MESSAGE,
   AWAIT_TERMINAL_TIMEOUT_MESSAGE,
   VERIFY_NO_RUNBOOK_REASON,
+  VERIFY_RUNBOOK_DRIFTED_REASON,
+  VERIFY_RUNBOOK_ELSEWHERE_REASON,
+  VERIFY_RUNBOOK_UNREADABLE_REASON,
   VERIFY_UNPROVEN_SKIP_BLOCKED,
   type OnVerdict,
 } from '../verificationScheduler';
@@ -83,6 +86,8 @@ function buildDb(): Database.Database {
       modality              TEXT,
       preflight_json        TEXT,
       setup_proof           INTEGER NOT NULL DEFAULT 0,
+      -- migration 107 (docs/proposals/lane-runbook-bootstrap.md §5)
+      bootstrap_proof       INTEGER NOT NULL DEFAULT 0,
       -- migration 096 (§5.2 seam 3): the content-addressed runbook PIN.
       runbook_hash          TEXT,
       runbook_local_version INTEGER
@@ -144,6 +149,7 @@ const CONFIG: ResolvedVisualVerifyConfig = {
   simulatorDevices: [],
   queuedAgeCeilingMs: 15 * 60 * 1000,
   agentSlots: 2,
+  autoBootstrapRunbook: false,
 };
 
 const PASS_VERDICT: VerdictV1 = {
@@ -227,7 +233,7 @@ describe("VerificationScheduler — ['agent'] stamp dispatch", () => {
       // The composed task below has a serve step, so the §3.2 degrade gate would
       // skip it on the default 'absent' runbook status. This test is about the
       // dispatch path, so it stands in for a project phase 2 has already proven.
-      runbookStatus: async () => 'proven',
+      runbookStatus: async () => ({ status: 'proven', reason: 'proven' }),
     });
 
     scheduler.enqueue({
@@ -948,7 +954,7 @@ describe('VerificationScheduler — §3.2 degrade path (no proven runbook)', () 
 
   it("an 'unproven-draft' runbook is NOT a pass — a written config nobody proved is exactly what already failed", async () => {
     seedRun(db, 'run-draft', JSON.stringify(['agent']));
-    const { scheduler, run } = initWith({ runbookStatus: async () => 'unproven-draft' });
+    const { scheduler, run } = initWith({ runbookStatus: async () => ({ status: 'unproven-draft', reason: 'draft' }) });
     scheduler.enqueue({
       runId: 'run-draft',
       projectId: 1,
@@ -964,7 +970,7 @@ describe('VerificationScheduler — §3.2 degrade path (no proven runbook)', () 
 
   it('a PROVEN runbook lets the same task through', async () => {
     seedRun(db, 'run-proven', JSON.stringify(['agent']));
-    const { scheduler, run } = initWith({ runbookStatus: async () => 'proven' });
+    const { scheduler, run } = initWith({ runbookStatus: async () => ({ status: 'proven', reason: 'proven' }) });
     scheduler.enqueue({
       runId: 'run-proven',
       projectId: 1,
@@ -994,6 +1000,27 @@ describe('VerificationScheduler — §3.2 degrade path (no proven runbook)', () 
     expect(requestRow(db).status).toBe('passed');
   });
 
+  it('a bootstrap_proof row ALSO bypasses the gate — same deadlock, narrower privilege', async () => {
+    // The lane bootstrap exists to produce the runbook the gate is complaining
+    // about, so gating it is the identical deadlock §3.6 exempts setup_proof for.
+    // It buys NOTHING else: the budget still charges it (asserted separately) and
+    // it drains at ordinary priority.
+    seedRun(db, 'run-bootstrap-proof', JSON.stringify(['agent']));
+    const { scheduler, run } = initWith(); // runbookStatus defaults to 'absent'
+    scheduler.enqueue({
+      runId: 'run-bootstrap-proof',
+      projectId: 1,
+      type: 'interactive-web-behavior',
+      input: { intent: 'x' },
+      chain: [],
+      task: SERVE_TASK,
+      bootstrapProof: true,
+    });
+    await flushDrain();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(requestRow(db).status).toBe('passed');
+  });
+
   it('a setup_proof row bypasses the gate (proving the runbook is how a project stops being unproven)', async () => {
     seedRun(db, 'run-setup-proof', JSON.stringify(['agent']));
     const { scheduler, run } = initWith();
@@ -1009,6 +1036,118 @@ describe('VerificationScheduler — §3.2 degrade path (no proven runbook)', () 
     await flushDrain();
     expect(run).toHaveBeenCalledTimes(1);
     expect(requestRow(db).status).toBe('passed');
+  });
+
+  /**
+   * The gate EXPLAINS ITSELF (lane-runbook-bootstrap.md §4).
+   *
+   * Every case below skips the request, and every case answers `'unproven-draft'`
+   * or `'absent'` — the collapsed status cannot tell them apart. The reason can,
+   * and it has to: the remedy for a branch that merely lacks the runbook file is
+   * to MERGE, and following the default "run verification setup" CTA there would
+   * derive a fresh runbook over the proven singleton record every other branch
+   * depends on.
+   */
+  it.each([
+    ['proven-file-absent-here', 'unproven-draft', VERIFY_RUNBOOK_ELSEWHERE_REASON],
+    ['drifted', 'unproven-draft', VERIFY_RUNBOOK_DRIFTED_REASON],
+    ['indeterminate', 'absent', VERIFY_RUNBOOK_UNREADABLE_REASON],
+    // The bootstrappable situations keep the ORIGINAL reason verbatim, so every
+    // existing consumer and CTA keeps matching what it always matched.
+    ['no-record', 'absent', VERIFY_NO_RUNBOOK_REASON],
+    ['draft', 'unproven-draft', VERIFY_NO_RUNBOOK_REASON],
+    ['file-only', 'unproven-draft', VERIFY_NO_RUNBOOK_REASON],
+  ] as const)('a %s runbook skips with its own reason', async (reason, status, expected) => {
+    seedRun(db, `run-reason-${reason}`, JSON.stringify(['agent']));
+    const { scheduler, run } = initWith({
+      runbookStatus: async () => ({ status, reason }),
+    });
+    scheduler.enqueue({
+      runId: `run-reason-${reason}`,
+      projectId: 1,
+      type: 'interactive-web-behavior',
+      input: { intent: 'x' },
+      chain: [],
+      task: SERVE_TASK,
+    });
+    await flushDrain();
+
+    expect(run).not.toHaveBeenCalled();
+    const row = requestRow(db);
+    expect(row.status).toBe('skipped');
+    expect(row.error_message).toBe(expected);
+  });
+
+  /**
+   * WHICH TREE the gate asks about (lane-runbook-bootstrap.md §3, decision B).
+   *
+   * The gate used to pass no path at all, so index.ts probed the PROJECT ROOT —
+   * while `resolveProvenRunbook` had always probed the requesting run's
+   * worktree. Two seams, two trees, one question. A runbook a run commits to its
+   * own branch was therefore invisible to the gate until the branch merged, so
+   * every request in that run kept skipping even after a successful proof.
+   */
+  it("passes the requesting run's worktree as the probe path", async () => {
+    seedRun(db, 'run-probe', JSON.stringify(['agent'])); // worktree_path '/live/worktree'
+    const probed: Array<string | undefined> = [];
+    const { scheduler, run } = initWith({
+      runbookStatus: async (_projectId, _modality, probePath) => {
+        probed.push(probePath);
+        // Proven ONLY in the tree that would actually execute — the exact state
+        // a run that just committed its own runbook is in before merging.
+        return probePath === '/live/worktree'
+          ? { status: 'proven', reason: 'proven' }
+          : { status: 'absent', reason: 'no-record' };
+      },
+    });
+    scheduler.enqueue({
+      runId: 'run-probe',
+      projectId: 1,
+      type: 'interactive-web-behavior',
+      input: { intent: 'x' },
+      chain: [],
+      task: SERVE_TASK,
+    });
+    await flushDrain();
+
+    expect(probed).toEqual(['/live/worktree']);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(requestRow(db).status).toBe('passed');
+  });
+
+  it('passes undefined for a run with no worktree, leaving the project-root fallback intact', async () => {
+    db.prepare(
+      `INSERT INTO workflow_runs (id, project_id, verify_chain, worktree_path, agent_provider, model)
+       VALUES (?, 1, ?, NULL, 'claude', 'claude-sonnet-5')`,
+    ).run('run-no-worktree', JSON.stringify(['agent']));
+    const probed: Array<string | undefined> = [];
+    const { scheduler, run } = initWith({
+      runbookStatus: async (_projectId, _modality, probePath) => {
+        probed.push(probePath);
+        return { status: 'proven', reason: 'proven' };
+      },
+    });
+    scheduler.enqueue({
+      runId: 'run-no-worktree',
+      projectId: 1,
+      type: 'interactive-web-behavior',
+      input: { intent: 'x' },
+      chain: [],
+      task: SERVE_TASK,
+    });
+    await flushDrain();
+
+    // `undefined`, not the project path and not a null the store would probe as
+    // a directory: resolving the fallback is the THUNK's job, and it is the one
+    // place that knows the project row.
+    expect(probed).toEqual([undefined]);
+    // The gate itself let this through — it skips further down, on the
+    // pre-existing "a deployment needs a worktree to snapshot" rule, which is
+    // exactly what should still happen and is not this gate's business.
+    const row = requestRow(db);
+    expect(row.error_message).toBe('run worktree path unavailable');
+    expect(row.error_message).not.toBe(VERIFY_NO_RUNBOOK_REASON);
+    expect(run).not.toHaveBeenCalled();
   });
 });
 
@@ -1070,6 +1209,38 @@ describe('VerificationScheduler — §3.6 budget accounting', () => {
     expect(row.status).toBe('skipped');
     // The preflight is persisted for the phase-3 health panel either way.
     expect(JSON.parse(row.preflight_json ?? 'null')).toMatchObject({ ok: false });
+  });
+
+  it('a bootstrap_proof row is NOT budget-exempt — an exhausted budget still skips it', async () => {
+    // THE LINE BETWEEN THE TWO PROOF KINDS. A budget exemption is defensible for a
+    // flow a human launches once per project; it is not defensible for something a
+    // lane reaches on every sprint, which is exactly the runaway `setup_proof`'s
+    // workflow-identity check exists to prevent. So the bootstrap takes the gate
+    // exemption and NOT this one.
+    seedRun(db, 'run-budget-boot', JSON.stringify(['agent']));
+    db.prepare('UPDATE projects SET visual_verify_budget_calls = 1 WHERE id = 1').run();
+    db.prepare(
+      `INSERT INTO verification_requests (id, run_id, project_id, status, verify_type, deliverable_json, judge_calls_used)
+       VALUES ('vr_spent_boot', 'run-budget-boot', 1, 'passed', 'static-render-snapshot', '{}', 1)`,
+    ).run();
+
+    const { scheduler, run } = initWith({ status: 'passed', fileNames: [], deployed: true });
+    const requestId = scheduler.enqueue({
+      runId: 'run-budget-boot',
+      projectId: 1,
+      type: 'static-render-snapshot',
+      input: { intent: 'x' },
+      chain: [],
+      bootstrapProof: true,
+    });
+    await flushDrain();
+
+    expect(run).not.toHaveBeenCalled();
+    const row = db
+      .prepare('SELECT status, error_message AS err FROM verification_requests WHERE id = ?')
+      .get(requestId) as { status: string; err: string | null };
+    expect(row.status).toBe('skipped');
+    expect(row.err).toContain('budget exhausted');
   });
 
   it('a setup_proof row BYPASSES an exhausted budget and is never counted against it', async () => {
@@ -1753,7 +1924,7 @@ describe('VerificationScheduler — §5.3 engine-enforced proof', () => {
       leasePool: new ResourceLeasePool(new Mutex()),
       agentRunner: runner,
       runbookStore: store,
-      runbookStatus: async () => 'proven',
+      runbookStatus: async () => ({ status: 'proven', reason: 'proven' }),
     });
     scheduler.enqueue({
       runId: 'run-lane-pass',
@@ -1814,7 +1985,7 @@ describe('VerificationScheduler — §5.2 seam 3 pin threading + mismatch classi
       config: CONFIG,
       leasePool: new ResourceLeasePool(new Mutex()),
       agentRunner: runner,
-      runbookStatus: async () => 'proven',
+      runbookStatus: async () => ({ status: 'proven', reason: 'proven' }),
     });
     scheduler.enqueue({
       runId: 'run-pin-thread',
@@ -1850,7 +2021,7 @@ describe('VerificationScheduler — §5.2 seam 3 pin threading + mismatch classi
       config: CONFIG,
       leasePool: new ResourceLeasePool(new Mutex()),
       agentRunner: runner,
-      runbookStatus: async () => 'proven',
+      runbookStatus: async () => ({ status: 'proven', reason: 'proven' }),
     });
     scheduler.enqueue({
       runId: 'run-mismatch',
@@ -1893,7 +2064,7 @@ describe('VerificationScheduler — §3.2 degrade gate with an ASYNC runbook pro
       // sync `!== 'proven'` comparison and deploy an unproven project.
       runbookStatus: async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
-        return 'absent';
+        return { status: 'absent', reason: 'no-record' } as const;
       },
     });
     scheduler.enqueue({
@@ -1924,7 +2095,7 @@ describe('VerificationScheduler — §3.2 degrade gate with an ASYNC runbook pro
       agentRunner: runner,
       runbookStatus: async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
-        return 'proven';
+        return { status: 'proven', reason: 'proven' } as const;
       },
     });
     scheduler.enqueue({
@@ -2106,5 +2277,60 @@ describe('VerificationScheduler — awaitTerminal (§5.2 seam 2)', () => {
     const outcome = await bareScheduler().awaitTerminal('vr-badverdict', 5_000, 5);
     expect(outcome.status).toBe('passed');
     expect(outcome.feedback).toBeNull();
+  });
+});
+
+describe('VerificationScheduler — the bootstrap toggle is read live', () => {
+  it('honours a toggle flipped after boot, in BOTH directions', async () => {
+    // `config` is resolved once at boot, which is right for the judge threshold
+    // and the port pools and wrong for a Settings checkbox. The OFF direction is
+    // the one that matters: unchecking the box mid-incident used to leave the
+    // next lane still deriving and committing to the branch until a relaunch,
+    // with nothing in the UI saying a restart was required.
+    const db = buildDb();
+    let enabled = false;
+    const attempts: string[] = [];
+    const scheduler = VerificationScheduler.initialize({
+      db: dbAdapter(db),
+      backends: { capturePage: fakeBackend(vi.fn(async () => ({ ok: true, fileNames: [] }) satisfies CaptureResult)) },
+      judge: fakeJudge,
+      artifactsDirResolver: () => '/artifacts',
+      config: { ...CONFIG, autoBootstrapRunbook: false },
+      liveConfig: () => ({ ...CONFIG, autoBootstrapRunbook: enabled }),
+      leasePool: new ResourceLeasePool(new Mutex()),
+      onVerdict: () => {},
+      runbookStatus: async () => ({ status: 'unproven-draft', reason: 'draft' }),
+      runbookBootstrap: async (args) => {
+        attempts.push(args.laneTaskRef);
+        return { kind: 'declined', reason: 'unavailable', detail: 'test' };
+      },
+    });
+
+    const call = () =>
+      scheduler.maybeBootstrapRunbook({
+        projectId: 1,
+        runId: 'run-toggle',
+        laneTaskRef: 'TASK-1',
+        modality: 'web',
+        probePath: '/wt',
+        task: {
+          version: 1,
+          summary: 'verify the widget',
+          serve: { cmd: 'pnpm run preview' },
+          behaviors: [],
+        },
+      });
+
+    expect(await call()).toMatchObject({ kind: 'not-attempted' });
+    expect(attempts).toHaveLength(0);
+
+    enabled = true;
+    expect(await call()).toMatchObject({ kind: 'declined' });
+    expect(attempts).toEqual(['TASK-1']);
+
+    enabled = false;
+    expect(await call()).toMatchObject({ kind: 'not-attempted' });
+    expect(attempts).toHaveLength(1);
+    db.close();
   });
 });

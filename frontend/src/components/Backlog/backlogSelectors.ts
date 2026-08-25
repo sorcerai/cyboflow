@@ -252,16 +252,38 @@ export function isExecutionStage(position: number): boolean {
  * belt-and-braces guard against the read-side lagging the stage move.
  */
 export function readyForDevChildTaskIds(epic: BacklogTaskItem): string[] {
-  return (epic.children ?? [])
-    .filter(
-      (c) =>
-        c.type === 'task' &&
-        c.stage_position === READY_FOR_DEV_POSITION &&
-        !c.isDone &&
-        c.archived_at === null &&
-        c.inFlow.length === 0,
-    )
-    .map((c) => c.id);
+  return (epic.children ?? []).filter(isReadyForSprint).map((c) => c.id);
+}
+
+/** The shared "eligible to seed a sprint batch" predicate (see above). */
+function isReadyForSprint(t: BacklogTaskItem): boolean {
+  return (
+    t.type === 'task' &&
+    t.stage_position === READY_FOR_DEV_POSITION &&
+    !t.isDone &&
+    t.archived_at === null &&
+    t.inFlow.length === 0
+  );
+}
+
+/**
+ * The ids of an IDEA's decomposed tasks that are ready to seed a sprint batch —
+ * the idea-session canvas's "Launch sprint" pre-selection. Covers both shapes
+ * decomposition produces: the single epic-less task directly under the idea
+ * (`originating_idea_id`, top-level in the nested list) and tasks nested under
+ * the idea's epics. Same eligibility predicate as readyForDevChildTaskIds.
+ */
+export function ideaReadyTaskIds(rows: BacklogTaskItem[], ideaId: string): string[] {
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (row.originating_idea_id === ideaId && isReadyForSprint(row)) out.add(row.id);
+    for (const child of row.children ?? []) {
+      const fromIdea =
+        child.originating_idea_id === ideaId || row.originating_idea_id === ideaId;
+      if (fromIdea && isReadyForSprint(child)) out.add(child.id);
+    }
+  }
+  return [...out];
 }
 
 /** The board stage a row currently sits in, or null when its stage_id is unknown to the board. */

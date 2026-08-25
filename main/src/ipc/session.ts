@@ -83,9 +83,17 @@ import { listQuickSessions } from '../orchestrator/quickSessionListing';
 import { QuestionRouter } from '../orchestrator/questionRouter';
 import { ApprovalRouter } from '../orchestrator/approvalRouter';
 import { validateDesignIdeaLink } from '../services/designIdeaValidation';
-import { detectClaudeCredentials } from '../utils/claudeCredentials';
-import { detectClaudeBinary } from '../utils/claudeCodeTest';
-import { computeState as computeClaudeDetectionState } from './claudeDetection';
+import {
+  runClaudeSdkSessionPreflights,
+  type ClaudeSdkPreflightFailure,
+} from '../services/claudeSdkSessionPreflight';
+import {
+  openIdeaSession,
+  OpenIdeaSessionError,
+  OPEN_IDEA_SESSION_SCHEMA,
+} from '../services/openIdeaSessionCore';
+import { assertIdeaNotBusy, IdeaBusyError } from '../orchestrator/ideaBusy';
+import { validateInput } from './validateInput';
 
 /**
  * Whether claude's own on-disk transcript for a resumable session still exists at
@@ -116,6 +124,21 @@ import { computeState as computeClaudeDetectionState } from './claudeDetection';
  * Fixed message + bounded `errorClass` per captureSeamError's payload rules —
  * the raw error text stays in the local console.error at the call site.
  */
+/**
+ * Design-session wording for each rung of the SHARED SDK-pinned pre-flight
+ * ladder (services/claudeSdkSessionPreflight.ts). The probe is shared; the
+ * copy is not — index.ts's design-mode fork and the open-idea-session door
+ * each keep their own, so extracting the ladder changed no user-visible string.
+ */
+const DESIGN_PREFLIGHT_MESSAGES: Readonly<Record<ClaudeSdkPreflightFailure, string>> = {
+  provider_disabled:
+    'Design sessions require Claude, which is turned off in Settings → Integrations. Enable Claude to start a design session.',
+  claude_not_detected:
+    'Design sessions require the Claude SDK substrate — Claude credentials/binary not detected. Sign in to Claude Code and try again.',
+  interactive_pty_only:
+    'Design sessions cannot run on the interactive substrate, but this app is locked to interactive-PTY-only mode. Disable that lock in Settings to start a design session.',
+};
+
 function reportEagerSpawnFailure(err: unknown, substrate: string, cliTool: string): void {
   const errorClass = classifyErrorPattern(err instanceof Error ? err.message : String(err));
   captureSeamError(
@@ -403,11 +426,21 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         return { success: false, error: 'Failed to deliver input to the OMP worker' };
       }
     } else {
-      await ompSessionManager.spawn(panelId, dbSession.id, input, {
+      // spawn() fails CLOSED (it emits `exit` and drops the panel) rather than
+      // throwing, so its result is the only honest signal — answering
+      // `success: true` here would leave the composer showing a delivered turn
+      // for a worker that never booted.
+      const spawned = await ompSessionManager.spawn(panelId, dbSession.id, input, {
         model: DEFAULT_OMP_MODEL,
         cwd: dbSession.worktree_path ?? undefined,
       });
+      if (!spawned) {
+        return { success: false, error: 'Failed to start the OMP worker' };
+      }
     }
+    // Mirror the other lanes: a delivered turn puts the session in 'running' so
+    // the sidebar and the session header stop showing it as idle.
+    await sessionManager.updateSession(dbSession.id, { status: 'running' });
     return { success: true };
   };
 
@@ -1105,52 +1138,33 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
           return { success: false, error: ideaValidation.error };
         }
 
+        // Max-one-running-per-idea (idea sessions plan, Stage 1): a design
+        // session is one of the things that occupies an idea, so it must not
+        // start on top of a live run or a mid-turn idea/launched session.
+        // Checked BEFORE the availability probe so the cheap read rejects first.
+        try {
+          assertIdeaNotBusy(databaseService.getDb(), designIdeaId);
+        } catch (busyErr) {
+          if (busyErr instanceof IdeaBusyError) {
+            return { success: false, error: busyErr.message };
+          }
+          throw busyErr;
+        }
+
         // Fail-closed Claude/SDK availability pre-flight. Design sessions are
         // hard-pinned to the Claude SDK substrate below (step 2), so an
         // unavailable Claude login/binary must reject HERE — before any
         // worktree is cut — rather than let normal substrate resolution
         // silently fall through to a substrate the design MCP scope doesn't
-        // cover. Reuses the same detection helpers + state mapping as
-        // onboarding (claudeDetection.ts computeState) so "available" means
-        // the same thing in both places.
-        // Zeroth pre-flight: the Claude provider must be switched on at all.
-        // Design sessions hard-pin the Claude SDK, so a Claude-off install can
-        // never serve one — reject before the detection probe (which would
-        // otherwise report a perfectly healthy account the user disabled).
-        if (!configManager.isAgentProviderEnabled('claude')) {
-          return {
-            success: false,
-            error:
-              'Design sessions require Claude, which is turned off in Settings → Integrations. Enable Claude to start a design session.',
-          };
-        }
-
-        const [designCredentials, designBinary] = await Promise.all([
-          detectClaudeCredentials(),
-          detectClaudeBinary(configManager.getConfig()?.claudeExecutablePath),
-        ]);
-        if (computeClaudeDetectionState(designCredentials.found, designBinary.found) !== 'detected') {
-          return {
-            success: false,
-            error:
-              'Design sessions require the Claude SDK substrate — Claude credentials/binary not detected. Sign in to Claude Code and try again.',
-          };
-        }
-
-        // Second pre-flight: the global interactivePtyOnly lock
-        // (configManager.isInteractivePtyOnly, folded into getForcedSubstrate)
-        // forces EVERY run/session onto the interactive PTY substrate, which
-        // conflicts with the design session's hard SDK pin — fail closed
-        // before creating anything rather than let createRun's post-resolution
-        // guard (requireSdkSubstrate, below) throw after a worktree already
-        // exists. Demo mode's forced 'sdk' pin is compatible with the design
-        // pin and is NOT checked here.
-        if (configManager.isInteractivePtyOnly()) {
-          return {
-            success: false,
-            error:
-              'Design sessions cannot run on the interactive substrate, but this app is locked to interactive-PTY-only mode. Disable that lock in Settings to start a design session.',
-          };
+        // cover. The three rungs (provider switched on → credentials/binary
+        // detect → no interactivePtyOnly lock), their ORDER, and the onboarding
+        // state mapping now live in the SHARED ladder
+        // (services/claudeSdkSessionPreflight.ts), which index.ts's
+        // createDesignSession and the open-idea-session door also run; only the
+        // user-facing wording stays here.
+        const designPreflight = await runClaudeSdkSessionPreflights(configManager);
+        if (!designPreflight.ok) {
+          return { success: false, error: DESIGN_PREFLIGHT_MESSAGES[designPreflight.reason] };
         }
       }
 
@@ -1374,6 +1388,15 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         // resolved-substrate belt confirms 'sdk'.
         db.prepare(`UPDATE sessions SET design_idea_id = ? WHERE id = ?`).run(designIdeaId, session.id);
 
+        // `origin_idea_id` (migration 114): a design session IS a session
+        // launched from the idea, and the sidebar's idea-session nesting groups
+        // children by that column. Lineage, not a claim (no unique index), so it
+        // never conflicts with design_idea_id's own meaning — and it stays a
+        // SEPARATE statement so the design claim above remains exactly the write
+        // it has always been. The refreshSessionFromDatabase below already
+        // publishes both.
+        db.prepare(`UPDATE sessions SET origin_idea_id = ? WHERE id = ?`).run(designIdeaId, session.id);
+
         // v0.5 re-entry stub (design-mode.md "Entry (two doors)"): create the
         // session's ui-prototype artifact row NOW, bytes-less, with the same
         // server-side sourceRef/sessionId stamp handleReportArtifact applies —
@@ -1486,7 +1509,28 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       // ultracode/fast-mode spawn options these lanes have no equivalent for.
       const eagerPtyLane =
         nonClaudeQuickRuntime !== undefined ? quickPtyLanes.get(nonClaudeQuickRuntime) : undefined;
-      if (eagerPtyLane) {
+      // OMP FLEET FIRST — this branch must outrank every substrate branch below.
+      // A fleet session's work runs on a REMOTE worker; any local eager spawn
+      // here would boot a second, unwanted agent against the same worktree.
+      // Today `ompSdkRequested` happens to force resolvedSubstrate to 'sdk', so
+      // the interactive branches miss it by luck rather than by design — one
+      // change to substrate resolution and a fleet session would silently grow a
+      // local Claude REPL. Ordering makes that structural instead of incidental.
+      if (useOmpFleet) {
+        // Create the panel server-side (so the frontend skips a duplicate) but
+        // do NOT spawn — the ADR's "first message spawns". The remote worker
+        // boots on the first panels:send-input / panels:continue.
+        try {
+          const panel = await panelManager.createPanel({
+            sessionId: session.id,
+            type: 'claude',
+            title: 'Chat',
+          });
+          claudePanelId = panel.id;
+        } catch (error) {
+          console.error(`[IPC] Failed to create OMP panel for quick session ${session.id}:`, error);
+        }
+      } else if (eagerPtyLane) {
         try {
           const panel = await panelManager.createPanel({
             sessionId: session.id,
@@ -1616,20 +1660,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
           console.error(`[IPC] Failed to create Claude panel for interactive quick session ${session.id}:`, error);
           // Continue without the eager spawn — sessions:input bootstraps on demand.
         }
-      } else if (useOmpFleet) {
-        // OMP fleet: create the panel server-side (so the frontend skips a
-        // duplicate) but do NOT spawn — the ADR's "first message spawns". The
-        // remote worker boots on the first panels:send-input / panels:continue.
-        try {
-          const panel = await panelManager.createPanel({
-            sessionId: session.id,
-            type: 'claude',
-            title: 'Chat',
-          });
-          claudePanelId = panel.id;
-        } catch (error) {
-          console.error(`[IPC] Failed to create OMP panel for quick session ${session.id}:`, error);
-        }
       }
 
       // claudePanelId is only set on the interactive path (so the frontend skips
@@ -1675,6 +1705,39 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         error: errorMessage,
         details: errorDetails,
         command: command
+      };
+    }
+  });
+
+  /**
+   * sessions:open-idea-session — the backlog idea card's "Open": find-or-create
+   * the idea's ONE persistent, in-place, SDK-pinned home session and hand back a
+   * registered Chat panel.
+   *
+   * Thin by contract (docs/CODE-PATTERNS.md "IPC handler structure"): validate,
+   * delegate to openIdeaSessionCore, map the structured failure to an error
+   * string. Every decision — validation, find, preflights, create, stamp,
+   * rename, UNIQUE-race compensation, panel ensure — lives in the core so it is
+   * unit-testable without Electron.
+   */
+  ipcMain.handle('sessions:open-idea-session', async (_event, args: unknown) => {
+    const v = validateInput(OPEN_IDEA_SESSION_SCHEMA, args, 'sessions:open-idea-session');
+    if (!v.ok) return { success: false, error: v.error };
+
+    try {
+      const result = await openIdeaSession({ projectId: v.value.projectId, ideaId: v.value.ideaId });
+      return { success: true, data: result };
+    } catch (error) {
+      // A user-caused rejection (dead idea, Claude unavailable, substrate belt)
+      // is already a finished sentence — surface it verbatim. Anything else is a
+      // real fault: log it with its stack, return its message.
+      if (error instanceof OpenIdeaSessionError) {
+        return { success: false, error: error.message };
+      }
+      console.error('[IPC] Failed to open idea session:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to open the idea session',
       };
     }
   });
@@ -1736,6 +1799,15 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       const dismissPanels = panelManager.getPanelsForSession(sessionId).filter((p) => p.type === 'claude');
       for (const panel of dismissPanels) {
         try {
+          // OMP fleet panels are 'claude'-typed but owned by the remote-worker
+          // manager, and omp-fleet is NOT a PanelLane — resolvePanelLane maps
+          // them onto the omp-sdk lane, whose manager never spawned them, so
+          // its stopPanel is a no-op and the REMOTE worker survives a dismiss
+          // that is about to delete the worktree out from under it.
+          if (dbSession.agent_runtime === 'omp-fleet') {
+            await ompSessionManager?.stopPanel(panel.id);
+            continue;
+          }
           // Per-PANEL lane: a mixed session (an overridden chat next to inherited
           // ones) has panels on two different managers, so a session-level test
           // would leave the odd one out running.
@@ -2049,10 +2121,15 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
             return { success: false, error: 'Failed to deliver input to the OMP worker' };
           }
         } else {
-          await ompSessionManager.spawn(claudePanel.id, sessionId, finalInput, {
+          // See routeOmpPanelTurn: spawn fails closed, so its result is the
+          // only honest signal for this turn.
+          const spawned = await ompSessionManager.spawn(claudePanel.id, sessionId, finalInput, {
             model: DEFAULT_OMP_MODEL,
             cwd: session.worktreePath ?? undefined,
           });
+          if (!spawned) {
+            return { success: false, error: 'Failed to start the OMP worker' };
+          }
         }
         await sessionManager.updateSession(sessionId, { status: 'running' });
         return { success: true };

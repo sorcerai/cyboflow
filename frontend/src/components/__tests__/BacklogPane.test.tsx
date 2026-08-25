@@ -82,6 +82,20 @@ vi.mock('../../utils/ensureSessionForLaunch', () => ({
   ensureSessionForLaunch: vi.fn().mockResolvedValue('sess-backlog'),
 }));
 
+// Backlog idea card "Open" (idea sessions plan, Stage 4) — mocked at the hook
+// boundary so these tests exercise BacklogPane's WIRING (does clicking an
+// idea card route to openIdeaSession, not launch()?) without also standing up
+// useIdeaSessionOpener's own internals (API IPC, cyboflowStore subscription
+// wiring, etc.) — those are covered directly by useIdeaSessionOpener.test.ts.
+const mockOpenIdeaSession = vi.fn().mockResolvedValue(undefined);
+vi.mock('../../hooks/useIdeaSessionOpener', () => ({
+  useIdeaSessionOpener: () => ({
+    openingTaskId: null,
+    error: null,
+    openIdeaSession: mockOpenIdeaSession,
+  }),
+}));
+
 // Flow-pill session opening (migration 066): MarkerRow reaches these stores via
 // getState() on click — mock both so the click is observable without the real
 // setActiveSession API round-trip.
@@ -203,6 +217,7 @@ beforeEach(() => {
   mockWorkflowsList.mockClear();
   mockSetActiveSession.mockClear();
   mockNavigateToSessions.mockClear();
+  mockOpenIdeaSession.mockClear();
 });
 
 // ---------------------------------------------------------------------------
@@ -514,6 +529,37 @@ describe('BacklogPane', () => {
         sessionId: 'sess-backlog',
       }),
     );
+  });
+
+  // Backlog idea card "Open" (idea sessions plan, Stage 4) — the idea branch
+  // of handleRun routes to useIdeaSessionOpener, never useTaskRunLauncher's
+  // launch()/runs.start (mockOpenIdeaSession is the module-level mock set up
+  // above; success routing + null chatRunId tolerance are covered directly by
+  // useIdeaSessionOpener.test.ts, not re-tested here).
+  it('routes an idea card\'s "Open" click to openIdeaSession(task), never runs.start', async () => {
+    mockTasks = [task({ id: 'idea_open_1', type: 'idea', stage_id: 's-idea', project_id: 1 })];
+    render(<BacklogPane projectId={1} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('task-open-button'));
+    });
+
+    expect(mockOpenIdeaSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'idea_open_1', type: 'idea' }),
+    );
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockWorkflowsList).not.toHaveBeenCalled();
+  });
+
+  it('does NOT open the sprint batch picker for an idea (unlike a Ready-for-dev epic)', async () => {
+    mockTasks = [task({ id: 'idea_open_2', type: 'idea', stage_id: 's-idea', project_id: 1 })];
+    render(<BacklogPane projectId={1} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('task-open-button'));
+    });
+
+    expect(screen.queryByTestId('task-batch-picker-launch')).not.toBeInTheDocument();
   });
 
   it('opens the New task dialog from the + New affordance', () => {

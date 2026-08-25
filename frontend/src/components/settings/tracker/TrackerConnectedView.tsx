@@ -13,12 +13,23 @@
  *   conflict rulings -> cyboflow.tracker.resolveConflict
  *   Disconnect       -> cyboflow.tracker.disconnect (inline confirm first)
  *   Reconnect        -> cyboflow.tracker.updateCredentials (paused connections only)
+ *   Make push target -> cyboflow.tracker.setPushTarget (arms a mapping row, demotes its siblings)
+ *   Remove mapping   -> cyboflow.tracker.disconnect (same procedure as header Disconnect, per row)
  *
  * Toggle state is mirrored locally so a row flips immediately and the summary
  * re-read (driven by the parent's onTrackerChanged subscription) reconciles it.
  * v1 has NO edit deep-links back into the wizard: `updateSettings` covers the
  * direction/mirroring/conflict rows, and changing the source, selection or state
- * mapping means re-running the wizard.
+ * mapping means re-running the wizard. `pushTarget` is read straight off the
+ * summary (no local mirror, no toggle) — it is set by the wizard's Map step
+ * when several sibling connections share a cyboflow project.
+ *
+ * The "Project mappings" card lists every LIVE sibling of this connection's
+ * workspace identity (across cyboflow projects — cyboflow.tracker.mappings),
+ * so a multi-project rev-4 wizard run has one place to see and manage the whole
+ * group: arm a different pusher, remove a mapping, or jump into the wizard's
+ * add-mapping mode via `onAddMapping`. It re-reads on every fresh `connection`
+ * prop, same cadence as the rest of the view.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { inferRouterInputs } from '@trpc/server';
@@ -31,13 +42,21 @@ import type { AppRouter } from '../../../../../shared/types/trpc';
 import type {
   TrackerConflictMode,
   TrackerConflictSummary,
+  TrackerConnectionStatus,
   TrackerConnectionSummary,
+  TrackerContentSyncMode,
   TrackerDirectionMode,
   TrackerMappingTarget,
   TrackerSyncLogEntry,
 } from '../../../../../shared/types/trackerSync';
 import { Eyebrow, PillToggle, ProviderTile, Segmented } from './trackerShared';
-import { logMarkerClass, mappingTargetLabel, providerMeta, trackerInputClass } from './trackerVocabulary';
+import {
+  CONTENT_MODE_OPTIONS,
+  logMarkerClass,
+  mappingTargetLabel,
+  providerMeta,
+  trackerInputClass,
+} from './trackerVocabulary';
 
 const CARD = 'rounded-none border border-border-primary bg-surface-primary';
 
@@ -64,6 +83,23 @@ const SELECTION_LABEL: Record<TrackerConnectionSummary['selectionMode'], string>
   manual: 'Hand-picked',
 };
 
+/**
+ * Compact status presentation for a mappings-card row — honest tones only, so a
+ * paused sibling never reads as green just because it is still "live".
+ */
+const MAPPING_STATUS_META: Record<
+  TrackerConnectionStatus,
+  { label: string; dotClass: string; textClass: string }
+> = {
+  active: { label: 'Connected', dotClass: 'bg-status-success', textClass: 'text-status-success' },
+  paused: { label: 'Paused', dotClass: 'bg-status-warning', textClass: 'text-status-warning' },
+  disconnected: {
+    label: 'Disconnected',
+    dotClass: 'bg-text-tertiary',
+    textClass: 'text-text-tertiary',
+  },
+};
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -81,6 +117,10 @@ export interface TrackerConnectedViewProps {
   onClose: () => void;
   /** Fired after any write so the catalog re-reads its connection rows. */
   onChanged: () => void;
+  /** Resolve a mapping row's `projectId` to its display name for the mappings card. */
+  projectName: (id: number) => string;
+  /** Opens the wizard in add-mapping mode, seeded from this connection. */
+  onAddMapping: () => void;
 }
 
 export function TrackerConnectedView({
@@ -88,6 +128,8 @@ export function TrackerConnectedView({
   connection,
   onClose,
   onChanged,
+  projectName,
+  onAddMapping,
 }: TrackerConnectedViewProps): React.JSX.Element {
   const meta = providerMeta(connection.provider);
 
@@ -97,6 +139,12 @@ export function TrackerConnectedView({
   );
   const [pullMode, setPullMode] = useState<TrackerDirectionMode>(connection.pullMode);
   const [pushMode, setPushMode] = useState<TrackerDirectionMode>(connection.pushMode);
+  const [contentSyncMode, setContentSyncMode] = useState<TrackerContentSyncMode>(
+    connection.contentSyncMode,
+  );
+  const [archiveSyncMode, setArchiveSyncMode] = useState<TrackerContentSyncMode>(
+    connection.archiveSyncMode,
+  );
   const [mirrorSubissues, setMirrorSubissues] = useState(connection.mirrorSubissues);
   const [conflictMode, setConflictMode] = useState<TrackerConflictMode>(connection.conflictMode);
 
@@ -117,6 +165,8 @@ export function TrackerConnectedView({
     setStatusSyncMode(connection.statusSyncMode);
     setPullMode(connection.pullMode);
     setPushMode(connection.pushMode);
+    setContentSyncMode(connection.contentSyncMode);
+    setArchiveSyncMode(connection.archiveSyncMode);
     setMirrorSubissues(connection.mirrorSubissues);
     setConflictMode(connection.conflictMode);
     setLog(connection.lastSyncLog);
@@ -124,6 +174,8 @@ export function TrackerConnectedView({
     connection.statusSyncMode,
     connection.pullMode,
     connection.pushMode,
+    connection.contentSyncMode,
+    connection.archiveSyncMode,
     connection.mirrorSubissues,
     connection.conflictMode,
     connection.lastSyncLog,
@@ -150,6 +202,55 @@ export function TrackerConnectedView({
     loadConflicts();
   }, [loadConflicts, connection.openConflictCount]);
 
+  // Project mappings card: every live sibling of this connection's workspace
+  // identity, across cyboflow projects.
+  const [mappings, setMappings] = useState<TrackerConnectionSummary[]>([]);
+  const [confirmingRemoveId, setConfirmingRemoveId] = useState<string | null>(null);
+
+  const refetchMappings = (): void => {
+    void trpc.cyboflow.tracker.mappings
+      .query({ connectionId: connection.id })
+      .then(setMappings)
+      .catch((err: unknown) => setError(errorMessage(err)));
+  };
+
+  // Keyed on the whole `connection` prop, not just its id: the parent re-reads
+  // summaries on every tracker event, so a fresh prop identity means a sibling's
+  // status/linkedCount/pushTarget may have changed too, not only this row's own.
+  useEffect(() => {
+    refetchMappings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection]);
+
+  const handleSetPushTarget = (rowId: string): void => {
+    setError(null);
+    void trpc.cyboflow.tracker.setPushTarget
+      .mutate({ connectionId: rowId })
+      .then(() => {
+        refetchMappings();
+        onChanged();
+      })
+      .catch((err: unknown) => setError(errorMessage(err)));
+  };
+
+  const handleRemoveMapping = (rowId: string): void => {
+    setError(null);
+    void trpc.cyboflow.tracker.disconnect
+      .mutate({ connectionId: rowId })
+      .then(() => {
+        setConfirmingRemoveId(null);
+        if (rowId === connection.id) {
+          // This is the row the modal is open on — nothing left to show here.
+          onChanged();
+          onClose();
+        } else {
+          refetchMappings();
+          onChanged();
+        }
+      })
+      .catch((err: unknown) => setError(errorMessage(err)));
+  };
+
   const patchSettings = (patch: UpdateSettingsInput): void => {
     setError(null);
     void trpc.cyboflow.tracker.updateSettings
@@ -171,6 +272,16 @@ export function TrackerConnectedView({
   const handlePushMode = (next: TrackerDirectionMode): void => {
     setPushMode(next);
     patchSettings({ connectionId: connection.id, pushMode: next });
+  };
+
+  const handleContentSyncMode = (next: TrackerContentSyncMode): void => {
+    setContentSyncMode(next);
+    patchSettings({ connectionId: connection.id, contentSyncMode: next });
+  };
+
+  const handleArchiveSyncMode = (next: TrackerContentSyncMode): void => {
+    setArchiveSyncMode(next);
+    patchSettings({ connectionId: connection.id, archiveSyncMode: next });
   };
 
   const handleMirror = (next: boolean): void => {
@@ -242,12 +353,29 @@ export function TrackerConnectedView({
 
   const mappedCount = Object.values(connection.stateMapping).filter((t) => t !== 'dont').length;
   const totalStates = Object.keys(connection.stateMapping).length;
+  /**
+   * Read-only counts, wizard-only editing per house convention (no inline
+   * editor here). `toProvider` always carries every level's key (the seed
+   * fills all of them, whether the user ever touched a picker or not), so the
+   * denominator is fixed rather than read off the connection.
+   */
+  const priorityMappedCount = Object.values(connection.priorityMapping.toProvider).filter(
+    (t) => t !== null,
+  ).length;
+  const categoryMappedCount = Object.values(connection.categoryMapping.toProvider).filter(
+    (t) => t !== null,
+  ).length;
 
-  /** The distinct cyboflow stages this connection imports into. */
+  /**
+   * The distinct cyboflow stages this connection IMPORTS into. 'indev' is
+   * excluded alongside 'dont': it is an outbound-only pin, so listing it here
+   * would claim an inbound destination that does not exist. It still counts as
+   * mapped above, because the user did map it — just not inward.
+   */
   const mappedTargets = useMemo(() => {
     const seen = new Set<TrackerMappingTarget>();
     for (const target of Object.values(connection.stateMapping)) {
-      if (target !== 'dont') seen.add(target);
+      if (target !== 'dont' && target !== 'indev') seen.add(target);
     }
     return [...seen].map(mappingTargetLabel).join(' · ');
   }, [connection.stateMapping]);
@@ -415,6 +543,139 @@ export function TrackerConnectedView({
               ))}
             </div>
 
+            {/* Project mappings */}
+            <div className={CARD} data-testid="tracker-mappings-card">
+              <div className="flex items-center justify-between gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
+                <Eyebrow>Project mappings</Eyebrow>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  className="rounded-none"
+                  data-testid="tracker-add-mapping"
+                  onClick={onAddMapping}
+                >
+                  Add mapping
+                </Button>
+              </div>
+              <div className="divide-y divide-border-primary">
+                {mappings.map((row) => {
+                  const status = MAPPING_STATUS_META[row.status];
+                  const isCurrent = row.id === connection.id;
+                  const confirmingRemove = confirmingRemoveId === row.id;
+                  return (
+                    <div
+                      key={row.id}
+                      data-testid="tracker-mapping-row"
+                      className={cn(
+                        'flex items-center gap-3 px-3 py-2.5',
+                        isCurrent && 'bg-surface-secondary',
+                      )}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs font-semibold text-text-primary">
+                          {row.sourceLabel}
+                          <span className="mx-1.5 text-text-tertiary">·</span>
+                          <span className="text-text-secondary">{projectName(row.projectId)}</span>
+                        </p>
+                        <p className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+                          <span className={cn('flex items-center gap-1.5 font-semibold', status.textClass)}>
+                            <span className={cn('h-1.5 w-1.5 flex-shrink-0 rounded-full', status.dotClass)} />
+                            {status.label}
+                          </span>
+                          <span className="text-text-tertiary">{row.linkedCount} linked</span>
+                          {/* Honest chip: a paused row holds the flag but enqueues
+                              nothing until reconnected — never a green claim. */}
+                          {row.pushTarget && (
+                            <span
+                              className={cn(
+                                'flex-shrink-0 rounded-none border px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em]',
+                                row.status === 'active'
+                                  ? 'border-status-success text-status-success'
+                                  : 'border-status-warning text-status-warning',
+                              )}
+                            >
+                              {row.status === 'active' ? 'Pushes' : 'Pushes when reconnected'}
+                            </span>
+                          )}
+                          {isCurrent && (
+                            <span className="text-[10px] uppercase tracking-[0.12em] text-text-tertiary">
+                              viewing
+                            </span>
+                          )}
+                        </p>
+                      </div>
+
+                      <div className="ml-auto flex flex-shrink-0 items-center gap-2">
+                        {confirmingRemove ? (
+                          <>
+                            <span className="text-[11px] text-text-secondary">
+                              Remove this mapping? Existing links stay.
+                            </span>
+                            <Button
+                              type="button"
+                              variant="danger"
+                              size="sm"
+                              className="rounded-none"
+                              onClick={() => handleRemoveMapping(row.id)}
+                            >
+                              Confirm
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="rounded-none"
+                              onClick={() => setConfirmingRemoveId(null)}
+                            >
+                              Cancel
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            {/* Offered only where the server would accept it: a
+                                paused row cannot take the role away from an
+                                ACTIVE same-project sibling (it would silently
+                                drop every idea filed until it reconnects). */}
+                            {!row.pushTarget &&
+                              (row.status === 'active' ||
+                                !mappings.some(
+                                  (m) =>
+                                    m.id !== row.id &&
+                                    m.projectId === row.projectId &&
+                                    m.status === 'active',
+                                )) && (
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                className="rounded-none"
+                                onClick={() => handleSetPushTarget(row.id)}
+                              >
+                                Make push target
+                              </Button>
+                            )}
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="sm"
+                              className="rounded-none"
+                              onClick={() => setConfirmingRemoveId(row.id)}
+                            >
+                              Remove
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+                {mappings.length === 0 && (
+                  <p className="px-3 py-4 text-xs text-text-tertiary">Loading mappings…</p>
+                )}
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               {/* Sync settings */}
               <div className={CARD}>
@@ -481,6 +742,53 @@ export function TrackerConnectedView({
                     />
                   </div>
 
+                  {/*
+                   * Multi-project mapping: several sibling connections can
+                   * share this cyboflow project, but only one per provider
+                   * pushes new ideas out (push_target). No edit affordance —
+                   * push target is set by the wizard's Map step, not here.
+                   */}
+                  {!connection.pushTarget && (
+                    <div className="px-3 py-2.5">
+                      <p className="text-[11px] text-text-tertiary">
+                        New ideas push · off — another mapping for this project pushes
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-text-primary">Sync task fields</p>
+                      <p className="text-[11px] text-text-tertiary">
+                        Title, description, priority
+                        {meta.supportsCategorySync ? ', and category' : ''} push out to {meta.name}.
+                      </p>
+                    </div>
+                    <Segmented
+                      options={CONTENT_MODE_OPTIONS}
+                      value={contentSyncMode}
+                      onChange={handleContentSyncMode}
+                      ariaLabel="Sync task fields"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-text-primary">
+                        Archive in {meta.name}
+                      </p>
+                      <p className="text-[11px] text-text-tertiary">
+                        A local archive or delete trashes the linked issue — never a hard delete.
+                      </p>
+                    </div>
+                    <Segmented
+                      options={CONTENT_MODE_OPTIONS}
+                      value={archiveSyncMode}
+                      onChange={handleArchiveSyncMode}
+                      ariaLabel={`Archive in ${meta.name}`}
+                    />
+                  </div>
+
                   <div className="flex items-center justify-between gap-3 px-3 py-2.5">
                     <div className="min-w-0">
                       <p className="text-xs font-semibold text-text-primary">
@@ -523,6 +831,31 @@ export function TrackerConnectedView({
                       {mappedTargets || 'nothing imported'}
                     </span>
                   </div>
+
+                  {/*
+                   * Read-only, like State mapping above — editing either
+                   * table means re-running the wizard (v1's mapping-only
+                   * editing rule), so this is a count, never a picker.
+                   */}
+                  <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-text-primary">Priority mapping</p>
+                      <p className="text-[11px] text-text-tertiary">
+                        {priorityMappedCount} of 7 priorities mapped
+                      </p>
+                    </div>
+                  </div>
+
+                  {meta.supportsCategorySync && (
+                    <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-text-primary">Category mapping</p>
+                        <p className="text-[11px] text-text-tertiary">
+                          {categoryMappedCount} of 3 categories mapped
+                        </p>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 

@@ -26,6 +26,10 @@ import type { AgentProvider, WorkflowAgentRuntime } from './agentRuntime';
  *               active, weight>0 variants.
  * - `paused`  — temporarily out of rotation; still explicitly pinnable.
  * - `retired` — hidden from pickers and rotation; kept for historical stats.
+ *
+ * Archiving is a SEPARATE axis ({@link WorkflowVariantRow.archived_at}, migration
+ * 116): it hides a variant of ANY status from the list/pickers/rotation without
+ * overwriting the status it had.
  */
 export type WorkflowVariantStatus = 'draft' | 'active' | 'paused' | 'retired';
 
@@ -80,6 +84,14 @@ export interface WorkflowVariantRow {
   /** Rotation weight (>= 0). */
   weight: number;
   status: WorkflowVariantStatus;
+  /**
+   * Archive stamp (migration 116), or NULL when live. ORTHOGONAL to
+   * {@link status}: archiving hides a variant from the management list, the
+   * launch pickers and the rotation pool while preserving its status, weight
+   * and run history. An explicit pin (a restart reproducing a historical run)
+   * still resolves an archived variant by id.
+   */
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -327,6 +339,12 @@ export const MIN_VARIANT_RUNS = 5;
  * judge's neutral-label output; `preference` is the mapped-back arm identity.
  */
 export interface PairwiseSample {
+  /**
+   * IDENTITY/KEY only — NOT a dense 0..K-1 ordinal. It is the sample's PANEL SLOT
+   * index, so a degraded ballot has gaps (e.g. [0, 2]); samples drawn by the
+   * bounded backfill use `panel.length + ordinal` to stay pairwise-distinct.
+   * Render position from array order, never from this value.
+   */
   sampleIndex: number;
   positionAFirst: boolean;
   rawPreference: '1' | '2' | 'tie';
@@ -376,6 +394,12 @@ export interface ExperimentComparisonRow {
   judge_model: string | null;
   judge_build_id: string | null;
   prompt_hash: string | null;
+  /**
+   * OVERLOADED by status: a failure message on `failed`/`skipped` rows, but a
+   * panel-DEGRADATION note on a `complete` row (which is a healthy outcome — some
+   * judge slots dropped and the ballot was backfilled). Never treat
+   * `error IS NOT NULL` alone as "this comparison broke".
+   */
   error: string | null;
   decision_review_item_id: string | null;
   snapshot_at: string | null;

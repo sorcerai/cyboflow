@@ -8,7 +8,8 @@
  * the shared session worktree, with a single human review at the end. This
  * modal is the entry point: the user multi-selects the tasks, the chosen
  * substrate drives the selection cap N (15 for sdk, 10 for interactive —
- * SPRINT_BATCH_MAX_TASKS), and onPicked hands the task ids back to the caller
+ * the effective per-substrate cap — resolveSprintMaxTasks over the user's
+ * Settings override), and onPicked hands the task ids back to the caller
  * which threads them into runs.start as `taskIds`.
  *
  * Eligibility (rendered + selectable) — this MIRRORS the strict runs.start
@@ -45,7 +46,8 @@ import type { BacklogTaskItem, Board } from '../../../../shared/types/tasks';
 import type { EpicTaskGroup } from './taskGrouping';
 import { flattenGroups, groupTasksByEpic } from './taskGrouping';
 import { EpicGroupedTaskList } from './EpicGroupedTaskList';
-import { SPRINT_BATCH_MAX_TASKS } from '../../../../shared/types/sprintBatch';
+import { resolveSprintMaxTasks } from '../../../../shared/types/sprintBatch';
+import { useConfigStore } from '../../stores/configStore';
 import type { CliSubstrate } from '../../../../shared/types/substrate';
 
 interface TaskBatchPickerModalProps {
@@ -94,6 +96,16 @@ export function TaskBatchPickerModal({
    */
   const [effectiveSubstrate, setEffectiveSubstrate] = useState<CliSubstrate>(substrate);
 
+  /**
+   * The user's per-substrate cap override (Settings → Sessions). App.tsx primes
+   * the config store at mount and Settings refetches after every save, so this is
+   * the live value; `resolveSprintMaxTasks` supplies the built-in default for a
+   * substrate the user never overrode. Reading it here (rather than the raw
+   * constant) is what makes the picker's cap agree with the server-side 400 in
+   * runs.start.
+   */
+  const sprintMaxTasks = useConfigStore((state) => state.config?.sprintMaxTasks);
+
   // Load the project's tasks AND its boards whenever the modal opens. The board
   // stages supply the terminal-stage set the eligibility predicate needs (to
   // drop 'Done' and 'Won't do'); the two queries resolve together so tasks are
@@ -139,7 +151,7 @@ export function TaskBatchPickerModal({
         const eligibleSet = new Set(
           batchable.filter((t) => t.inFlow.length === 0).map((t) => t.id),
         );
-        const seedCap = SPRINT_BATCH_MAX_TASKS[substrate];
+        const seedCap = resolveSprintMaxTasks(sprintMaxTasks, substrate);
         setSelectedIds((prev) => {
           const source =
             preselectedTaskIds && preselectedTaskIds.length > 0
@@ -160,7 +172,7 @@ export function TaskBatchPickerModal({
       .finally(() => {
         setIsLoading(false);
       });
-  }, [isOpen, projectId, preselectedTaskIds, substrate]);
+  }, [isOpen, projectId, preselectedTaskIds, substrate, sprintMaxTasks]);
 
   // Re-resolve the effective substrate (drives the cap) whenever the requested
   // substrate or the open state changes.
@@ -182,7 +194,7 @@ export function TaskBatchPickerModal({
     };
   }, [isOpen, substrate]);
 
-  const cap = SPRINT_BATCH_MAX_TASKS[effectiveSubstrate];
+  const cap = resolveSprintMaxTasks(sprintMaxTasks, effectiveSubstrate);
 
   // Eligible tasks (selectable): not in-flight. In-flight tasks are still
   // rendered (disabled) for context.

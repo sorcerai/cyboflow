@@ -21,6 +21,7 @@ import type { ReasoningEffort } from '../../../../../shared/types/reasoningEffor
 import { AbstractCliManager } from '../cli/AbstractCliManager';
 import { resolveAgentModelAlias } from '../agentModelContext';
 import { perfBump } from '../../perfTracer';
+import { observeCodexNotification } from '../../providerUsage/codexUsageObserver';
 import {
   CODEX_EXECUTABLE_VERSION,
   prependCodexPathToEnvironment,
@@ -729,6 +730,15 @@ export class CodexSdkManager extends AbstractCliManager {
         // under the entry's stable runId, mirroring pre-warm behavior.
         entry.rawNotificationSink.persist(entry.runId, notification);
         entry.turnSession.handleNotification(notification);
+        // Usage telemetry LAST, and never allowed to throw: an exception
+        // escaping this handler reaches CodexAppServerClient.fail(), which
+        // SIGTERMs the app-server's whole process group mid-turn.
+        try {
+          observeCodexNotification(notification.method, notification.params);
+        } catch {
+          // Unreachable in practice — observeCodexNotification is itself
+          // catch-all — but a usage meter must never be able to kill a turn.
+        }
       },
       onStderr: (chunk) => this.logger?.warn(`[Codex app-server stderr] ${chunk.trimEnd()}`),
       onError: (error) => {

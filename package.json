@@ -1,6 +1,6 @@
 {
   "name": "cyboflow",
-  "version": "0.2.3",
+  "version": "0.2.6",
   "private": true,
   "description": "Cyboflow - Multi-session AI code assistant manager",
   "author": {
@@ -30,6 +30,7 @@
     "dev": "pnpm run electron-dev",
     "electron-dev": "node scripts/ensure-sqlite-abi.mjs electron && concurrently \"pnpm run --filter frontend dev\" \"wait-on http://localhost:${CYBOFLOW_VITE_PORT:-4521} && env -u NODE_OPTIONS electron . --remote-debugging-port=${CYBOFLOW_CDP_PORT:-9223}\"",
     "electron-dev:custom": "node scripts/ensure-sqlite-abi.mjs electron && concurrently \"pnpm run --filter frontend dev\" \"wait-on http://localhost:${CYBOFLOW_VITE_PORT:-4521} && env -u NODE_OPTIONS electron .\"",
+    "dev:perf": "node scripts/ensure-sqlite-abi.mjs electron && concurrently \"pnpm run --filter frontend dev\" \"wait-on http://localhost:${CYBOFLOW_VITE_PORT:-4521} && CYBOFLOW_PERF_TRACE=1 electron . --inspect=${CYBOFLOW_INSPECT_PORT:-9229} --remote-debugging-port=${CYBOFLOW_CDP_PORT:-9223}\"",
     "build": "pnpm run build:frontend && pnpm run build:main && pnpm run build:electron",
     "build:frontend": "pnpm run --filter frontend build",
     "build:main": "pnpm run --filter main build && node scripts/bundle-mcp-server.mjs",
@@ -62,7 +63,7 @@
     "test:ci:minimal": "playwright test --config=playwright.ci.minimal.config.ts",
     "test:ui": "playwright test --ui",
     "test:headed": "playwright test --headed",
-    "test:build": "node build/afterSign.test.js && node scripts/configure-build.test.js",
+    "test:build": "node build/afterSign.test.js && node build/verifyArtifact.test.js && node scripts/configure-build.test.js",
     "verify:schema": "node scripts/verify-schema-parity.js",
     "test:unit": "node scripts/ensure-sqlite-abi.mjs host && pnpm --filter main test && pnpm --filter frontend test && pnpm run verify:schema && node scripts/__tests__/verify-schema-parity.test.js && node scripts/__tests__/release-scripts.test.js && node scripts/__tests__/ensure-sqlite-abi.test.js && pnpm run test:build",
     "test:gate": "node scripts/ensure-sqlite-abi.mjs host && vitest run --config vitest.config.gate.ts",
@@ -119,7 +120,9 @@
       "package.json",
       "node_modules/**/*",
       "build/**/*",
-      "LICENSE"
+      "LICENSE",
+      "!node_modules/better-sqlite3/bin/**",
+      "!node_modules/@homebridge/node-pty-prebuilt-multiarch/bin/**"
     ],
     "npmRebuild": true,
     "buildDependenciesFromSource": false,
@@ -140,6 +143,7 @@
       }
     ],
     "afterSign": "build/afterSign.js",
+    "artifactBuildCompleted": "build/verifyArtifact.js",
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "main/assets/icon.icns",

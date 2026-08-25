@@ -33,6 +33,7 @@ import { createTestDb, seedApproval, seedQuestion } from '../../__test_fixtures_
 import { stepTransitionEvents } from '../../trpc/routers/events';
 import { TaskChangeRouter, taskChangeEvents } from '../../taskChangeRouter';
 import { ReviewItemRouter, reviewItemChangeEvents } from '../../reviewItemRouter';
+import { IdeaComponentRouter, ideaComponentChangeEvents } from '../../ideaComponents/ideaComponentRouter';
 import { SprintLaneStore, sprintLaneEvents, sprintLaneChannel } from '../../sprintLaneStore';
 import { ApprovalRouter } from '../../approvalRouter';
 import { QuestionRouter } from '../../questionRouter';
@@ -1910,6 +1911,24 @@ describe('McpQueryHandler', () => {
         );
         CREATE INDEX idx_approved_designs_idea ON approved_designs(idea_id);
       `);
+      // Migration 101 (idea component ledger): handleGetTask now unconditionally
+      // resolves cyboflow_get_task's 'components' for every idea via
+      // resolveIdeaComponents — the table must exist even for tests that never
+      // touch the ledger directly (same rationale as approved_designs above).
+      // A minimal 'artifacts' table (migration 035, not otherwise in this
+      // fixture's chain) is ALSO needed: an idea created via createEntity()
+      // below is linked to its creating run through a real entity_events row
+      // (run_id set), so resolveIdeaComponentsBatch's 'prototype' derivation
+      // arm queries `artifacts` for that run id even when nothing was ever
+      // minted against it.
+      db.exec(readFileSync(join(migDir, '101_idea_component_ledger.sql'), 'utf-8'));
+      db.exec(`
+        CREATE TABLE artifacts (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          atype TEXT NOT NULL
+        );
+      `);
       return db;
     }
 
@@ -1953,7 +1972,9 @@ describe('McpQueryHandler', () => {
 
     afterEach(() => {
       TaskChangeRouter._resetForTesting();
+      IdeaComponentRouter._resetForTesting();
       taskChangeEvents.removeAllListeners();
+      ideaComponentChangeEvents.removeAllListeners();
     });
 
     /** Create an entity via the real mcp-create-task handler; returns its id + ref. */
@@ -2503,6 +2524,295 @@ describe('McpQueryHandler', () => {
           draft_revision: current.draftRevision,
         });
       });
+    });
+
+    // -----------------------------------------------------------------------
+    // Idea component ledger (migration 101) exposure on cyboflow_get_task —
+    // see the sibling 'idea component staleness hook' coverage in
+    // taskChangeRouter.test.ts for how a component actually GOES stale; this
+    // block covers the read-side shape/gating only.
+    // -----------------------------------------------------------------------
+    describe('mcp-get-task components (idea component ledger, migration 101)', () => {
+      it("surfaces all FIVE derived components for a fresh idea, and omits 'components' for an epic/task", async () => {
+        listSeedRun(listDb, 'run-get-comp-1');
+        const idea = await createEntity('run-get-comp-1', 'Fresh idea');
+        const task = await createEntity('run-get-comp-1', 'A plain task', 'task');
+
+        const ideaRes = makeSocketDouble();
+        await listHandler.handleMessage(
+          { type: 'mcp-get-task', requestId: 'gt-comp-1', runId: 'run-get-comp-1', taskId: idea.id },
+          ideaRes.socket,
+        );
+        const ideaData = parseLastWrite(ideaRes.writes).data as { task: Record<string, unknown> };
+        const components = ideaData.task['components'] as Array<Record<string, unknown>>;
+        expect(components).toBeDefined();
+        expect(components.map((c) => c['component'])).toEqual([
+          'idea-spec',
+          'prototype',
+          'architecture',
+          'epics',
+          'stories',
+        ]);
+        // A fresh idea with no body/children derives every component 'incomplete',
+        // source 'derived', never stale (staleAt null on every entry).
+        for (const c of components) {
+          expect(c['state']).toBe('incomplete');
+          expect(c['source']).toBe('derived');
+          expect(c['staleAt']).toBeNull();
+        }
+
+        const taskRes = makeSocketDouble();
+        await listHandler.handleMessage(
+          { type: 'mcp-get-task', requestId: 'gt-comp-2', runId: 'run-get-comp-1', taskId: task.id },
+          taskRes.socket,
+        );
+        const taskData = parseLastWrite(taskRes.writes).data as { task: Record<string, unknown> };
+        expect('components' in taskData.task).toBe(false);
+      });
+
+      it('a component with prior work marked stale reads as visibly distinct from one never started', async () => {
+        listSeedRun(listDb, 'run-get-comp-2');
+        const idea = await createEntity('run-get-comp-2', 'Idea with mixed ledger state');
+
+        IdeaComponentRouter.initialize(dbAdapter(listDb));
+        // 'architecture' finished a full pass, THEN the idea's body moved under
+        // it (mark-stale) — prior work exists and needs re-verification.
+        await IdeaComponentRouter.getInstance().applyChange(1, {
+          op: 'set-component-state',
+          ideaId: idea.id,
+          component: 'architecture',
+          state: 'complete',
+          source: 'flow',
+        });
+        await IdeaComponentRouter.getInstance().applyChange(1, {
+          op: 'mark-stale',
+          ideaId: idea.id,
+          staleReason: 'idea body changed',
+        });
+
+        const { socket, writes } = makeSocketDouble();
+        await listHandler.handleMessage(
+          { type: 'mcp-get-task', requestId: 'gt-comp-3', runId: 'run-get-comp-2', taskId: idea.id },
+          socket,
+        );
+        const data = parseLastWrite(writes).data as { task: Record<string, unknown> };
+        const components = data.task['components'] as Array<Record<string, unknown>>;
+
+        const architecture = components.find((c) => c['component'] === 'architecture')!;
+        // "needs review": incomplete WITH a stale flag — prior work exists.
+        expect(architecture['state']).toBe('incomplete');
+        expect(architecture['staleAt']).not.toBeNull();
+
+        // 'stories' has no ledger row at all and derives to plain 'incomplete' —
+        // "not started". Same `state`, but VISIBLY DIFFERENT via staleAt: the
+        // exact distinction the ledger design says must never collapse.
+        const stories = components.find((c) => c['component'] === 'stories')!;
+        expect(stories['state']).toBe('incomplete');
+        expect(stories['staleAt']).toBeNull();
+        expect(architecture['staleAt']).not.toEqual(stories['staleAt']);
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // cyboflow_set_idea_component (mcp-set-idea-component) — the WRITE half of
+  // the idea component ledger (migration 101). Routes through
+  // IdeaComponentRouter.getInstance().applyChange with source:'flow';
+  // sourceRunId + builtAgainstVersion are resolved by the handler itself.
+  // -------------------------------------------------------------------------
+
+  describe('mcp-set-idea-component', () => {
+    function buildComponentDb(): Database.Database {
+      const db = new Database(':memory:');
+      db.pragma('foreign_keys = ON');
+      db.exec(`
+        CREATE TABLE projects (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL UNIQUE,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      db.prepare('INSERT INTO projects (id, name, path) VALUES (1, ?, ?)').run('Proj', '/tmp/p1');
+
+      const migDir = join(__dirname, '..', '..', '..', 'database', 'migrations');
+      db.exec(readFileSync(join(migDir, '006_cyboflow_schema.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '011_workflow_step_tracking.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '014_native_tasks.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '015_entity_model_rebuild.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '024_archive_in_place.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '028_idea_attachments.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '042_collapse_board.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '057_entity_sort_order.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '059_entity_category.sql'), 'utf-8'));
+      db.exec(readFileSync(join(migDir, '101_idea_component_ledger.sql'), 'utf-8'));
+      // taskListing.selectTaskById's UNION (reached by mcp-set-idea-component's
+      // id/ref resolution, same as mcp-get-task) also reads experiment_id
+      // (migration 049) unconditionally — absent from this fixture's chain.
+      db.exec('ALTER TABLE ideas ADD COLUMN experiment_id TEXT;');
+      db.exec('ALTER TABLE epics ADD COLUMN experiment_id TEXT;');
+      db.exec('ALTER TABLE tasks ADD COLUMN experiment_id TEXT;');
+      // resolveIdeaComponentsBatch (the post-write emit read) unconditionally
+      // queries approved_designs, and — once the created idea's entity_events
+      // row links it to this fixture's run — the 'prototype' derivation arm
+      // also queries artifacts for that run id. Neither table is otherwise in
+      // this fixture's chain (mirrors taskChangeRouter.test.ts's
+      // buildDbWithIdeaComponents()).
+      db.exec(`
+        CREATE TABLE approved_designs (id TEXT PRIMARY KEY, idea_id TEXT NOT NULL, superseded_at TEXT);
+        CREATE TABLE artifacts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, atype TEXT NOT NULL);
+      `);
+      return db;
+    }
+
+    function seedComponentRun(db: Database.Database, runId: string): void {
+      db.prepare(
+        `INSERT OR IGNORE INTO workflows (id, project_id, name, spec_json) VALUES ('wf-comp', 1, 'planner', '{}')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_runs
+           (id, workflow_id, project_id, status, current_step_id, steps_snapshot_json)
+         VALUES (?, 'wf-comp', 1, 'running', 'expand-spec', ?)`,
+      ).run(runId, JSON.stringify({ 'expand-spec': 'cyboflow-planner' }));
+    }
+
+    let componentDb: Database.Database;
+    let componentHandler: McpQueryHandler;
+
+    beforeEach(() => {
+      componentDb = buildComponentDb();
+      TaskChangeRouter.initialize(dbAdapter(componentDb));
+      IdeaComponentRouter.initialize(dbAdapter(componentDb));
+      componentHandler = new McpQueryHandler(dbAdapter(componentDb));
+    });
+
+    afterEach(() => {
+      TaskChangeRouter._resetForTesting();
+      IdeaComponentRouter._resetForTesting();
+      taskChangeEvents.removeAllListeners();
+      ideaComponentChangeEvents.removeAllListeners();
+    });
+
+    /** Create an idea via the real mcp-create-task handler; returns its id + ref. */
+    async function createIdea(runId: string, title: string): Promise<{ id: string; ref: string }> {
+      const { socket, writes } = makeSocketDouble();
+      await componentHandler.handleMessage(
+        { type: 'mcp-create-task', requestId: `ci-${title}`, runId, title, taskType: 'idea' },
+        socket,
+      );
+      const data = parseLastWrite(writes).data as { task_id: string; ref: string };
+      return { id: data.task_id, ref: data.ref };
+    }
+
+    /** Raw row read, bypassing the router — asserts exactly what was persisted. */
+    function rawComponentRow(
+      ideaId: string,
+      component: string,
+    ): { state: string; source: string; source_run_id: string | null; built_against_version: number | null } | undefined {
+      return componentDb
+        .prepare(
+          `SELECT state, source, source_run_id, built_against_version
+             FROM idea_components WHERE idea_id = ? AND component = ?`,
+        )
+        .get(ideaId, component) as
+        | { state: string; source: string; source_run_id: string | null; built_against_version: number | null }
+        | undefined;
+    }
+
+    it('sets a component state with source "flow", stamping sourceRunId + the idea\'s current version', async () => {
+      seedComponentRun(componentDb, 'run-sic-1');
+      const idea = await createIdea('run-sic-1', 'An idea');
+
+      const { socket, writes } = makeSocketDouble();
+      await componentHandler.handleMessage(
+        {
+          type: 'mcp-set-idea-component',
+          requestId: 'sic-1',
+          runId: 'run-sic-1',
+          ideaId: idea.id,
+          component: 'architecture',
+          state: 'complete',
+        },
+        socket,
+      );
+
+      const response = parseLastWrite(writes);
+      expect(response.ok).toBe(true);
+      const data = response.data as {
+        idea_id: string;
+        ref: string;
+        component: string;
+        state: string;
+        components: Array<Record<string, unknown>>;
+      };
+      expect(data.idea_id).toBe(idea.id);
+      expect(data.ref).toBe(idea.ref);
+      expect(data.component).toBe('architecture');
+      expect(data.state).toBe('complete');
+      // The fresh merged snapshot round-trips the just-written state.
+      const architecture = data.components.find((c) => c['component'] === 'architecture')!;
+      expect(architecture['state']).toBe('complete');
+      expect(architecture['source']).toBe('flow');
+
+      const row = rawComponentRow(idea.id, 'architecture');
+      expect(row).toMatchObject({ state: 'complete', source: 'flow', source_run_id: 'run-sic-1' });
+      // builtAgainstVersion is resolved from the idea's OWN current version —
+      // never accepted from the caller, who never passed one.
+      const idea2 = componentDb.prepare('SELECT version FROM ideas WHERE id = ?').get(idea.id) as {
+        version: number;
+      };
+      expect(row?.built_against_version).toBe(idea2.version);
+    });
+
+    it('resolves a display ref (IDEA-NNN) to the idea, exactly like cyboflow_get_task', async () => {
+      seedComponentRun(componentDb, 'run-sic-2');
+      const idea = await createIdea('run-sic-2', 'Ref-addressed idea');
+      expect(idea.ref).toMatch(/^IDEA-\d+$/);
+
+      const { socket, writes } = makeSocketDouble();
+      await componentHandler.handleMessage(
+        {
+          type: 'mcp-set-idea-component',
+          requestId: 'sic-2',
+          runId: 'run-sic-2',
+          ideaId: idea.ref,
+          component: 'stories',
+          state: 'skipped',
+        },
+        socket,
+      );
+
+      const response = parseLastWrite(writes);
+      expect(response.ok).toBe(true);
+      expect((response.data as { idea_id: string }).idea_id).toBe(idea.id);
+      expect(rawComponentRow(idea.id, 'stories')?.state).toBe('skipped');
+    });
+
+    it('rejects a non-idea target (epic/task) with not_found — the ledger is ideas-only', async () => {
+      seedComponentRun(componentDb, 'run-sic-3');
+      const { socket: taskSocket, writes: taskWrites } = makeSocketDouble();
+      await componentHandler.handleMessage(
+        { type: 'mcp-create-task', requestId: 'ci-task', runId: 'run-sic-3', title: 'A task', taskType: 'task' },
+        taskSocket,
+      );
+      const taskId = (parseLastWrite(taskWrites).data as { task_id: string }).task_id;
+
+      const { socket, writes } = makeSocketDouble();
+      await componentHandler.handleMessage(
+        {
+          type: 'mcp-set-idea-component',
+          requestId: 'sic-3',
+          runId: 'run-sic-3',
+          ideaId: taskId,
+          component: 'stories',
+          state: 'complete',
+        },
+        socket,
+      );
+      const response = parseLastWrite(writes);
+      expect(response.ok).toBe(false);
+      expect(response.error).toBe('not_found');
     });
   });
 
@@ -6690,5 +7000,41 @@ describe('mcp-run-eval', () => {
     expect(response.ok).toBe(false);
     expect(response.error).toBe('eval_request_failed');
     expect(writes).toHaveLength(1);
+  });
+});
+
+describe('bootstrap_proof is not a wire field (migration 107 tripwire)', () => {
+  /**
+   * THE INVARIANT. `setup_proof` is agent-settable and defends itself with a
+   * workflow-identity check. `bootstrap_proof` (docs/proposals/lane-runbook-bootstrap.md
+   * §5) defends itself more simply and more strongly: the MCP handler does not
+   * read it AT ALL, so there is no request an agent can compose — in any flow,
+   * with any argument — that sets it. Only the in-process controller seam
+   * (enqueueTaskVerification) can.
+   *
+   * This is a SOURCE tripwire rather than a behavioral one on purpose: the
+   * property being protected is the ABSENCE of a code path, and the way that
+   * property dies is someone helpfully threading the flag through the wire
+   * schema "for symmetry with setup_proof". A behavioral test would pass right
+   * up until that happens and then start testing the new path instead.
+   */
+  it('the MCP query handler never references the bootstrap-proof flag', () => {
+    const source = readFileSync(join(__dirname, '..', 'mcpQueryHandler.ts'), 'utf-8');
+    // Comments are allowed to NAME it (explaining why it is absent is useful);
+    // strip line comments and block comments before scanning for real references.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toMatch(/bootstrap_proof/);
+    expect(code).not.toMatch(/bootstrapProof/);
+  });
+
+  it('the MCP server tool schema never exposes a bootstrap-proof input', () => {
+    const source = readFileSync(join(__dirname, '..', 'cyboflowMcpServer.ts'), 'utf-8');
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toMatch(/bootstrap_proof/);
+    expect(code).not.toMatch(/bootstrapProof/);
   });
 });

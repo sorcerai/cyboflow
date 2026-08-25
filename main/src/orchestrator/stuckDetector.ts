@@ -1,7 +1,7 @@
 /**
- * StuckDetector — periodic service that scans for approvals pending longer
- * than STALE_THRESHOLD_MS (5 minutes), classifies the failure reason, and
- * transitions the affected workflow_run to status='stuck'.
+ * StuckDetector — periodic service that scans for AWAITED approvals pending
+ * longer than STALE_THRESHOLD_MS (45 minutes), classifies the failure reason,
+ * and transitions the affected workflow_run to status='stuck'.
  *
  * Standalone-typecheck invariant (ROADMAP-001 §6.3):
  * This module must NOT import from 'electron', 'better-sqlite3', or any
@@ -19,8 +19,22 @@ import { emitSeamError } from './telemetrySink';
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Approvals older than this (ms) are considered stale. */
-const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * Approvals older than this (ms) are considered stale.
+ *
+ * 45 minutes, not the original 5. The threshold has to sit ABOVE the longest
+ * decision window the product itself sanctions, or it reclassifies patience as
+ * failure: the OMP gate gives a human ~30 minutes to answer, and 86d3fd1e
+ * records a real approval answered at 6m14s that this constant had already
+ * declared wedged at 5m. A human reading a diff before approving a shell
+ * command is the normal case, not the pathological one.
+ *
+ * This is a NOTIFICATION/ESCALATION boundary, not proof of a deadlock — the
+ * rungs below supply the proof. Raising it does not fix a wrong classification
+ * and is not trying to; it stops the clock from being the thing that
+ * manufactures one.
+ */
+const STALE_THRESHOLD_MS = 45 * 60 * 1000; // 45 minutes
 
 /** How often the detector scans for stale approvals. */
 const SCAN_INTERVAL_MS = 60_000; // 60 seconds
@@ -36,16 +50,6 @@ const SCAN_INTERVAL_MS = 60_000; // 60 seconds
  */
 export interface ClaudeManagerLike {
   hasActiveRunForId(runId: string): boolean;
-}
-
-/**
- * Narrow interface for querying whether a permission-socket client is
- * connected for a given run ID.  The real implementation is supplied by the
- * permission IPC layer.  When unavailable, default to `false` (stale_socket
- * classification disabled) with a one-time WARN.
- */
-export interface PermissionServerLike {
-  hasClientForRun(runId: string): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,8 +77,6 @@ interface WorkflowRunRow {
 export interface StuckDetectorDeps {
   db: DatabaseLike;
   claudeManager: ClaudeManagerLike;
-  /** Optional — when omitted, stale_socket classification is skipped. */
-  permissionServer?: PermissionServerLike;
   /** Per-component event emitter for publishing 'runs:stuck' events. */
   emitter: EventEmitter;
   logger: LoggerLike;
@@ -87,14 +89,10 @@ export interface StuckDetectorDeps {
 export class StuckDetector {
   private readonly db: DatabaseLike;
   private readonly claudeManager: ClaudeManagerLike;
-  private readonly permissionServer: PermissionServerLike | undefined;
   private readonly emitter: EventEmitter;
   private readonly logger: LoggerLike;
 
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
-
-  /** One-time warning flag for missing permissionServer. */
-  private permissionServerWarnEmitted = false;
 
   // Hoisted prepared statements — SQL is static, so prepare once per detector
   // instance instead of on every scan tick / per-row.
@@ -106,21 +104,57 @@ export class StuckDetector {
   constructor(deps: StuckDetectorDeps) {
     this.db = deps.db;
     this.claudeManager = deps.claudeManager;
-    this.permissionServer = deps.permissionServer;
     this.emitter = deps.emitter;
     this.logger = deps.logger;
 
+    // `awaited = 1` on every approval predicate below (migration 111): a
+    // pending row means two different things now. Either a requester is
+    // blocked on it right now, or the ask is still answerable but nobody is
+    // waiting — the omp-sdk gate hangs up at ~25s and the model may never
+    // retry. Only the first is evidence a run is wedged. Counting the second
+    // is how an OMP run that had long since moved on looked deadlocked.
+    // `unixepoch(created_at) < unixepoch(?)`, not `created_at < ?`. A raw string
+    // comparison silently assumed every writer stamps the same format, and they
+    // did not: transitions.ts left the column to `DEFAULT CURRENT_TIMESTAMP`
+    // ('2026-08-23 20:43:58') while the cutoff here is toISOString()
+    // ('2026-08-23T19:58:58.545Z'). ' ' (0x20) < 'T' (0x54), so a same-date row
+    // in the space form ALWAYS compared as older than the cutoff regardless of
+    // clock time — a brand-new approval read as 45 minutes stale and stamped its
+    // run 'stuck' on the first scan. transitions.ts now writes ISO, so new rows
+    // agree; unixepoch() parses both spellings to the same integer and keeps
+    // rows written before that fix honest. `status = 'pending'` still uses
+    // idx_approvals_status_created for its equality prefix; only the range on
+    // created_at gives up the index, and pending rows are few.
     this.stmtStaleApprovals = this.db.prepare(
       `SELECT id, run_id, status, created_at FROM approvals
-       WHERE status = 'pending' AND created_at < ?`,
+       WHERE status = 'pending' AND awaited = 1
+         AND unixepoch(created_at) < unixepoch(?)`,
     );
+    // Rung 3 additionally: orphanPendingForRun deliberately permits a SECOND
+    // pending approval per run on the OMP lane (it restores the run to
+    // 'running' while the ask stays collectable), so counting un-awaited rows
+    // here made a healthy OMP run look like an intra-run queue jam.
     this.stmtSelfDeadlockCount = this.db.prepare(
       `SELECT COUNT(*) as cnt FROM approvals
-       WHERE run_id = ? AND status = 'pending' AND id != ?`,
+       WHERE run_id = ? AND status = 'pending' AND awaited = 1 AND id != ?`,
     );
+    // Rung 4 requires the CONFLICTING run to itself hold a stale pending
+    // approval. Until now this query checked only `status='awaiting_review'`,
+    // which the docstring above never claimed: awaiting_review is also the
+    // plain rest state of every finished run waiting on Merge/Dismiss, so
+    // "another run exists" degenerated into "any other session finished a
+    // turn" and stamped healthy runs as deadlocked. The EXISTS clause is the
+    // behavior the docstring always described.
     this.stmtCrossRunDeadlock = this.db.prepare(
-      `SELECT id FROM workflow_runs
-       WHERE status = 'awaiting_review' AND id != ?
+      `SELECT wr.id FROM workflow_runs wr
+       WHERE wr.status = 'awaiting_review' AND wr.id != ?
+         AND EXISTS (
+           SELECT 1 FROM approvals a
+            WHERE a.run_id = wr.id
+              AND a.status = 'pending'
+              AND a.awaited = 1
+              AND unixepoch(a.created_at) < unixepoch(?)
+         )
        LIMIT 1`,
     );
     this.stmtTransitionToStuck = this.db.prepare(
@@ -178,15 +212,15 @@ export class StuckDetector {
     try {
       const cutoff = Date.now() - STALE_THRESHOLD_MS;
 
-      // SQLite stores created_at as an ISO datetime string or unix ms integer
-      // depending on how it was inserted.  The approvalRouter inserts as ISO
-      // (new Date().toISOString()), so we compare against the ISO representation
-      // of the cutoff timestamp.
+      // The cutoff goes to SQLite as ISO-8601. Both approval predicates wrap it
+      // and the column in unixepoch() rather than trusting a string compare —
+      // see the note on stmtStaleApprovals for the format mismatch that made a
+      // fresh approval read as stale.
       const cutoffIso = new Date(cutoff).toISOString();
       const rows = this.stmtStaleApprovals.all(cutoffIso) as ApprovalRow[];
 
       for (const approval of rows) {
-        const reason = this.classifyStaleApproval(approval);
+        const reason = this.classifyStaleApproval(approval, cutoffIso);
         if (reason === null) {
           continue;
         }
@@ -208,46 +242,65 @@ export class StuckDetector {
    * Classify a stale approval into a StuckReason variant (first match wins):
    *
    * 1. orphan_pty      — no active Claude run for the run's ID.
-   * 2. stale_socket    — no permission-socket client connected for the run's ID.
-   * 3. self_deadlock   — the same run has another pending approval distinct from
+   * 2. self_deadlock   — the same run has another pending approval distinct from
    *                      this one (intra-run queue jam).
-   * 4. cross_run_deadlock — v1 heuristic: another run is in 'awaiting_review'
-   *                         with a stale pending approval (conflictingRunId set).
+   * 3. cross_run_deadlock — another run is in 'awaiting_review' AND itself holds
+   *                         a stale pending approval (conflictingRunId set).
+   *
+   * `stale_socket` was rung 2 and is RETIRED — see the note on StuckReason in
+   * shared/types/stuckDetection.ts. It never fired, and wiring it would have
+   * been wrong in all three directions (rationale below).
    *
    * Returns null when none of the above apply — the approval is stale but not
    * deterministically stuck, so no transition fires.
    */
-  classifyStaleApproval(approval: ApprovalRow): StuckReason | null {
+  classifyStaleApproval(approval: ApprovalRow, cutoffIso?: string): StuckReason | null {
     const { id: approvalId, run_id: runId } = approval;
+    // scan() already computed the cutoff for its own query; accept it so rung 4
+    // shares one staleness boundary with the row that triggered this call.
+    // Recomputed here only for direct callers (tests) that pass one approval.
+    const cutoff = cutoffIso ?? new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
 
     // 1. orphan_pty
     if (!this.claudeManager.hasActiveRunForId(runId)) {
       return { kind: 'orphan_pty' };
     }
 
-    // 2. stale_socket
-    if (this.permissionServer) {
-      if (!this.permissionServer.hasClientForRun(runId)) {
-        return { kind: 'stale_socket' };
-      }
-    } else {
-      // Emit one-time WARN when permissionServer is not wired.
-      if (!this.permissionServerWarnEmitted) {
-        this.permissionServerWarnEmitted = true;
-        this.logger.warn(
-          '[StuckDetector] permissionServer not provided — stale_socket classification disabled',
-        );
-      }
-    }
+    // RETIRED RUNG — `stale_socket`, formerly rung 2, asked the socket server
+    // whether a permission-socket client was still connected for this run. It
+    // was never wired (the dep was never passed), so it never fired once: zero
+    // rows in any database carry stuck_reason='stale_socket'. Wiring it was
+    // examined on 2026-08-21 and rejected, because the condition it hunts for
+    // cannot survive to be observed, and the query it would have run is wrong
+    // for every lane:
+    //
+    //   - PTY shell-hook lane: when the client dies mid-approval the socket's
+    //     own 'close'/'error' handler calls abandonPendingForRun, which settles
+    //     the row and restores awaiting_review -> running SYNCHRONOUSLY. No
+    //     stale pending approval survives for a later scan to classify.
+    //   - OMP lane: the same disconnect calls orphanPendingForRun, which keeps
+    //     the ask pending ON PURPOSE (nobody is waiting; the verdict stays
+    //     collectable by a later retry — migration 111's `awaited = 0`). That
+    //     is a designed state, so firing here would report a healthy run.
+    //   - claude-sdk lane: permission decisions are produced in-process by the
+    //     PreToolUse hook and never touch the socket at all. hasClientForRun
+    //     binds LAZILY, on the first envelope carrying a runId, so a healthy
+    //     SDK run that has not yet called a cyboflow_* tool reads false — an
+    //     unconditional rung 2 would stamp it stuck on nothing.
+    //
+    // So: no true positives available, false positives across the whole SDK
+    // lane, and the one genuinely orphaned case (a socket lost across an app
+    // restart, where the in-memory binding map is empty) is already covered by
+    // rung 1 above, which answers it for every lane rather than just this one.
 
-    // 3. self_deadlock — another pending approval for the same run
+    // 2. self_deadlock — another pending approval for the same run
     const selfRow = this.stmtSelfDeadlockCount.get(runId, approvalId) as { cnt: number };
     if (selfRow.cnt > 0) {
       return { kind: 'self_deadlock' };
     }
 
-    // 4. cross_run_deadlock (v1 heuristic)
-    const crossRow = this.stmtCrossRunDeadlock.get(runId) as WorkflowRunRow | undefined;
+    // 3. cross_run_deadlock
+    const crossRow = this.stmtCrossRunDeadlock.get(runId, cutoff) as WorkflowRunRow | undefined;
     if (crossRow) {
       return { kind: 'cross_run_deadlock', conflictingRunId: crossRow.id };
     }

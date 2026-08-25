@@ -49,7 +49,16 @@ import type { ClaudeStreamEvent } from '../../../../../shared/types/claudeStream
  * `SDKBackgroundTasksChangedMessage` (`system/background_tasks_changed`), and dropped none.
  * cyboflow does not model that kind, so it fail-softs to `{kind:'__unknown__'}` like
  * `system/permission_denied` already does — no new builder, so `EXPECTED_DISCRIMINANTS`
- * is unchanged. Add one only if production starts consuming background-task events.
+ * is unchanged. (Production DOES consume the other background-task signals —
+ * task_started / task_updated / task_notification, see claudeCodeManager — so add a
+ * builder here only if it starts consuming `background_tasks_changed` specifically.)
+ *
+ * A TYPE-level pass is not a CONTRACT-level pass, and this pin only enforces the former.
+ * The same 0.3.224 diff carried two semantic changes that compiled clean and shipped
+ * broken: `origin` inverted its default (absent stopped meaning "human"), and
+ * `CanUseTool` gained an optional `matchedAskRule` a host-side auto-approver is
+ * obliged to honor. When this tripwire fires, read the changed d.ts CONTRACT TEXT for
+ * the host callbacks too — do not stop at the `SDKMessage` union.
  */
 const PINNED_SDK_VERSION = '0.3.224';
 

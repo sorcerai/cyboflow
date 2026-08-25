@@ -6,6 +6,10 @@
  *   - list                : query        -> Artifact[] (a run's deliverables)
  *   - listBySession       : query        -> Artifact[] (a session's deliverables
  *                                            across ALL its runs)
+ *   - listForIdea         : query        -> IdeaArtifactLink[] (one idea's five
+ *                                            ledger components, each resolved
+ *                                            against the concrete artifact
+ *                                            backing it — see ../../ideaArtifacts.ts)
  *   - get                 : query        -> Artifact | null
  *   - commit              : mutation     -> { artifactId } (persist to repo)
  *   - onArtifactChanged   : subscription -> ArtifactChangedEvent (project-scoped)
@@ -24,12 +28,14 @@ import { z } from 'zod';
 import { router, protectedProcedure } from '../trpc';
 import type { DatabaseLike } from '../../types';
 import type { Artifact, ArtifactChangedEvent } from '../../../../../shared/types/artifacts';
+import type { IdeaArtifactLink } from '../../../../../shared/types/ideaArtifacts';
 import {
   ArtifactRouter,
   ArtifactError,
   artifactChangeEvents,
   artifactProjectChannel,
 } from '../../artifactRouter';
+import { listIdeaArtifactLinks } from '../../ideaArtifacts';
 import { eventToAsyncIterable } from './events';
 
 function requireDb(db: DatabaseLike | undefined, where: string): DatabaseLike {
@@ -115,6 +121,32 @@ export const artifactsRouter = router({
       if (!run) return [];
       return sortArtifactsOldestFirst(
         await ArtifactRouter.getInstance().listForSession(run.projectId, input.sessionId),
+      );
+    }),
+
+  /**
+   * List one idea's five ledger components (idea-spec / prototype /
+   * architecture / epics / stories), each resolved against the concrete
+   * deliverable artifact backing it — the idea-scoped "link out to the real
+   * tab" read model (see `../../ideaArtifacts.ts`). Delegates entirely to
+   * `listIdeaArtifactLinks`, injecting this router's `listForRun` so the
+   * module stays independent of the `ArtifactRouter` singleton. `projectId`
+   * is taken from the caller (not re-derived from the idea) because a
+   * component's backing run may belong to a DIFFERENT project than the idea
+   * in a cross-project edge case — `listIdeaArtifactLinks` itself treats such
+   * a run as absent rather than trusting it.
+   */
+  listForIdea: protectedProcedure
+    .input(z.object({ projectId: z.number().int().positive(), ideaId: z.string().min(1) }))
+    .query(async ({ input, ctx }): Promise<IdeaArtifactLink[]> => {
+      const db = requireDb(ctx.db, 'listForIdea');
+      return listIdeaArtifactLinks(
+        {
+          db,
+          listForRun: (pid, rid, committed) => ArtifactRouter.getInstance().listForRun(pid, rid, committed),
+        },
+        input.projectId,
+        input.ideaId,
       );
     }),
 

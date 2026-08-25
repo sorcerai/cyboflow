@@ -13,8 +13,8 @@
  *     CreateSessionRequest.substrate → sessions.substrate (migration 027);
  *     'interactive' spawns a PTY-backed quick session (persistent claude REPL).
  *
- * Global PTY-only lock: when Settings → AI Integration → CLI runtime is set to
- * "Interactive PTY only" (config.interactivePtyOnly), the SDK is disabled and
+ * Global CLI-only lock: when Settings → AI Integration → CLI runtime is set to
+ * "Interactive CLI only" (config.interactivePtyOnly), the SDK is disabled and
  * every run is forced onto the interactive substrate. The authoritative pin is
  * the backend ConfigManager.getForcedSubstrate (consumed in
  * WorkflowRegistry.createRun, above the whole resolver ladder); this component
@@ -33,6 +33,7 @@
  */
 import { useEffect } from 'react';
 import {
+  AGENT_RUNTIME_LABELS,
   firstEnabledRuntime,
   isRuntimeProviderEnabled,
   isSessionAgentRuntime,
@@ -42,7 +43,7 @@ import {
 import { isRuntimeSelectableInPickers } from '../../../../shared/types/agentCapabilities';
 import { useAgentProviderAccess } from '../../hooks/useAgentProviderAccess';
 import { useForcedSubstrate } from '../../hooks/useForcedSubstrate';
-import { useOmpAvailability } from '../../hooks/useOmpAvailability';
+import { useOmpAvailability, type OmpAvailability } from '../../hooks/useOmpAvailability';
 import {
   workflowRuntimeForLaunch,
   type LaunchAgentRuntime,
@@ -60,15 +61,30 @@ export const INTERACTIVE_CAVEATS: readonly string[] = [
   'Streaming is coarser — output arrives at turn-level granularity, not token-level deltas.',
 ];
 
-/** The v1 limits of the OMP structured (omp-sdk) lane, mirroring INTERACTIVE_CAVEATS' style. */
+/**
+ * The v1 limits of the OMP structured (omp-sdk) lane, mirroring
+ * INTERACTIVE_CAVEATS' style.
+ *
+ * The last two were added after the 2026-08-16 release smoke returned RED on
+ * this lane with exactly these two app-owned findings. Both are deliberate v1
+ * gaps rather than defects — the `task` deny is the unconditional rule 2 in
+ * `gate/ompGateExtension.ts` (OMP subagents run forced-yolo and whether the
+ * gating hook is even installed inside one is unverified), and the dialog
+ * cancel is `OmpApprovalBridge`'s no-question-bridge path. What the old wording
+ * got wrong was the SEVERITY: "No question gate yet — approvals land in the
+ * review queue" describes the approval prompt, which the bridge answers fine,
+ * and says nothing about the agent's own `ask` tool, which is cancelled and
+ * ENDS THE TURN ("Tool call denied by user" upstream). A user should know both
+ * before choosing this lane, not after a run stops mid-task.
+ */
 export const OMP_SDK_CAVEATS: readonly string[] = [
-  'No question gate yet — approvals land in the review queue.',
   'Slow approvals (over 25s) are blocked and can be retried.',
+  'Subagents are unavailable — OMP’s task tool is refused, so the agent cannot delegate.',
 ];
 
-/** The v1 limits of the OMP terminal (omp-pty) lane. */
+/** The v1 limits of the OMP CLI (omp-pty) lane. */
 export const OMP_PTY_CAVEATS: readonly string[] = [
-  'Approvals stay in the OMP terminal — no Cyboflow review-queue integration.',
+  'Approvals stay in the OMP CLI — no Cyboflow review-queue integration.',
 ];
 
 interface SubstrateSelectorProps {
@@ -84,16 +100,25 @@ interface SubstrateSelectorProps {
   runtimeScope?: 'workflow' | 'session' | 'mixed';
 }
 
-/** Every runtime this picker knows a row for, in display order. */
-const RUNTIME_OPTIONS: readonly { runtime: LaunchAgentRuntime; label: string }[] = [
-  { runtime: 'claude-sdk', label: 'Claude SDK (default)' },
-  { runtime: 'claude-interactive', label: 'Claude interactive (PTY)' },
-  { runtime: 'codex-sdk', label: 'Codex SDK' },
-  { runtime: 'codex-pty', label: 'Codex PTY — quick sessions only' },
-  { runtime: 'omp-sdk', label: 'OMP' },
-  { runtime: 'omp-pty', label: 'OMP terminal' },
-  { runtime: 'omp-fleet', label: 'OMP fleet — quick sessions only' },
-];
+/**
+ * Every runtime this picker knows a row for, in display order.
+ *
+ * The NAME half comes from the shared {@link AGENT_RUNTIME_LABELS} so it cannot
+ * drift from the Settings runtime list or the wizard's launch summary; only the
+ * scope suffix — which is this picker's own concern — is added here.
+ */
+const RUNTIME_SCOPE_SUFFIXES: Partial<Record<LaunchAgentRuntime, string>> = {
+  'claude-sdk': ' (default)',
+  'codex-pty': ' — quick sessions only',
+  'omp-fleet': ' — quick sessions only',
+};
+
+const RUNTIME_OPTIONS: readonly { runtime: LaunchAgentRuntime; label: string }[] = (
+  ['claude-sdk', 'claude-interactive', 'codex-sdk', 'codex-pty', 'omp-sdk', 'omp-pty', 'omp-fleet'] as const
+).map((runtime) => ({
+  runtime,
+  label: `${AGENT_RUNTIME_LABELS[runtime]}${RUNTIME_SCOPE_SUFFIXES[runtime] ?? ''}`,
+}));
 
 /**
  * The rows the picker may render at all, before the provider toggles narrow them
@@ -123,25 +148,65 @@ function isRuntimeDisabled(runtime: LaunchAgentRuntime, scope: NonNullable<Subst
   return false;
 }
 
-/** The options a picker may show, given the provider toggles + OMP availability. */
-function enabledRuntimeOptions(
-  access: AgentProviderAccess,
-  ompAvailable: boolean,
+/** The LOCAL OMP runtimes — an OMP process this machine runs. */
+const LOCAL_OMP_RUNTIMES: ReadonlySet<LaunchAgentRuntime> = new Set<LaunchAgentRuntime>(['omp-sdk', 'omp-pty']);
+
+/**
+ * The options a picker may show, given the provider toggles + OMP availability.
+ *
+ * The two OMP flavors are ALTERNATIVES, not a stack: a panel is either a local
+ * OMP process or a supervised remote worker. Aria mode picks which one this
+ * install runs, so exactly one of them is ever offered — showing both would
+ * imply a choice the runtime does not actually support, and `omp-fleet` needs a
+ * configured bridge the local runtimes do not.
+ */
+function flavorVisibleOptions(
+  omp: OmpAvailability,
 ): readonly { runtime: LaunchAgentRuntime; label: string }[] {
   return SELECTABLE_RUNTIME_OPTIONS.filter((o) => {
-    if (o.runtime === 'omp-fleet' && !ompAvailable) return false;
-    return isRuntimeProviderEnabled(access, o.runtime);
+    // Visible on ARIA MODE ALONE, not on availability. Hiding it when the
+    // bridge is missing removed the last OMP row from an Aria install — the
+    // local runtimes are hidden precisely BECAUSE Aria is on — so the picker
+    // showed no OMP at all while Settings → Integrations still read "on", with
+    // no note explaining it (the hidden-runtimes note counts against THIS
+    // list, so a row removed here is invisible by construction). It is offered
+    // and DISABLED instead: see unavailableReason.
+    if (o.runtime === 'omp-fleet') return omp.ariaMode;
+    if (LOCAL_OMP_RUNTIMES.has(o.runtime)) return !omp.ariaMode;
+    return true;
   });
+}
+
+/**
+ * Why a VISIBLE runtime cannot be chosen right now, or null when it can.
+ *
+ * Distinct from {@link isRuntimeDisabled}, which is about SCOPE ("this launch
+ * surface can't run it"). This is about the machine's current configuration —
+ * the runtime is right for the surface, but something outside the picker has to
+ * be set up first. Rendering the reason beats removing the row: a user who
+ * turned Aria mode on needs to learn the bridge is missing, not watch OMP
+ * disappear from a picker whose provider toggle still says it is enabled.
+ */
+function unavailableReason(runtime: LaunchAgentRuntime, omp: OmpAvailability): string | null {
+  if (runtime === 'omp-fleet' && !omp.launchable) return 'bridge not configured';
+  return null;
+}
+
+function enabledRuntimeOptions(
+  access: AgentProviderAccess,
+  omp: OmpAvailability,
+): readonly { runtime: LaunchAgentRuntime; label: string }[] {
+  return flavorVisibleOptions(omp).filter((o) => isRuntimeProviderEnabled(access, o.runtime));
 }
 
 function scopeHelp(scope: NonNullable<SubstrateSelectorProps['runtimeScope']>): string {
   if (scope === 'workflow') {
-    return 'Workflows run on any structured runtime — Claude, Codex SDK, or OMP. The terminal runtimes remain quick-session-only.';
+    return 'Workflows run on any structured runtime — Claude, Codex SDK, or OMP. The CLI runtimes remain quick-session-only.';
   }
   if (scope === 'session') {
-    return 'The structured runtimes run quick-session chat; the terminal runtimes open an interactive terminal-style session instead.';
+    return 'The structured runtimes run quick-session chat; the CLI runtimes open an interactive terminal-style session instead.';
   }
-  return 'A structured runtime can run workflows or quick sessions. The terminal runtimes start quick sessions only.';
+  return 'A structured runtime can run workflows or quick sessions. The CLI runtimes start quick sessions only.';
 }
 
 /** Shared caveats-block rendering — the interactive PTY and both OMP rows use
@@ -185,8 +250,13 @@ export function SubstrateSelector({
   // Provider toggles (Settings → Integrations / onboarding). A switched-off
   // provider's runtimes leave the picker entirely and can never be submitted.
   const providerAccess = useAgentProviderAccess();
-  const ompAvailable = useOmpAvailability();
-  const options = enabledRuntimeOptions(providerAccess, ompAvailable);
+  const omp = useOmpAvailability();
+  const options = enabledRuntimeOptions(providerAccess, omp);
+  // Baseline for the "…are hidden" note: the rows this OMP FLAVOR can show, not
+  // every selectable runtime. Aria mode always hides one flavor, so counting
+  // against the full list would fire the note permanently and blame the provider
+  // toggles for a row the flavor removed.
+  const flavorOptionCount = flavorVisibleOptions(omp).length;
   const claudeEnabled = isRuntimeProviderEnabled(providerAccess, 'claude-sdk');
 
   // Under the interactive lock, keep the controlled value consistent so the
@@ -209,9 +279,9 @@ export function SubstrateSelector({
   // always name a provider the backend will accept.
   const fallbackRuntime = firstEnabledRuntime(
     providerAccess,
-    SELECTABLE_RUNTIME_OPTIONS.filter((o) => !isRuntimeDisabled(o.runtime, runtimeScope)).map(
-      (o) => o.runtime,
-    ),
+    SELECTABLE_RUNTIME_OPTIONS.filter(
+      (o) => !isRuntimeDisabled(o.runtime, runtimeScope) && unavailableReason(o.runtime, omp) === null,
+    ).map((o) => o.runtime),
   );
   useEffect(() => {
     if (isRuntimeProviderEnabled(providerAccess, value)) return;
@@ -233,8 +303,8 @@ export function SubstrateSelector({
           No runtime available
         </div>
         <p className="text-xs text-text-tertiary">
-          This app is locked to interactive-PTY-only mode, which runs on Claude — but Claude is
-          turned off in Settings → Integrations. Enable Claude, or lift the PTY-only lock, to launch.
+          This app is locked to interactive-CLI-only mode, which runs on Claude — but Claude is
+          turned off in Settings → Integrations. Enable Claude, or lift the CLI-only lock, to launch.
         </p>
       </div>
     );
@@ -246,14 +316,14 @@ export function SubstrateSelector({
         <label className="text-xs font-medium text-text-secondary">{label}</label>
         <div
           data-testid="substrate-locked"
-          aria-label="Agent runtime locked to Claude interactive PTY"
+          aria-label="Agent runtime locked to Claude Interactive (CLI)"
           className="w-full rounded-input border border-border-primary bg-bg-secondary px-2 py-1 text-sm text-text-secondary"
         >
-          Claude interactive (PTY) — locked
+          {AGENT_RUNTIME_LABELS['claude-interactive']} — locked
         </div>
         <p className="text-xs text-text-tertiary">
           Claude SDK is disabled globally (Settings → AI Integration → CLI runtime). Every run uses
-          the interactive PTY runtime.
+          the interactive CLI runtime.
         </p>
         <CaveatsPanel testId={caveatsTestId} title="Interactive substrate — v1 limits" items={INTERACTIVE_CAVEATS} />
       </div>
@@ -273,6 +343,7 @@ export function SubstrateSelector({
           if (
             (isSessionAgentRuntime(next) || isWorkflowLaunchableRuntime(next)) &&
             !isRuntimeDisabled(next, runtimeScope) &&
+            unavailableReason(next, omp) === null &&
             isRuntimeProviderEnabled(providerAccess, next)
           ) {
             onChange(next);
@@ -281,18 +352,21 @@ export function SubstrateSelector({
         className="w-full rounded-input border border-border-primary bg-bg-primary px-2 py-1 text-sm text-text-primary"
         aria-label="Select agent runtime"
       >
-        {options.map(({ runtime, label: optionLabel }) => (
-          <option
-            key={runtime}
-            value={runtime}
-            disabled={isRuntimeDisabled(runtime, runtimeScope)}
-          >
-            {optionLabel}
-          </option>
-        ))}
+        {options.map(({ runtime, label: optionLabel }) => {
+          const reason = unavailableReason(runtime, omp);
+          return (
+            <option
+              key={runtime}
+              value={runtime}
+              disabled={isRuntimeDisabled(runtime, runtimeScope) || reason !== null}
+            >
+              {reason === null ? optionLabel : `${optionLabel} (${reason})`}
+            </option>
+          );
+        })}
       </select>
       <p className="text-xs text-text-tertiary">
-        {options.length === SELECTABLE_RUNTIME_OPTIONS.length
+        {options.length === flavorOptionCount
           ? scopeHelp(runtimeScope)
           : `${scopeHelp(runtimeScope)} Runtimes for providers turned off in Settings → Integrations are hidden.`}
       </p>
@@ -304,7 +378,7 @@ export function SubstrateSelector({
         <CaveatsPanel testId={caveatsTestId} title="OMP — v1 limits" items={OMP_SDK_CAVEATS} />
       )}
       {value === 'omp-pty' && (
-        <CaveatsPanel testId={caveatsTestId} title="OMP terminal — v1 limits" items={OMP_PTY_CAVEATS} />
+        <CaveatsPanel testId={caveatsTestId} title="OMP (CLI) — v1 limits" items={OMP_PTY_CAVEATS} />
       )}
     </div>
   );

@@ -30,7 +30,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { McpQueryHandler, type McpQueryMessage, type McpQueryHandlerDeps } from './mcpQueryHandler';
 import type { DatabaseLike, LoggerLike } from '../types';
-import type { PermissionServerLike } from '../stuckDetector';
 
 // ---------------------------------------------------------------------------
 // Wire-envelope narrowing
@@ -63,14 +62,13 @@ function isMcpQueryEnvelope(v: unknown): v is McpQueryEnvelope {
 // ---------------------------------------------------------------------------
 
 /**
- * Implements `PermissionServerLike` (stuckDetector.ts) via `hasClientForRun`,
- * and structurally satisfies `OrchSocketProvider` (runLauncher.ts) via
+ * Structurally satisfies `OrchSocketProvider` (runLauncher.ts) via
  * `getSocketPath`. The `OrchSocketProvider` interface is not imported here
  * because runLauncher.ts drags concrete service types (WorktreeManager,
  * RunExecutor, …) that would violate the standalone-typecheck invariant; the
  * structural match is asserted in the unit test instead.
  */
-export class OrchSocketServer implements PermissionServerLike {
+export class OrchSocketServer {
   private readonly handler: McpQueryHandler;
   private server: net.Server | null = null;
   private readonly clientsByRun = new Map<string, Set<net.Socket>>();
@@ -344,7 +342,17 @@ export class OrchSocketServer implements PermissionServerLike {
     }
   }
 
-  /** Whether a client connection bound to `runId` is currently open. */
+  /**
+   * Whether a client connection bound to `runId` is currently open.
+   *
+   * DIAGNOSTIC ONLY — nothing consumes this for control flow. It formerly
+   * backed StuckDetector's `stale_socket` rung, retired on 2026-08-21 (the
+   * reasoning lives at that rung's tombstone in stuckDetector.ts). Two traps
+   * for any future caller: binding is LAZY, happening on the first envelope
+   * that carries a runId, so a live run that has sent nothing reads false; and
+   * the claude-sdk lane decides permissions in-process and never connects at
+   * all, so false there means nothing.
+   */
   hasClientForRun(runId: string): boolean {
     return (this.clientsByRun.get(runId)?.size ?? 0) > 0;
   }

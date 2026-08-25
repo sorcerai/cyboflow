@@ -14,6 +14,13 @@
  *                  awaiting_review, …) renders it static.
  *   - ReviewMarker (gold person glyph "Awaiting review")
  *   - DoneFlag     (green "Merged")
+ *   - LedgerChip   (one of the idea component ledger's five components — see
+ *                  shared/types/ideaComponents.ts. FOUR visual states even
+ *                  though the ledger only has three: staleness is a separate
+ *                  axis from state, so an incomplete component with prior work
+ *                  ("needs review") reads differently from one that was never
+ *                  started. Rendered by TaskCard.tsx, one per component, on
+ *                  ideas only.)
  *
  * Colors map the Protoflow design hex to the EXISTING semantic theme tokens in
  * styles/tokens/colors.css: terracotta → --color-interactive-primary,
@@ -24,6 +31,8 @@
  */
 import { User, Bug, Sparkles, Wrench, FlaskConical } from 'lucide-react';
 import type { EntityCategory, FlowOverlay, IdeaScope, Priority, TaskType } from '../../../../shared/types/tasks';
+import { IDEA_COMPONENT_LABELS } from '../../../../shared/types/ideaComponents';
+import type { IdeaComponentState } from '../../../../shared/types/ideaComponents';
 
 const TYPE_LABEL: Record<TaskType, string> = {
   idea: 'Idea',
@@ -39,11 +48,23 @@ export function TypeTag({ type }: { type: TaskType }): React.JSX.Element {
   );
 }
 
+/**
+ * 7-level ramp (migration 117 widen; was P0-P2). P0/P1/P2 keep their original
+ * colors (hottest red -> warning amber -> the existing neutral) as the TOP of
+ * the ramp; P3-P6 continue it downward by fading the SAME neutral tokens
+ * P2 already uses, so the scale reads as one continuous cool-down rather than
+ * a second unrelated palette bolted on. P6 lands on `text-disabled` — the
+ * dimmest text token in the theme — for the most muted tier.
+ */
 const PRIORITY_CLASS: Record<Priority, string> = {
   // P0 = highest urgency (warm-red error token), P1 = warning, P2 = neutral.
   P0: 'border-status-error/40 bg-status-error/10 text-status-error',
   P1: 'border-status-warning/40 bg-status-warning/10 text-status-warning',
   P2: 'border-border-primary bg-bg-tertiary text-text-tertiary',
+  P3: 'border-border-primary/70 bg-bg-tertiary/70 text-text-tertiary/90',
+  P4: 'border-border-primary/50 bg-bg-tertiary/50 text-text-tertiary/70',
+  P5: 'border-border-primary/30 bg-bg-tertiary/40 text-text-tertiary/50',
+  P6: 'border-border-primary/20 bg-bg-tertiary/25 text-text-disabled',
 };
 
 export function PriorityTag({ priority }: { priority: Priority }): React.JSX.Element {
@@ -250,6 +271,59 @@ export function DoneFlag(): React.JSX.Element {
       data-testid="done-flag"
     >
       Merged
+    </span>
+  );
+}
+
+/**
+ * A ledger chip's FOUR visual states. The ledger itself only has three
+ * (complete/incomplete/skipped — shared/types/ideaComponents.ts) — staleness
+ * is a separate axis carried by `staleAt`, not a fourth state, but it still
+ * needs its own visual treatment: "needs review" (prior work exists, re-verify
+ * it) must never collapse into "not started" (nothing has happened yet).
+ */
+export type LedgerChipVisualState = 'complete' | 'needs-review' | 'not-started' | 'skipped';
+
+/** Human label per visual state — used by both the chip's title and LedgerExpand's row text. */
+export const LEDGER_STATE_LABEL: Record<LedgerChipVisualState, string> = {
+  complete: 'Complete',
+  'needs-review': 'Needs review',
+  'not-started': 'Not started',
+  skipped: 'Skipped',
+};
+
+const LEDGER_CHIP_CLASS: Record<LedgerChipVisualState, string> = {
+  complete: 'border-status-success/40 bg-status-success/10 text-status-success',
+  'needs-review': 'border-status-warning/40 bg-status-warning/10 text-status-warning',
+  'not-started': 'border-border-primary bg-bg-tertiary text-text-tertiary',
+  // Muted AND dashed — clearly de-emphasised but still present, so the row of
+  // five always reads as a checklist rather than a variable badge pile.
+  skipped: 'border-dashed border-border-primary bg-bg-tertiary text-text-tertiary',
+};
+
+/** Resolve a ledger entry's visual state from its (state, staleAt) pair. */
+export function ledgerChipVisualState(entry: Pick<IdeaComponentState, 'state' | 'staleAt'>): LedgerChipVisualState {
+  if (entry.state === 'skipped') return 'skipped';
+  if (entry.state === 'complete') return 'complete';
+  return entry.staleAt !== null ? 'needs-review' : 'not-started';
+}
+
+/**
+ * One idea component's ledger chip. Label comes from {@link IDEA_COMPONENT_LABELS}
+ * — the shared vocabulary the card and the artifact renderer both read, so
+ * never re-derive a second label here.
+ */
+export function LedgerChip({ component }: { component: IdeaComponentState }): React.JSX.Element {
+  const visual = ledgerChipVisualState(component);
+  const label = IDEA_COMPONENT_LABELS[component.component];
+  return (
+    <span
+      className={`eyebrow rounded-[3px] border px-1.5 py-px ${LEDGER_CHIP_CLASS[visual]}`}
+      title={`${label}: ${LEDGER_STATE_LABEL[visual]}`}
+      data-testid={`ledger-chip-${component.component}`}
+      data-ledger-state={visual}
+    >
+      {label}
     </span>
   );
 }

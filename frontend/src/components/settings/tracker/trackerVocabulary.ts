@@ -11,12 +11,14 @@
  * type that crosses the IPC boundary.
  */
 import type {
+  TrackerContentSyncMode,
   TrackerMappingTarget,
   TrackerProvider,
   TrackerState,
   TrackerStateGroup,
   TrackerStateMapping,
 } from '../../../../../shared/types/trackerSync';
+import type { EntityCategory, Priority } from '../../../../../shared/types/tasks';
 
 // ---------------------------------------------------------------------------
 // Providers
@@ -38,6 +40,15 @@ export interface TrackerProviderMeta {
   /** Documentation card on Step 0 — what cyboflow reads and writes. */
   scopes: { label: string; granted: boolean }[];
   scopeFootnote: string;
+  /**
+   * Does this provider model a native issue TYPE the category mapping table
+   * can target? Mirrors `categoryMapping.ts`'s `providerSupportsCategorySync`
+   * table (main-side) — kept as its own table here, not derived from it,
+   * because the wizard/connected-view bundle must not import main/src/services/*.
+   * The house rule this exists for: no provider-string branches in tracker UI —
+   * a caller reads this flag instead of checking `provider === 'dart'`.
+   */
+  supportsCategorySync: boolean;
 }
 
 export const TRACKER_PROVIDERS: readonly TrackerProviderMeta[] = [
@@ -45,7 +56,7 @@ export const TRACKER_PROVIDERS: readonly TrackerProviderMeta[] = [
     provider: 'linear',
     name: 'Linear',
     description:
-      'Import a Linear team, project, view or cycle as cyboflow ideas and write status back.',
+      'Map Linear projects or teams to cyboflow projects with two-way status sync.',
     mark: 'LN',
     apiKeyLabel: 'Personal API key',
     apiKeyHint: 'Linear → Settings → Security & access → Personal API keys.',
@@ -56,12 +67,13 @@ export const TRACKER_PROVIDERS: readonly TrackerProviderMeta[] = [
       { label: 'write:issues', granted: true },
     ],
     scopeFootnote: 'No access to comments, attachments, or billing.',
+    supportsCategorySync: false,
   },
   {
     provider: 'plane',
     name: 'Plane',
     description:
-      'Import a Plane project, cycle or module — cloud or self-hosted — with two-way status sync.',
+      'Map Plane projects — cloud or self-hosted — to cyboflow projects with two-way status sync.',
     mark: 'PL',
     apiKeyLabel: 'Personal access token',
     apiKeyHint: 'Plane → Workspace settings → API tokens.',
@@ -72,13 +84,32 @@ export const TRACKER_PROVIDERS: readonly TrackerProviderMeta[] = [
       { label: 'write:issues', granted: true },
     ],
     scopeFootnote: 'No access to comments, attachments, or billing.',
+    supportsCategorySync: false,
+  },
+  {
+    provider: 'dart',
+    name: 'Dart',
+    description: 'Map Dart spaces to cyboflow projects and write status back.',
+    mark: 'DT',
+    apiKeyLabel: 'Personal authentication token',
+    apiKeyHint: 'Dart → Settings → Account → Authentication token.',
+    // Dart scopes everything by the token itself and is cloud-only, so it needs
+    // neither a workspace slug nor a base URL — see dartAdapter.ts.
+    needsWorkspaceSlug: false,
+    defaultBaseUrl: null,
+    scopes: [
+      { label: 'read:tasks', granted: true },
+      { label: 'write:tasks', granted: true },
+    ],
+    scopeFootnote: 'No access to docs, comments, attachments, or billing.',
+    supportsCategorySync: true,
   },
 ];
 
 export function providerMeta(provider: TrackerProvider): TrackerProviderMeta {
   const meta = TRACKER_PROVIDERS.find((p) => p.provider === provider);
-  // The union has exactly two members and both are in the table above; the
-  // fallback exists so the return type is not needlessly optional.
+  // Every member of the union is in the table above; the fallback exists so the
+  // return type is not needlessly optional.
   return meta ?? TRACKER_PROVIDERS[0];
 }
 
@@ -86,21 +117,49 @@ export function providerMeta(provider: TrackerProvider): TrackerProviderMeta {
 // State mapping
 // ---------------------------------------------------------------------------
 
-/** The mapping dropdown's options — cyboflow's four writable stages plus opt-out. */
+/**
+ * The mapping dropdown's options — cyboflow's four writable stages, opt-out,
+ * and the one-way 'indev'. Listed in BOARD order (Idea → Ready → In
+ * development → Done → Won't do) so the picker reads like the board does.
+ *
+ * 'In development' is labelled "(one way)" right in the option text because the
+ * asymmetry is the whole point: picking it does not import anything, it names
+ * which provider state a task entering In development is pushed to. See
+ * MAPPING_TARGET_NOTE for the inline caption the picker shows once it is chosen.
+ */
 export const MAPPING_TARGETS: readonly { value: TrackerMappingTarget; label: string }[] = [
   { value: 'dont', label: "— Don't import" },
   { value: 'idea', label: 'Idea' },
   { value: 'ready', label: 'Ready for development' },
+  { value: 'indev', label: 'In development (one way)' },
   { value: 'done', label: 'Done' },
   { value: 'wontdo', label: "Won't do" },
 ];
+
+/**
+ * The caption shown under a picker whose target needs a qualifier — keyed by
+ * target so a future one-way target does not need another branch in the view.
+ * `{provider}` is substituted with the provider's display name.
+ */
+export const MAPPING_TARGET_NOTE: Partial<Record<TrackerMappingTarget, string>> = {
+  indev: 'One way only — pushed to {provider}, never imported.',
+};
+
+/** The note for a target with the provider name filled in, or null. */
+export function mappingTargetNote(
+  target: TrackerMappingTarget,
+  providerName: string,
+): string | null {
+  const note = MAPPING_TARGET_NOTE[target];
+  return note === undefined ? null : note.replace('{provider}', providerName);
+}
 
 export function mappingTargetLabel(target: TrackerMappingTarget): string {
   return MAPPING_TARGETS.find((t) => t.value === target)?.label ?? target;
 }
 
 /**
- * Seed defaults keyed by the adapter's canonical state group (both providers
+ * Seed defaults keyed by the adapter's canonical state group (every provider
  * normalize onto it, so the wizard never branches on provider here).
  */
 export const DEFAULT_TARGET_BY_GROUP: Record<TrackerStateGroup, TrackerMappingTarget> = {
@@ -126,6 +185,62 @@ export function seedStateMapping(
     seeded[state.id] = previous?.[state.id] ?? DEFAULT_TARGET_BY_GROUP[state.group];
   }
   return seeded;
+}
+
+// ---------------------------------------------------------------------------
+// Field write-back cadence (migration 118) — a THREE-state cousin of the
+// direction controls above. `contentSyncMode`/`archiveSyncMode` are a
+// SEPARATE type (TrackerContentSyncMode) from TrackerDirectionMode precisely
+// so 'off' cannot leak onto status/pull/push — see trackerSync.ts's header —
+// which is also why this gets its OWN options list and label function rather
+// than reusing the wizard/connected-view's local `DIRECTION_OPTIONS` /
+// `directionLabel` (a binary ternary that would render 'off' as "Manual").
+// ---------------------------------------------------------------------------
+
+export const CONTENT_MODE_OPTIONS: readonly { value: TrackerContentSyncMode; label: string }[] = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'manual', label: 'Manual' },
+  { value: 'off', label: 'Off' },
+];
+
+export function contentModeLabel(mode: TrackerContentSyncMode): string {
+  if (mode === 'auto') return 'Auto';
+  if (mode === 'manual') return 'Manual';
+  return 'Off';
+}
+
+// ---------------------------------------------------------------------------
+// Priority / category mapping (migration 118, Phase 6) — the wizard's value
+// pickers. Both tables edit only `toProvider`; `toLocal` is never sent (the
+// resolver falls back to the seed's own inbound table — see
+// TrackerPriorityMappingOverlay's header in shared/types/trackerSync.ts), so
+// there is exactly one half to seed and re-seed here.
+// ---------------------------------------------------------------------------
+
+/** P0-P6 in escalation order — the priority mapping table's row order. */
+export const PRIORITY_LEVELS: readonly Priority[] = ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'];
+
+/** feature/bug/chore — the category mapping table's row order. */
+export const ENTITY_CATEGORIES: readonly EntityCategory[] = ['feature', 'bug', 'chore'];
+
+/**
+ * The priority table's initial value. Unlike {@link seedStateMapping}, the key
+ * set never varies (always exactly the seven `Priority` levels), so a `previous`
+ * edit survives a re-fetch wholesale rather than key-by-key.
+ */
+export function seedPriorityMapping(
+  defaults: Record<Priority, string | null>,
+  previous?: Record<Priority, string | null>,
+): Record<Priority, string | null> {
+  return previous ?? { ...defaults };
+}
+
+/** Same as {@link seedPriorityMapping}, for the category table. */
+export function seedCategoryMapping(
+  defaults: Record<EntityCategory, string | null>,
+  previous?: Record<EntityCategory, string | null>,
+): Record<EntityCategory, string | null> {
+  return previous ?? { ...defaults };
 }
 
 // ---------------------------------------------------------------------------

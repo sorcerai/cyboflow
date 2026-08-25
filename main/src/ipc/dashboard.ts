@@ -1,5 +1,5 @@
 import { IpcMain } from 'electron';
-import { execSync, execAsync } from '../utils/commandExecutor';
+import { runGit, runGitCapture, runToolCapture, END_OF_OPTIONS } from '../utils/runGit';
 import { formatForDatabase } from '../utils/timestampUtils';
 import type { AppServices } from './types';
 import path from 'path';
@@ -102,7 +102,7 @@ export function registerDashboardHandlers(ipcMain: IpcMain, services: AppService
       event.sender.send('dashboard:update', { projectId, data: initialData, isPartial: true });
 
       // Start async operations in parallel
-      const fetchPromise = execAsync('git fetch origin', { cwd: project.path, timeout: 15000 }).catch(error => {
+      const fetchPromise = runGitCapture(project.path, ['fetch', 'origin'], { timeout: 15000 }).catch(error => {
         console.warn('Failed to fetch from origin:', error);
       });
 
@@ -209,7 +209,7 @@ export function registerDashboardHandlers(ipcMain: IpcMain, services: AppService
 
       // Fetch latest changes from remote (async to prevent blocking)
       try {
-        await execAsync('git fetch origin', { cwd: project.path, timeout: 15000 });
+        await runGitCapture(project.path, ['fetch', 'origin'], { timeout: 15000 });
       } catch (error) {
         console.warn('Failed to fetch from origin:', error);
         // Continue anyway - we can still show local status
@@ -283,8 +283,7 @@ function getMainBranchStatus(projectPath: string, mainBranch: string): MainBranc
     
     // Check if remote branch exists
     try {
-      // TODO(TASK-680): migrate to runGit(cwd, args[]) — see main/src/utils/runGit.ts
-      execSync(`git rev-parse --verify ${remoteBranch}`, { cwd: projectPath });
+      runGit(projectPath, ['rev-parse', '--verify', END_OF_OPTIONS, remoteBranch]);
     } catch {
       // No remote branch
       return {
@@ -294,10 +293,10 @@ function getMainBranchStatus(projectPath: string, mainBranch: string): MainBranc
     }
 
     // Get commit counts
-    const aheadBehind = execSync(
-      `git rev-list --left-right --count ${mainBranch}...${remoteBranch}`,
-      { cwd: projectPath }
-    ).toString().trim();
+    const aheadBehind = runGit(
+      projectPath,
+      ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${mainBranch}...${remoteBranch}`],
+    ).trim();
 
     const [ahead, behind] = aheadBehind.split('\t').map((n: string) => parseInt(n, 10));
 
@@ -329,8 +328,9 @@ function getMainBranchStatus(projectPath: string, mainBranch: string): MainBranc
 
 async function getRemoteStatuses(projectPath: string, mainBranch: string): Promise<RemoteStatus[]> {
   try {
-    // Get all remotes
-    const remotesResult = await execAsync('git remote -v', { cwd: projectPath, timeout: 5000 });
+    // Get all remotes. Remote NAMES come from the repository itself, so they are
+    // treated as hostile input for the rest of this function.
+    const remotesResult = await runGitCapture(projectPath, ['remote', '-v'], { timeout: 5000 });
     const remoteLines = remotesResult.stdout.trim().split('\n');
     
     // Parse unique remotes
@@ -347,19 +347,24 @@ async function getRemoteStatuses(projectPath: string, mainBranch: string): Promi
     // Fetch from all remotes
     for (const [remoteName, remoteUrl] of remotesMap) {
       try {
-        await execAsync(`git fetch ${remoteName}`, { cwd: projectPath, timeout: 10000 });
+        await runGitCapture(projectPath, ['fetch', END_OF_OPTIONS, remoteName], { timeout: 10000 });
       } catch (error) {
         console.warn(`Failed to fetch from ${remoteName}:`, error);
       }
-      
+
       // Check if remote branch exists
       try {
-        await execAsync(`git rev-parse --verify ${remoteName}/${mainBranch}`, { cwd: projectPath, timeout: 2000 });
-        
+        await runGitCapture(
+          projectPath,
+          ['rev-parse', '--verify', END_OF_OPTIONS, `${remoteName}/${mainBranch}`],
+          { timeout: 2000 },
+        );
+
         // Get ahead/behind status
-        const result = await execAsync(
-          `git rev-list --left-right --count ${mainBranch}...${remoteName}/${mainBranch}`,
-          { cwd: projectPath, timeout: 5000 }
+        const result = await runGitCapture(
+          projectPath,
+          ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${mainBranch}...${remoteName}/${mainBranch}`],
+          { timeout: 5000 },
         );
         const [ahead, behind] = result.stdout.trim().split('\t').map(n => parseInt(n, 10));
         
@@ -417,7 +422,7 @@ async function getMainBranchStatusAsync(projectPath: string, mainBranch: string)
     
     // Check if remote branch exists
     try {
-      await execAsync(`git rev-parse --verify ${remoteBranch}`, { cwd: projectPath, timeout: 5000 });
+      await runGitCapture(projectPath, ['rev-parse', '--verify', END_OF_OPTIONS, remoteBranch], { timeout: 5000 });
     } catch {
       // No remote branch
       return {
@@ -427,9 +432,10 @@ async function getMainBranchStatusAsync(projectPath: string, mainBranch: string)
     }
 
     // Get commit counts
-    const result = await execAsync(
-      `git rev-list --left-right --count ${mainBranch}...${remoteBranch}`,
-      { cwd: projectPath, timeout: 5000 }
+    const result = await runGitCapture(
+      projectPath,
+      ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${mainBranch}...${remoteBranch}`],
+      { timeout: 5000 },
     );
     const aheadBehind = result.stdout.trim();
 
@@ -473,9 +479,7 @@ async function getSessionBranchInfo(
     }
 
     // Get the branch name from the worktree
-    const branchName = execSync('git branch --show-current', { 
-      cwd: session.worktree_path 
-    }).toString().trim();
+    const branchName = runGit(session.worktree_path, ['branch', '--show-current']).trim();
 
     if (!branchName) {
       return null;
@@ -489,10 +493,10 @@ async function getSessionBranchInfo(
     if (!baseCommit) {
       // Try to find the merge-base with main
       try {
-        baseCommit = execSync(
-          `git merge-base ${branchName} ${mainBranch}`,
-          { cwd: session.worktree_path }
-        ).toString().trim();
+        baseCommit = runGit(
+          session.worktree_path,
+          ['merge-base', END_OF_OPTIONS, branchName, mainBranch],
+        ).trim();
       } catch {
         baseCommit = 'unknown';
       }
@@ -504,19 +508,19 @@ async function getSessionBranchInfo(
     
     if (baseCommit && baseCommit !== 'unknown') {
       try {
-        const currentBaseCommit = execSync(
-          `git rev-parse ${baseBranch}`,
-          { cwd: projectPath }
-        ).toString().trim();
-        
+        const currentBaseCommit = runGit(
+          projectPath,
+          ['rev-parse', '--verify', END_OF_OPTIONS, baseBranch],
+        ).trim();
+
         isStale = currentBaseCommit !== baseCommit;
-        
+
         if (isStale) {
           // Try to get the timestamp when the base branch moved
-          const commitDate = execSync(
-            `git log -1 --format=%cd --date=iso-strict ${currentBaseCommit}`,
-            { cwd: projectPath }
-          ).toString().trim();
+          const commitDate = runGit(
+            projectPath,
+            ['log', '-1', '--format=%cd', '--date=iso-strict', END_OF_OPTIONS, currentBaseCommit],
+          ).trim();
           staleSince = commitDate;
         }
       } catch {
@@ -532,11 +536,11 @@ async function getSessionBranchInfo(
     let commitsBehind = 0;
     
     try {
-      const aheadBehind = execSync(
-        `git rev-list --left-right --count ${branchName}...${baseBranch}`,
-        { cwd: session.worktree_path }
-      ).toString().trim();
-      
+      const aheadBehind = runGit(
+        session.worktree_path,
+        ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${branchName}...${baseBranch}`],
+      ).trim();
+
       const [ahead, behind] = aheadBehind.split('\t').map((n: string) => parseInt(n, 10));
       commitsAhead = ahead;
       commitsBehind = behind;
@@ -547,11 +551,14 @@ async function getSessionBranchInfo(
     // Check for associated pull request
     let pullRequest: SessionBranchInfo['pullRequest'];
     try {
-      const prOutput = execSync(
-        `gh pr list --head ${branchName} --json number,title,state,url --limit 1`,
-        { cwd: projectPath }
-      ).toString().trim();
-      
+      // `--head=<value>` rather than `--head <value>`: the branch name comes from
+      // the repository, and the joined form cannot slide into a flag position.
+      const prOutput = (await runToolCapture(
+        'gh',
+        projectPath,
+        ['pr', 'list', `--head=${branchName}`, '--json', 'number,title,state,url', '--limit', '1'],
+      )).stdout.trim();
+
       if (prOutput) {
         const prs = JSON.parse(prOutput);
         if (prs.length > 0) {
@@ -600,9 +607,8 @@ async function getSessionBranchInfoAsync(
     }
 
     // Get the branch name from the worktree
-    const branchResult = await execAsync('git branch --show-current', { 
-      cwd: session.worktree_path,
-      timeout: 5000
+    const branchResult = await runGitCapture(session.worktree_path, ['branch', '--show-current'], {
+      timeout: 5000,
     });
     const branchName = branchResult.stdout.trim();
 
@@ -618,9 +624,10 @@ async function getSessionBranchInfoAsync(
     if (!baseCommit) {
       // Try to find the merge-base with main
       try {
-        const mergeBaseResult = await execAsync(
-          `git merge-base ${branchName} ${mainBranch}`,
-          { cwd: session.worktree_path, timeout: 5000 }
+        const mergeBaseResult = await runGitCapture(
+          session.worktree_path,
+          ['merge-base', END_OF_OPTIONS, branchName, mainBranch],
+          { timeout: 5000 },
         );
         baseCommit = mergeBaseResult.stdout.trim();
       } catch {
@@ -634,19 +641,21 @@ async function getSessionBranchInfoAsync(
     
     if (baseCommit && baseCommit !== 'unknown') {
       try {
-        const currentBaseResult = await execAsync(
-          `git rev-parse ${baseBranch}`,
-          { cwd: projectPath, timeout: 5000 }
+        const currentBaseResult = await runGitCapture(
+          projectPath,
+          ['rev-parse', '--verify', END_OF_OPTIONS, baseBranch],
+          { timeout: 5000 },
         );
         const currentBaseCommit = currentBaseResult.stdout.trim();
-        
+
         isStale = currentBaseCommit !== baseCommit;
-        
+
         if (isStale) {
           // Try to get the timestamp when the base branch moved
-          const commitDateResult = await execAsync(
-            `git log -1 --format=%cd --date=iso-strict ${currentBaseCommit}`,
-            { cwd: projectPath, timeout: 5000 }
+          const commitDateResult = await runGitCapture(
+            projectPath,
+            ['log', '-1', '--format=%cd', '--date=iso-strict', END_OF_OPTIONS, currentBaseCommit],
+            { timeout: 5000 },
           );
           staleSince = commitDateResult.stdout.trim();
         }
@@ -663,9 +672,10 @@ async function getSessionBranchInfoAsync(
     let commitsBehind = 0;
     
     try {
-      const aheadBehindResult = await execAsync(
-        `git rev-list --left-right --count ${branchName}...${baseBranch}`,
-        { cwd: session.worktree_path, timeout: 5000 }
+      const aheadBehindResult = await runGitCapture(
+        session.worktree_path,
+        ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${branchName}...${baseBranch}`],
+        { timeout: 5000 },
       );
       const aheadBehind = aheadBehindResult.stdout.trim();
       
@@ -679,9 +689,11 @@ async function getSessionBranchInfoAsync(
     // Check for associated pull request (async)
     let pullRequest: SessionBranchInfo['pullRequest'];
     try {
-      const prResult = await execAsync(
-        `gh pr list --head ${branchName} --json number,title,state,url --limit 1`,
-        { cwd: projectPath, timeout: 10000 }
+      const prResult = await runToolCapture(
+        'gh',
+        projectPath,
+        ['pr', 'list', `--head=${branchName}`, '--json', 'number,title,state,url', '--limit', '1'],
+        { timeout: 10000 },
       );
       const prOutput = prResult.stdout.trim();
       
@@ -723,7 +735,7 @@ async function getSessionBranchInfoAsync(
 
 function checkUncommittedChanges(worktreePath: string): boolean {
   try {
-    const status = execSync('git status --porcelain', { cwd: worktreePath }).toString();
+    const status = runGit(worktreePath, ['status', '--porcelain']);
     return status.trim().length > 0;
   } catch {
     return false;
@@ -732,10 +744,7 @@ function checkUncommittedChanges(worktreePath: string): boolean {
 
 async function checkUncommittedChangesAsync(worktreePath: string): Promise<boolean> {
   try {
-    const result = await execAsync('git status --porcelain', { 
-      cwd: worktreePath, 
-      timeout: 5000 
-    });
+    const result = await runGitCapture(worktreePath, ['status', '--porcelain'], { timeout: 5000 });
     return result.stdout.trim().length > 0;
   } catch {
     return false;

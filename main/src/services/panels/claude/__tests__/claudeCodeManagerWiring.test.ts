@@ -627,14 +627,14 @@ describe('TASK-758: AskUserQuestion wiring', () => {
     const mgrPrivate = mgr as unknown as {
       makePreToolUseHook: (
         panelId: string,
-        allowRules: { allow: string[]; deny: string[] },
+        allowRules: { allow: string[]; deny: string[]; ask: string[] },
       ) => (
         input: unknown,
         toolUseId: string,
         ctx: unknown,
       ) => Promise<unknown>;
     };
-    const hook = mgrPrivate.makePreToolUseHook('panel-ask-user', { allow: [], deny: [] });
+    const hook = mgrPrivate.makePreToolUseHook('panel-ask-user', { allow: [], deny: [], ask: [] });
 
     const fakeQuestions = [
       {
@@ -696,14 +696,14 @@ describe('TASK-758: AskUserQuestion wiring', () => {
     const mgrPrivate = mgr as unknown as {
       makePreToolUseHook: (
         panelId: string,
-        allowRules: { allow: string[]; deny: string[] },
+        allowRules: { allow: string[]; deny: string[]; ask: string[] },
       ) => (
         input: unknown,
         toolUseId: string,
         ctx: unknown,
       ) => Promise<unknown>;
     };
-    const hook = mgrPrivate.makePreToolUseHook('panel-ask-error', { allow: [], deny: [] });
+    const hook = mgrPrivate.makePreToolUseHook('panel-ask-error', { allow: [], deny: [], ask: [] });
 
     const fakePreToolInput = {
       hook_event_name: 'PreToolUse',
@@ -751,14 +751,14 @@ describe('TASK-758: AskUserQuestion wiring', () => {
     const mgrPrivate = mgr as unknown as {
       makePreToolUseHook: (
         panelId: string,
-        allowRules: { allow: string[]; deny: string[] },
+        allowRules: { allow: string[]; deny: string[]; ask: string[] },
       ) => (
         input: unknown,
         toolUseId: string,
         ctx: unknown,
       ) => Promise<unknown>;
     };
-    const hook = mgrPrivate.makePreToolUseHook('panel-bash', { allow: [], deny: [] });
+    const hook = mgrPrivate.makePreToolUseHook('panel-bash', { allow: [], deny: [], ask: [] });
 
     const fakePreToolInput = {
       hook_event_name: 'PreToolUse',
@@ -803,7 +803,7 @@ describe('TASK-758: AskUserQuestion wiring', () => {
     const mgrPrivate = mgr as unknown as {
       makePreToolUseHook: (
         panelId: string,
-        allowRules: { allow: string[]; deny: string[] },
+        allowRules: { allow: string[]; deny: string[]; ask: string[] },
       ) => (
         input: unknown,
         toolUseId: string,
@@ -813,6 +813,7 @@ describe('TASK-758: AskUserQuestion wiring', () => {
     const hook = mgrPrivate.makePreToolUseHook('panel-allow', {
       allow: ['Bash(git status:*)'],
       deny: [],
+      ask: [],
     });
 
     const fakePreToolInput = {

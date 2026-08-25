@@ -174,6 +174,18 @@ const IDENTIFIED_SAMPLE_WITH_NULL_VERDICT_MODEL: PairwiseSample[] = [
   { ...LEGACY_SAMPLES[0], judgeName: 'judge-a', judgeModel: 'sample-model' },
 ];
 
+/**
+ * A DEGRADED, backfilled ballot from the 3-slot pairwise panel: `claude-2` (slot
+ * index 1) dropped, so the survivors keep slot indices 0 and 2, and the single
+ * backfill sample is stamped at `panel.length + 0` = 3. `sampleIndex` is an
+ * identity key with gaps, not an ordinal.
+ */
+const BACKFILLED_SAMPLES: PairwiseSample[] = [
+  { ...LEGACY_SAMPLES[0], sampleIndex: 0, judgeName: 'claude-pairwise', judgeModel: 'sample-model' },
+  { ...LEGACY_SAMPLES[1], sampleIndex: 2, judgeName: 'codex-pairwise', judgeModel: 'sample-model' },
+  { ...LEGACY_SAMPLES[2], sampleIndex: 3, judgeName: 'claude-pairwise', judgeModel: 'sample-model' },
+];
+
 const NULL_IDENTITY_SAMPLES: PairwiseSample[] = [
   { ...LEGACY_SAMPLES[0], judgeModel: null },
 ];
@@ -283,6 +295,33 @@ describe('ExperimentComparisonView', () => {
     expect(provenance).toHaveLength(1);
     expect(provenance[0].tagName).toBe('FOOTER');
     expect(provenance[0]).toHaveTextContent('graded by row-model');
+  });
+
+  it('numbers a degraded/backfilled ballot by POSITION, not by the gappy sampleIndex identity key', async () => {
+    // Slot indices [0, 2] survived and the backfill sample is stamped at 3, so
+    // rendering `sampleIndex + 1` showed this ballot as "#1 #2 #4". The chips must
+    // read #1 #2 #3 while sampleIndex remains the (unique) React key.
+    getQuery.mockResolvedValue(makeExp());
+    getComparisonQuery.mockResolvedValue(
+      makePayload({
+        verdict: {
+          ...makePayload().verdict!,
+          judgeModel: 'row-model',
+          perSample: [...BACKFILLED_SAMPLES],
+          sampleCount: 3,
+        },
+      }),
+    );
+    getComparisonDiffsQuery.mockResolvedValue(makeDiffs());
+
+    render(<ExperimentComparisonView experimentId="exp_1" />);
+
+    const chips = await screen.findAllByTestId('experiment-sample-chip');
+    expect(chips).toHaveLength(3);
+    expect(chips[0]).toHaveTextContent(/^#1 Arm A · claude-pairwise$/);
+    expect(chips[1]).toHaveTextContent(/^#2 Arm A · codex-pairwise$/);
+    expect(chips[2]).toHaveTextContent(/^#3 Arm B · claude-pairwise$/);
+    expect(chips.map((c) => c.textContent)).not.toContainEqual(expect.stringContaining('#4'));
   });
 
   it('uses per-sample identity while the provenance footer falls back to unknown', async () => {

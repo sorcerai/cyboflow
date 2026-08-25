@@ -28,7 +28,7 @@ interface EpicDetailEditorProps {
   onSaved?: (taskId: string) => void;
 }
 
-const PRIORITIES: Priority[] = ['P0', 'P1', 'P2'];
+const PRIORITIES: Priority[] = ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'];
 const CATEGORIES: EntityCategory[] = ['feature', 'bug', 'chore'];
 
 export function EpicDetailEditor({ epic, isOpen, onClose, onSaved }: EpicDetailEditorProps): React.JSX.Element {

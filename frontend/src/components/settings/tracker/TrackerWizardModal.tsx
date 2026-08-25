@@ -1,31 +1,55 @@
 /**
- * TrackerWizardModal — the seven-step connect wizard for a Linear/Plane tracker
- * connection (Connect · Project · Source · Tasks · States · Reconcile · Review).
+ * TrackerWizardModal — the six-step connect wizard for a Linear/Plane/Dart
+ * tracker connection (Connect · Map · Tasks · States · Reconcile · Review).
  *
  * Rendered as a `size="full"` Modal nested inside the Settings modal (the
  * WorkflowEditorModal pattern); Modal's cross-portal guards make the nesting
  * safe. State is flat local `useState` — this is a self-contained flow whose
- * values are handed to `cyboflow.tracker.connect` once and then forgotten, so a
+ * values are handed to `cyboflow.tracker.connect` and then forgotten, so a
  * store would only add ceremony.
  *
+ * ONE PASS MINTS N CONNECTIONS. The Map step maps tracker groups (Linear
+ * projects + whole teams, Plane projects, Dart spaces) N:1 onto cyboflow
+ * projects, and each mapping becomes its own `tracker_connections` row — so
+ * everything downstream of Map is keyed by group: issues per group, one state
+ * table per distinct `stateScopeKey`, one reconcile preview per distinct target
+ * project, and one sequential `connect` call per mapping.
+ *
  * Data flow, one probe per forward step (each is a MUTATION: every call carries
- * the API key and hits the provider live, so nothing here may be cached —
- * except Step 1, which is a local project-list read, not a provider call):
+ * the API key and hits the provider live, so nothing here may be cached):
  *
  *   Step 0  wizardValidate   -> the "Authorized as …" identity card
- *   Step 1  (local)          -> pick the target cyboflow project
- *   Step 2  wizardContainers + wizardNarrows -> team/project + its narrows
- *   Step 3  wizardIssues     -> the issue set the three modes filter
- *   Step 4  wizardStates     -> the mapping table, seeded from canonical groups
- *   Step 5  reconcilePreview -> pre-existing backlog rows + suggested matches
- *   Step 6  connect          -> persists the connection, then the parent refreshes
+ *   Step 1  wizardGroups     -> the mappable groups (+ a local project list)
+ *   Step 2  wizardIssues ×N  -> the issue set the three modes filter, per group
+ *   Step 3  wizardStates ×N  -> one mapping table per distinct state scope
+ *   Step 4  reconcilePreview ×N -> pre-existing backlog rows, per target project
+ *   Step 5  connect ×N       -> persists each mapping, then the parent refreshes
  *
- * Moving BACK never re-fetches; changing the source (or the Step-3 selection,
- * or the target project) invalidates exactly the downstream steps that depend
- * on it.
+ * Moving BACK never re-fetches; changing the mappings (or the Step-2 selection)
+ * invalidates exactly the downstream steps that depend on it.
  *
  * The API key lives in this component's state and leaves only inside the
  * `credentials` field of the calls above — nothing ever reads it back.
+ *
+ * ADD-MAPPING MODE (`sourceConnection` set). Re-entered from the connected
+ * view to manage an authorization that already exists, so Step 0 is not merely
+ * pre-answered — it is GONE: the wizard opens on Map, the rail carries five
+ * steps, Back from Map has nowhere to go, and nothing ever asks for the key
+ * again. Every probe names the connection (`{ connectionId }`) instead of
+ * carrying credentials, `connect` passes `sourceConnectionId`, and main
+ * resolves the stored key on its side — so in this mode nothing key-shaped
+ * crosses IPC at all.
+ *
+ * Its Map step is a MAPPING EDITOR in two halves. The connection's live
+ * siblings are listed first, each with an Unlink that STAGES a disconnect
+ * locally; below them, only the groups no kept sibling covers are offered a
+ * project select — so a scope is either linked or mappable, never both, and
+ * moving one is unlink-then-map rather than a second row on the same scope.
+ *
+ * Everything sibling-derived reads PAST a staged unlink (the push target it
+ * holds, the container it covers), because Submit disconnects before it
+ * connects; and a run that only unlinks skips Tasks/States/Reconcile entirely,
+ * since those steps describe mapped groups it does not have.
  */
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check } from 'lucide-react';
@@ -37,26 +61,36 @@ import { API } from '../../../utils/api';
 import type { Project } from '../../../types/project';
 import type {
   TrackerConflictMode,
+  TrackerConnectionSummary,
+  TrackerContentSyncMode,
   TrackerCredentialsInput,
   TrackerDirectionMode,
+  TrackerFieldOptions,
+  TrackerGroup,
+  TrackerGroupTree,
   TrackerIssue,
   TrackerProvider,
   TrackerReconcileDecision,
   TrackerReconcileItem,
   TrackerSelectionJson,
   TrackerSelectionMode,
-  TrackerSourceNarrow,
-  TrackerSourceSelection,
-  TrackerSourceTree,
   TrackerState,
   TrackerStateMapping,
   TrackerUserRef,
+  TrackerWizardSourceInput,
   TrackerWorkspaceIdentity,
 } from '../../../../../shared/types/trackerSync';
+import type { EntityCategory, Priority } from '../../../../../shared/types/tasks';
 import { Eyebrow, PillToggle, ProviderTile, Segmented } from './trackerShared';
 import {
+  CONTENT_MODE_OPTIONS,
+  ENTITY_CATEGORIES,
   MAPPING_TARGETS,
+  PRIORITY_LEVELS,
+  mappingTargetNote,
   providerMeta,
+  seedCategoryMapping,
+  seedPriorityMapping,
   seedStateMapping,
   trackerInputClass,
   trackerSelectClass,
@@ -66,19 +100,26 @@ import {
 // Step vocabulary
 // ---------------------------------------------------------------------------
 
-const STEP_LABELS = ['Connect', 'Project', 'Source', 'Tasks', 'States', 'Reconcile', 'Review'] as const;
+const STEP_LABELS = ['Connect', 'Map', 'Tasks', 'States', 'Reconcile', 'Review'] as const;
 const STEP_EYEBROWS = [
   'Step 01 · Authorize',
-  'Step 02 · Project',
-  'Step 03 · Source',
-  'Step 04 · Selection',
-  'Step 05 · Mapping',
-  'Step 06 · Reconcile',
-  'Step 07 · Confirm',
+  'Step 02 · Map projects',
+  'Step 03 · Selection',
+  'Step 04 · Mapping',
+  'Step 05 · Reconcile',
+  'Step 06 · Confirm',
 ] as const;
 const LAST_STEP = STEP_LABELS.length - 1;
+/** The step every mapping change clamps the rail back to. */
+const MAP_STEP = 1;
 
 type ReconcileAction = TrackerReconcileDecision['action'];
+
+/** Per-mapping submit state on the Review step; an absent entry is "pending". */
+interface MappingProgress {
+  status: 'connecting' | 'ok' | 'error';
+  error: string | null;
+}
 
 const MODE_OPTIONS: readonly { value: TrackerSelectionMode; label: string }[] = [
   { value: 'all', label: 'All tasks' },
@@ -109,8 +150,33 @@ const CONFLICT_OPTIONS: readonly { value: TrackerConflictMode; label: string }[]
 /** Card chrome shared by every panel in the body — square corners, hairline border. */
 const CARD = 'rounded-none border border-border-primary bg-surface-primary';
 
+/**
+ * Reconcile decisions are keyed by (target project, entity) — the same entity id
+ * can only appear under one project, but two mappings sharing a project share
+ * its rows, so the project has to be part of the key for the routing below.
+ */
+function decisionKey(projectId: number, item: TrackerReconcileItem): string {
+  return `${projectId}:${item.entityType}:${item.entityId}`;
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Whether a live connection's recorded scope names the exact slice a mappable
+ * group covers. The whole triple is the identity — two rows under the same
+ * container are different mappings unless the narrow matches too.
+ */
+function sameScope(
+  scope: NonNullable<TrackerConnectionSummary['sourceScope']>,
+  selection: TrackerGroup['selection'],
+): boolean {
+  return (
+    scope.containerId === selection.containerId &&
+    scope.narrowId === selection.narrowId &&
+    scope.narrowKind === selection.narrowKind
+  );
 }
 
 export interface TrackerWizardModalProps {
@@ -118,8 +184,15 @@ export interface TrackerWizardModalProps {
   provider: TrackerProvider;
   projectId: number;
   onClose: () => void;
-  /** Fired after `connect` resolves so the catalog can re-read its rows. */
+  /** Fired after every mapping's `connect` resolves so the catalog can re-read its rows. */
   onConnected: () => void;
+  /**
+   * ADD-MAPPING MODE. Set to a live connection to hang further mappings off its
+   * existing authorization: Step 0 is dropped entirely, the probes and `connect`
+   * name this connection instead of carrying a key, and the Map step chips the
+   * groups its siblings already cover. Undefined = the ordinary paste-a-key run.
+   */
+  sourceConnection?: TrackerConnectionSummary;
 }
 
 export function TrackerWizardModal({
@@ -128,14 +201,27 @@ export function TrackerWizardModal({
   projectId,
   onClose,
   onConnected,
+  sourceConnection,
 }: TrackerWizardModalProps): React.JSX.Element {
   const meta = providerMeta(provider);
 
+  /**
+   * The first step this run owns. Add-mapping mode starts on Map because its
+   * authorization already happened — Step 0 is not skipped-but-present, it is
+   * absent, so every index-based guard below reads this rather than 0.
+   */
+  const firstStep = sourceConnection !== undefined ? MAP_STEP : 0;
+
   // ── Navigation ────────────────────────────────────────────────────────────
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState(firstStep);
   /** Furthest step reached — the rail only navigates to steps already unlocked. */
-  const [maxStep, setMaxStep] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [maxStep, setMaxStep] = useState(firstStep);
+  /**
+   * Add-mapping mode mounts already fetching (the group tree its Map step opens
+   * on), so it starts loading rather than rendering one frame of "nothing came
+   * back" before the mount probe has even fired.
+   */
+  const [loading, setLoading] = useState(sourceConnection !== undefined);
   const [stepError, setStepError] = useState<string | null>(null);
 
   // ── Step 0 · credentials + identity ───────────────────────────────────────
@@ -146,35 +232,68 @@ export function TrackerWizardModal({
   const [authError, setAuthError] = useState<string | null>(null);
   const [identity, setIdentity] = useState<TrackerWorkspaceIdentity | null>(null);
 
-  // ── Step 1 · target project ───────────────────────────────────────────────
+  // ── Step 1 · map ──────────────────────────────────────────────────────────
   const [projects, setProjects] = useState<Project[]>([]);
-  const [targetProjectId, setTargetProjectId] = useState(projectId);
+  const [groupTree, setGroupTree] = useState<TrackerGroupTree | null>(null);
+  /** groupId → cyboflow project id; an absent key is "don't import". */
+  const [mappings, setMappings] = useState<Record<string, number>>({});
+  /** cyboflow project id → the groupId that may push new ideas out. */
+  const [pushChoice, setPushChoice] = useState<Record<number, string>>({});
+  /**
+   * Add-mapping mode only: the connection's live siblings, read once on mount.
+   * They are the Map step's LINKED section — what this authorization already
+   * covers — and the reason its group list only offers what is not covered yet.
+   * Empty in the ordinary run (a fresh authorization has no siblings).
+   */
+  const [existingMappings, setExistingMappings] = useState<TrackerConnectionSummary[]>([]);
+  /**
+   * Connection ids STAGED for unlink. Staging is local and free: nothing is
+   * disconnected until Submit runs, and closing the wizard forgets it. Every
+   * sibling-derived answer below reads past these, because by the time a
+   * `connect` in this run executes they will already be retired.
+   */
+  const [unlinkIds, setUnlinkIds] = useState<Set<string>>(() => new Set());
 
-  // ── Step 2 · source ───────────────────────────────────────────────────────
-  const [sourceTree, setSourceTree] = useState<TrackerSourceTree | null>(null);
-  const [containerId, setContainerId] = useState<string | null>(null);
-  const [narrows, setNarrows] = useState<TrackerSourceNarrow[]>([]);
-  const [narrowId, setNarrowId] = useState<string | null>(null);
-
-  // ── Step 3 · selection ────────────────────────────────────────────────────
-  const [issues, setIssues] = useState<TrackerIssue[]>([]);
+  // ── Step 2 · selection ────────────────────────────────────────────────────
+  const [issuesByGroup, setIssuesByGroup] = useState<Record<string, TrackerIssue[]>>({});
   const [issuesLoaded, setIssuesLoaded] = useState(false);
   const [mode, setMode] = useState<TrackerSelectionMode>('all');
   const [assignees, setAssignees] = useState<Record<string, boolean>>({});
   const [manual, setManual] = useState<Record<string, boolean>>({});
 
-  // ── Step 4 · mapping + direction ──────────────────────────────────────────
-  const [states, setStates] = useState<TrackerState[]>([]);
+  // ── Step 3 · mapping + direction ──────────────────────────────────────────
+  const [statesByScope, setStatesByScope] = useState<Record<string, TrackerState[]>>({});
   const [statesLoaded, setStatesLoaded] = useState(false);
-  const [mapping, setMapping] = useState<TrackerStateMapping>({});
+  const [mappingByScope, setMappingByScope] = useState<Record<string, TrackerStateMapping>>({});
   const [statusSyncMode, setStatusSyncMode] = useState<TrackerDirectionMode>('auto');
   const [pullMode, setPullMode] = useState<TrackerDirectionMode>('auto');
   const [pushMode, setPushMode] = useState<TrackerDirectionMode>('auto');
   const [mirrorSubissues, setMirrorSubissues] = useState(true);
   const [conflictMode, setConflictMode] = useState<TrackerConflictMode>('auto');
+  /**
+   * The priority/category mapping tables' vocabulary — fetched ONCE per
+   * credential source (like `groupTree`, and unlike `statesByScope`: none of
+   * the three providers scopes these lists to a container, so a mapping
+   * change never invalidates this cache — see the credential-edit effect
+   * below, not the mapping-change one).
+   */
+  const [fieldOptions, setFieldOptions] = useState<TrackerFieldOptions | null>(null);
+  const [fieldOptionsLoaded, setFieldOptionsLoaded] = useState(false);
+  /** The edited `toProvider` half only — `toLocal` is never sent (see trackerVocabulary.ts). */
+  const [priorityMapping, setPriorityMapping] = useState<Record<Priority, string | null> | null>(
+    null,
+  );
+  const [categoryMapping, setCategoryMapping] = useState<Record<
+    EntityCategory,
+    string | null
+  > | null>(null);
+  const [contentSyncMode, setContentSyncMode] = useState<TrackerContentSyncMode>('off');
+  const [archiveSyncMode, setArchiveSyncMode] = useState<TrackerContentSyncMode>('off');
 
-  // ── Step 5 · reconcile ────────────────────────────────────────────────────
-  const [reconcileItems, setReconcileItems] = useState<TrackerReconcileItem[]>([]);
+  // ── Step 4 · reconcile ────────────────────────────────────────────────────
+  const [reconcileByProject, setReconcileByProject] = useState<
+    Record<number, TrackerReconcileItem[]>
+  >({});
   const [reconcileLoaded, setReconcileLoaded] = useState(false);
   const [decisions, setDecisions] = useState<Record<string, ReconcileAction>>({});
   const [linkTargets, setLinkTargets] = useState<Record<string, string>>({});
@@ -183,12 +302,27 @@ export function TrackerWizardModal({
    * request is superseded (a new ensureReconcile call, or any invalidation
    * below that drops `reconcileLoaded`) so a response that arrives after its
    * request was superseded is discarded instead of installed for the wrong
-   * project/source/selection.
+   * mappings/selection.
    */
   const reconcileRequestIdRef = useRef(0);
+  /**
+   * Version stamp for the group/issues/states probes, bumped by every
+   * credential or mapping edit: a probe claimed under an older version abandons
+   * its install, so a response landing AFTER the invalidation effect cleared
+   * the caches cannot re-install data computed for the previous mapping set.
+   */
+  const probeVersionRef = useRef(0);
 
-  // ── Step 6 · submit ───────────────────────────────────────────────────────
+  // ── Step 5 · submit ───────────────────────────────────────────────────────
   const [submitting, setSubmitting] = useState(false);
+  const [progress, setProgress] = useState<Record<string, MappingProgress>>({});
+  /**
+   * Per-staged-unlink submit state, keyed by connection id (see `progress`).
+   * Deliberately NOT cleared when the mappings change: a disconnect that already
+   * landed cannot be undone by editing the map, and re-sending it would only
+   * fail on a row that no longer exists.
+   */
+  const [unlinkProgress, setUnlinkProgress] = useState<Record<string, MappingProgress>>({});
 
   // -------------------------------------------------------------------------
   // Derived
@@ -207,129 +341,453 @@ export function TrackerWizardModal({
     };
   }, [provider, apiKey, baseUrl, workspaceSlug, meta.defaultBaseUrl, meta.needsWorkspaceSlug]);
 
-  const targetProject = useMemo(
-    () => projects.find((p) => p.id === targetProjectId) ?? null,
-    [projects, targetProjectId],
-  );
-  const targetProjectName = targetProject?.name ?? `Project ${targetProjectId}`;
-
-  const container = useMemo(
-    () => sourceTree?.containers.find((c) => c.id === containerId) ?? null,
-    [sourceTree, containerId],
-  );
-  const narrow = useMemo(
-    () => narrows.find((n) => n.id === narrowId) ?? null,
-    [narrows, narrowId],
+  /**
+   * What every probe sends as its credential source — EXACTLY one key, which is
+   * what the router's refinement enforces. Add-mapping mode names the
+   * connection and sends nothing key-shaped; the paste path sends the key it
+   * validated.
+   */
+  const probeSource = useMemo<TrackerWizardSourceInput>(
+    () =>
+      sourceConnection !== undefined ? { connectionId: sourceConnection.id } : { credentials },
+    [sourceConnection, credentials],
   );
 
-  const selection = useMemo<TrackerSourceSelection | null>(() => {
-    if (containerId === null || narrow === null) return null;
-    return { containerId, narrowId: narrow.id, narrowKind: narrow.kind };
-  }, [containerId, narrow]);
+  /**
+   * The identity the header and Review card attribute this run to, and the gate
+   * `goToStep` reads: non-null means "authorized". Add-mapping mode inherits it
+   * from the connection it extends — that authorization was already probed, and
+   * re-probing it would ask the provider a question the row already answers.
+   *
+   * Only the two DISPLAYED fields, deliberately: a connection summary carries no
+   * `workspaceId`, and inventing one to satisfy `TrackerWorkspaceIdentity` would
+   * put a connection id behind a workspace-shaped name.
+   */
+  const shownIdentity = useMemo<Pick<
+    TrackerWorkspaceIdentity,
+    'workspaceName' | 'actorLabel'
+  > | null>(
+    () =>
+      sourceConnection === undefined
+        ? identity
+        : {
+            workspaceName: sourceConnection.workspaceName,
+            actorLabel: sourceConnection.actorLabel,
+          },
+    [sourceConnection, identity],
+  );
 
-  const sourceLabel = container !== null && narrow !== null ? `${container.name} · ${narrow.name}` : '';
+  /** Every group in tree order — the order mappings, probes and connects follow. */
+  const allGroups = useMemo<TrackerGroup[]>(
+    () => (groupTree?.sections ?? []).flatMap((s) => s.groups),
+    [groupTree],
+  );
 
-  /** Distinct assignees across the fetched issues, with their issue counts. */
+  const mappedGroups = useMemo(
+    () => allGroups.filter((g) => mappings[g.id] !== undefined),
+    [allGroups, mappings],
+  );
+
+  const projectName = (id: number): string =>
+    projects.find((p) => p.id === id)?.name ?? `Project ${id}`;
+
+  /**
+   * The siblings this run is KEEPING — the Map step's linked rows, and the only
+   * ones every sibling-derived answer below may consider. A staged unlink is
+   * already gone as far as this run is concerned: its disconnect runs before any
+   * connect does, so the push target it holds and the scope it covers are the
+   * run's to take.
+   */
+  const liveMappings = useMemo(
+    () => existingMappings.filter((m) => !unlinkIds.has(m.id)),
+    [existingMappings, unlinkIds],
+  );
+
+  /** Siblings staged for unlink, in the order the connection reports them. */
+  const stagedUnlinks = useMemo(
+    () => existingMappings.filter((m) => unlinkIds.has(m.id)),
+    [existingMappings, unlinkIds],
+  );
+
+  /**
+   * The connection whose stored key this run's `connect` calls ride on. Nothing
+   * key-shaped exists in add-mapping mode: main resolves one from the row the
+   * payload names, and `disconnect` CLEARS that row's key — so the carrier has
+   * to be a row the run is keeping. Any of them will do; they are all the same
+   * authorization.
+   */
+  const credentialCarrierId: string | undefined =
+    sourceConnection === undefined
+      ? undefined
+      : !unlinkIds.has(sourceConnection.id)
+        ? sourceConnection.id
+        : (liveMappings[0]?.id ?? sourceConnection.id);
+
+  /**
+   * The one staged unlink that must run AFTER the connects instead of before
+   * them: the run retires every sibling, so the key the connects need belongs
+   * to a row that is itself on the way out. Ordering it last keeps the run
+   * working; the cost is that a new mapping re-using its exact scope imports on
+   * the next sync pass rather than immediately, because the old row still owns
+   * those links while the connect runs.
+   */
+  const deferredUnlinkId: string | null =
+    credentialCarrierId !== undefined &&
+    unlinkIds.has(credentialCarrierId) &&
+    mappedGroups.length > 0
+      ? credentialCarrierId
+      : null;
+
+  /**
+   * The kept siblings covering a group's exact scope triple. A group with any
+   * of them is LINKED: it is shown as a linked row and offers no select at all,
+   * which is what keeps one scope from being mapped into two projects at once.
+   *
+   * A legacy row with no recorded `sourceScope` matches nothing rather than
+   * everything: an unknown scope is not evidence of coverage.
+   */
+  const mappedSiblingsFor = (group: TrackerGroup): TrackerConnectionSummary[] =>
+    liveMappings.filter((m) => m.sourceScope !== null && sameScope(m.sourceScope, group.selection));
+
+  /** Groups still free to map — everything no kept sibling already covers. */
+  const availableGroups = (groups: TrackerGroup[]): TrackerGroup[] =>
+    groups.filter((g) => mappedSiblingsFor(g).length === 0);
+
+  /**
+   * What to call a sibling's scope. The tree's own name where the scope is still
+   * offered as a group; the stored label otherwise — a scope the provider no
+   * longer lists (a deleted team, a legacy row) still has to be nameable, and
+   * inventing one from the id would read as a group that exists.
+   */
+  const siblingLabel = (m: TrackerConnectionSummary): string => {
+    const scope = m.sourceScope;
+    const group = scope === null ? undefined : allGroups.find((g) => sameScope(scope, g.selection));
+    return group?.name ?? m.sourceLabel;
+  };
+
+  /** Distinct target projects, first-mapped first. */
+  const targetProjectIds = useMemo(() => {
+    const seen: number[] = [];
+    for (const g of mappedGroups) {
+      const pid = mappings[g.id];
+      if (!seen.includes(pid)) seen.push(pid);
+    }
+    return seen;
+  }, [mappedGroups, mappings]);
+
+  const groupsForProject = (pid: number): TrackerGroup[] =>
+    mappedGroups.filter((g) => mappings[g.id] === pid);
+
+  /**
+   * Target projects whose pusher is a LIVE SIBLING this run is not re-connecting
+   * — the push-target question those projects answered in an earlier run.
+   *
+   * It matters because `connect` claims the push target across wizard runs: main
+   * demotes every other armed row of the (project, provider) pair unless the
+   * payload says `pushTarget: false`. This run's cluster is run-local, so
+   * without this the FIRST group mapped into such a project would silently take
+   * the incumbent's place — a choice the user was never shown. So the run
+   * declines instead: no radio, `pushGroupIdFor` → null, `pushTarget: false` on
+   * every mapping into the project, and the incumbent keeps filing.
+   *
+   * Reads KEPT siblings only: unlink the pusher and the project is left with
+   * none, so the run claims it normally — the disconnect runs first, and main
+   * hands the flag on from there.
+   *
+   * The same-scope exclusion is belt and braces. The Map step no longer offers a
+   * select for a scope a kept sibling covers, so a run cannot contain the
+   * incumbent's own scope today; the term keeps the rule true of the payload
+   * rather than of the current step layout, because `pushTarget: false` on the
+   * incumbent's own row takes main's existing-row branch and DISARMS the project
+   * outright. Empty outside add-mapping mode, so the paste-a-key run is
+   * unchanged.
+   */
+  const pushIncumbents = useMemo<{ projectId: number; sibling: TrackerConnectionSummary }[]>(() => {
+    const out: { projectId: number; sibling: TrackerConnectionSummary }[] = [];
+    for (const pid of targetProjectIds) {
+      const runScopes = mappedGroups.filter((g) => mappings[g.id] === pid).map((g) => g.selection);
+      const sibling = liveMappings.find((m) => {
+        const scope = m.sourceScope;
+        // A legacy row with no recorded scope is not evidence of anything, same
+        // rule the linked rows follow — an unknown scope claims no coverage.
+        if (m.projectId !== pid || !m.pushTarget || scope === null) return false;
+        return !runScopes.some((selection) => sameScope(scope, selection));
+      });
+      if (sibling !== undefined) out.push({ projectId: pid, sibling });
+    }
+    return out;
+  }, [targetProjectIds, mappedGroups, mappings, liveMappings]);
+
+  const pushIncumbentFor = (pid: number): TrackerConnectionSummary | undefined =>
+    pushIncumbents.find((i) => i.projectId === pid)?.sibling;
+
+  const pushIncumbentIds = useMemo(
+    () => new Set(pushIncumbents.map((i) => i.projectId)),
+    [pushIncumbents],
+  );
+
+  /**
+   * Projects several groups feed AND this run decides for — the only ones
+   * needing a push-target choice. A project with an incumbent is excluded even
+   * at N groups: the payload sends `pushTarget: false` for all of them, so a
+   * radio would offer a choice nothing acts on.
+   */
+  const pushClusters = useMemo(() => {
+    const byProject = new Map<number, TrackerGroup[]>();
+    for (const g of mappedGroups) {
+      const pid = mappings[g.id];
+      const list = byProject.get(pid);
+      if (list) list.push(g);
+      else byProject.set(pid, [g]);
+    }
+    return [...byProject.entries()]
+      .filter(([pid, groups]) => groups.length > 1 && !pushIncumbentIds.has(pid))
+      .map(([pid, groups]) => ({ projectId: pid, groups }));
+  }, [mappedGroups, mappings, pushIncumbentIds]);
+
+  /**
+   * Which mapping pushes new ideas for a project, or null when this run claims
+   * nothing there. A stale choice (its group was remapped elsewhere) falls back
+   * to the first mapping rather than leaving the project with no pusher.
+   */
+  const pushGroupIdFor = (pid: number): string | null => {
+    // An incumbent outside this run answers for the project already; claiming
+    // over it would demote a mapping the user never chose to replace.
+    if (pushIncumbentFor(pid) !== undefined) return null;
+    const groups = groupsForProject(pid);
+    const chosen = pushChoice[pid];
+    if (groups.some((g) => g.id === chosen)) return chosen;
+    return groups[0]?.id ?? null;
+  };
+
+  /**
+   * A whole-team mapping and a project mapping under the same team both import
+   * the project's issues; the engine's cross-row guard skips the second. Say so
+   * here rather than letting the user discover it after the first sync.
+   *
+   * The overlap is with every KEPT mapping, not just this run's: in add-mapping
+   * mode the run owns only part of the connection's set, and a sibling covers
+   * exactly as much as an in-run row would. Both directions are checked, because
+   * the subsuming half can sit on either side — and a sibling staged for unlink
+   * covers nothing, since it is retired before the first sync.
+   */
+  const overlapWarnings = useMemo<string[]>(() => {
+    // Honest about the engine's guarantee: the cross-scope guard imports each
+    // issue ONCE, under whichever mapping fetches it first — not
+    // deterministically under either row.
+    const overlapText = (name: string): string =>
+      `Issues in ${name} are covered by both mappings — each imports once, under whichever mapping syncs it first.`;
+
+    // Containers some whole-container mapping already covers — this run's plus
+    // the connection's kept siblings. A legacy row with no recorded scope
+    // covers nothing, same rule the linked rows follow.
+    const covered = new Set<string>();
+    for (const g of mappedGroups) {
+      if (g.selection.narrowKind === 'all') covered.add(g.selection.containerId);
+    }
+    for (const m of liveMappings) {
+      if (m.sourceScope !== null && m.sourceScope.narrowKind === 'all') {
+        covered.add(m.sourceScope.containerId);
+      }
+    }
+
+    const out: string[] = [];
+    for (const g of mappedGroups) {
+      if (g.selection.narrowKind !== 'all') {
+        // Narrowed here, subsumed by a whole-container mapping on either side.
+        if (covered.has(g.selection.containerId)) out.push(overlapText(g.name));
+      } else if (
+        // Whole-container here, subsuming a sibling narrowed under it — the
+        // direction a this-run-only scan can never see.
+        liveMappings.some(
+          (m) =>
+            m.sourceScope !== null &&
+            m.sourceScope.narrowKind !== 'all' &&
+            m.sourceScope.containerId === g.selection.containerId,
+        )
+      ) {
+        out.push(overlapText(g.name));
+      }
+    }
+    return out;
+  }, [mappedGroups, liveMappings]);
+
+  /** Every fetched issue across the mapped groups, in mapping order. */
+  const allIssues = useMemo(
+    () => mappedGroups.flatMap((g) => issuesByGroup[g.id] ?? []),
+    [mappedGroups, issuesByGroup],
+  );
+
+  /** Distinct assignees across every mapping, with their issue counts. */
   const assigneeOptions = useMemo(() => {
     const byId = new Map<string, { user: TrackerUserRef; count: number }>();
-    for (const issue of issues) {
+    for (const issue of allIssues) {
       if (issue.assignee === null) continue;
       const entry = byId.get(issue.assignee.id);
       if (entry) entry.count += 1;
       else byId.set(issue.assignee.id, { user: issue.assignee, count: 1 });
     }
     return [...byId.values()];
-  }, [issues]);
+  }, [allIssues]);
 
-  const includedIssues = useMemo(() => {
-    if (mode === 'assignee') {
-      return issues.filter((i) => i.assignee !== null && assignees[i.assignee.id] === true);
+  const includedByGroup = useMemo<Record<string, TrackerIssue[]>>(() => {
+    const out: Record<string, TrackerIssue[]> = {};
+    for (const g of mappedGroups) {
+      const rows = issuesByGroup[g.id] ?? [];
+      out[g.id] =
+        mode === 'assignee'
+          ? rows.filter((i) => i.assignee !== null && assignees[i.assignee.id] === true)
+          : mode === 'manual'
+            ? rows.filter((i) => manual[i.externalId] === true)
+            : rows;
     }
-    if (mode === 'manual') return issues.filter((i) => manual[i.externalId] === true);
-    return issues;
-  }, [issues, mode, assignees, manual]);
+    return out;
+  }, [mappedGroups, issuesByGroup, mode, assignees, manual]);
+
+  const includedIssues = useMemo(
+    () => mappedGroups.flatMap((g) => includedByGroup[g.id] ?? []),
+    [mappedGroups, includedByGroup],
+  );
 
   const selectedAssigneeIds = useMemo(
     () => Object.keys(assignees).filter((id) => assignees[id]),
     [assignees],
   );
 
-  /** Membership set for the Step-2 list, so the row render stays linear. */
+  /** Membership set for the Tasks list, so the row render stays linear. */
   const includedIds = useMemo(
     () => new Set(includedIssues.map((i) => i.externalId)),
     [includedIssues],
   );
 
-  const stateCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const issue of issues) counts[issue.stateId] = (counts[issue.stateId] ?? 0) + 1;
-    return counts;
-  }, [issues]);
+  const includedForProject = (pid: number): TrackerIssue[] =>
+    groupsForProject(pid).flatMap((g) => includedByGroup[g.id] ?? []);
 
-  const reconcileDecisions = useMemo<TrackerReconcileDecision[]>(
+  /**
+   * One state table per distinct scope key: Linear states are per-team, Plane's
+   * per-project, so two groups sharing a scope share a table (and its mapping).
+   */
+  const stateScopes = useMemo(() => {
+    const byKey = new Map<string, TrackerGroup[]>();
+    for (const g of mappedGroups) {
+      const list = byKey.get(g.stateScopeKey);
+      if (list) list.push(g);
+      else byKey.set(g.stateScopeKey, [g]);
+    }
+    return [...byKey.entries()].map(([key, groups]) => ({
+      key,
+      groups,
+      label: groups.map((g) => g.name).join(', '),
+    }));
+  }, [mappedGroups]);
+
+  const mappedStates = useMemo(
+    () => stateScopes.flatMap((scope) => statesByScope[scope.key] ?? []),
+    [stateScopes, statesByScope],
+  );
+
+  const skippedStates = useMemo(
     () =>
-      reconcileItems.map((item) => {
-        const action = decisions[item.entityId] ?? 'keep';
-        const target = linkTargets[item.entityId];
-        if (action !== 'link' || target === undefined) {
-          return { entityType: item.entityType, entityId: item.entityId, action };
-        }
-        // Carry the ref chip along with the id — the service persists these on
-        // the link row and nothing back-fills them after connect.
-        const issue = issues.find((i) => i.externalId === target);
-        return {
-          entityType: item.entityType,
-          entityId: item.entityId,
-          action,
-          linkExternalId: target,
-          linkIdentifier: issue?.identifier,
-          linkUrl: issue?.url,
-        };
-      }),
-    [reconcileItems, decisions, linkTargets, issues],
+      stateScopes.flatMap((scope) =>
+        (statesByScope[scope.key] ?? []).filter(
+          (s) => (mappingByScope[scope.key] ?? {})[s.id] === 'dont',
+        ),
+      ),
+    [stateScopes, statesByScope, mappingByScope],
+  );
+
+  /** Every reconcile row with its ruling, flattened across the target projects. */
+  const decidedRows = useMemo(
+    () =>
+      targetProjectIds.flatMap((pid) =>
+        (reconcileByProject[pid] ?? []).map((item) => {
+          const key = decisionKey(pid, item);
+          return {
+            projectId: pid,
+            item,
+            action: decisions[key] ?? ('keep' as ReconcileAction),
+            target: linkTargets[key],
+          };
+        }),
+      ),
+    [targetProjectIds, reconcileByProject, decisions, linkTargets],
   );
 
   const tally = useMemo(() => {
     let keep = 0;
     let link = 0;
     let discard = 0;
-    for (const d of reconcileDecisions) {
-      if (d.action === 'keep') keep += 1;
-      else if (d.action === 'link') link += 1;
+    for (const row of decidedRows) {
+      if (row.action === 'keep') keep += 1;
+      else if (row.action === 'link') link += 1;
       else discard += 1;
     }
     return { keep, link, discard };
-  }, [reconcileDecisions]);
+  }, [decidedRows]);
 
-  const skippedStates = useMemo(
-    () => states.filter((s) => mapping[s.id] === 'dont'),
-    [states, mapping],
+  const failedCount = useMemo(
+    () =>
+      mappedGroups.filter((g) => progress[g.id]?.status === 'error').length +
+      stagedUnlinks.filter((m) => unlinkProgress[m.id]?.status === 'error').length,
+    [mappedGroups, progress, stagedUnlinks, unlinkProgress],
   );
 
   /**
-   * Footer guards. Step 2 cannot advance without a resolved source (there is
-   * nothing to probe), and Step 3's two selection modes cannot advance while
-   * they resolve to an empty set.
+   * A run that only unlinks. Tasks, States and Reconcile all describe MAPPED
+   * groups — with none there is no issue set to filter, no state table to build
+   * and no backlog to reconcile against — so those three steps have nothing to
+   * say and the run's one forward move is Review.
+   */
+  const unlinkOnly = mappedGroups.length === 0 && stagedUnlinks.length > 0;
+
+  /** Where Continue goes from `from`, honouring the unlink-only jump. */
+  const nextStepFrom = (from: number): number =>
+    from === MAP_STEP && unlinkOnly ? LAST_STEP : from + 1;
+
+  /** Where Back goes from `from` — the mirror of the jump above. */
+  const prevStepFrom = (from: number): number =>
+    from === LAST_STEP && mappedGroups.length === 0 ? MAP_STEP : from - 1;
+
+  /**
+   * Footer guards. Map cannot advance with nothing staged either way (no group
+   * to probe, no unlink to run), and the two selection modes cannot advance
+   * while they resolve to an empty set.
    */
   const nextBlocked =
-    (step === 2 && selection === null) ||
-    (step === 3 && mode === 'assignee' && selectedAssigneeIds.length === 0) ||
-    (step === 3 && mode === 'manual' && includedIssues.length === 0);
+    (step === MAP_STEP && mappedGroups.length === 0 && stagedUnlinks.length === 0) ||
+    (step === 2 && mode === 'assignee' && selectedAssigneeIds.length === 0) ||
+    (step === 2 && mode === 'manual' && includedIssues.length === 0);
 
   // -------------------------------------------------------------------------
   // Invalidation — a changed upstream answer drops exactly what depended on it
   // -------------------------------------------------------------------------
 
-  // Editing a credential retires the validated identity: the wizard past Step 0
-  // is only meaningful for the key that was actually probed.
+  // Editing a credential retires the validated identity AND the group tree: the
+  // wizard past Step 0 is only meaningful for the key that was actually probed,
+  // and a different key can name a different workspace.
+  //
+  // Inert in add-mapping mode: no credential input renders there, so the only
+  // time this could fire is the mount pass — where it would retire the inherited
+  // identity and clamp the rail behind a Step 0 that does not exist.
   useEffect(() => {
+    if (sourceConnection !== undefined) return;
+    probeVersionRef.current += 1;
     setIdentity(null);
     setAuthError(null);
+    setGroupTree(null);
+    setMappings({});
+    // The field-options cache is credential-scoped, same as groupTree — a
+    // different key can name a different workspace with a different
+    // priority/type vocabulary.
+    setFieldOptions(null);
+    setFieldOptionsLoaded(false);
+    setPriorityMapping(null);
+    setCategoryMapping(null);
     setMaxStep(0);
-  }, [apiKey, baseUrl, workspaceSlug]);
+  }, [apiKey, baseUrl, workspaceSlug, sourceConnection]);
 
-  // The Step-1 project list is a local read, loaded once per open. A failed
-  // load leaves the list empty and the wizard on the seeded active project.
+  // The Map step's project list is a local read, loaded once per open. A failed
+  // load leaves the list empty and the step unable to map anything.
   useEffect(() => {
     if (!isOpen) return;
     void API.projects
@@ -340,110 +798,179 @@ export function TrackerWizardModal({
       .catch(() => setProjects([]));
   }, [isOpen]);
 
-  // Reconcile previews the CHOSEN project's backlog, so a retarget drops it —
-  // and supersedes any reconcile request already in flight for the old target,
-  // so its late response cannot install itself under the new one.
+  // Different mappings mean different issues, state scopes, target projects and
+  // reconcile matches — and supersede any reconcile request already in flight,
+  // so its late response cannot install itself under the new mappings.
   useEffect(() => {
     reconcileRequestIdRef.current += 1;
-    setReconcileLoaded(false);
-    setMaxStep((m) => Math.min(m, 4));
-  }, [targetProjectId]);
-
-  // A different source means different issues, states and reconcile matches.
-  useEffect(() => {
-    reconcileRequestIdRef.current += 1;
-    setIssues([]);
+    probeVersionRef.current += 1;
+    setIssuesByGroup({});
     setIssuesLoaded(false);
     setAssignees({});
     setManual({});
-    setStates([]);
+    setStatesByScope({});
     setStatesLoaded(false);
-    setMapping({});
-    setReconcileItems([]);
+    setMappingByScope({});
+    setReconcileByProject({});
     setReconcileLoaded(false);
     setDecisions({});
     setLinkTargets({});
-    setMaxStep((m) => Math.min(m, 2));
-  }, [containerId, narrowId]);
+    setProgress({});
+    setMaxStep((m) => Math.min(m, MAP_STEP));
+  }, [mappings, pushChoice]);
 
   // The reconcile suggestions are computed against the INCLUDED issue set, so a
-  // changed Step-3 answer invalidates Step 5 (but nothing else).
+  // changed Tasks answer invalidates Reconcile (but nothing else).
   useEffect(() => {
     reconcileRequestIdRef.current += 1;
     setReconcileLoaded(false);
-    setMaxStep((m) => Math.min(m, 4));
+    setMaxStep((m) => Math.min(m, 3));
   }, [mode, assignees, manual]);
+
+  // -------------------------------------------------------------------------
+  // Add-mapping mount probes
+  //
+  // DECLARED AFTER the invalidation effects on purpose: those bump
+  // `probeVersionRef` on the mount pass too, and an effect that claimed its
+  // version before that bump would discard its own response as superseded.
+  // -------------------------------------------------------------------------
+
+  // The wizard opens ON Map here, so the group tree that Step 0's Continue would
+  // have fetched is fetched on mount instead. A failure surfaces as the step
+  // error and leaves `groupTree` null — and Continue CANNOT retry it, because
+  // an empty tree means nothing is mapped and the footer guard blocks the only
+  // other call site of `ensureGroups`. The Map step's Retry card is what
+  // re-drives it (see `retryGroups`).
+  useEffect(() => {
+    if (!isOpen || sourceConnection === undefined) return;
+    const version = probeVersionRef.current;
+    setLoading(true);
+    void trpc.cyboflow.tracker.wizardGroups
+      .mutate({ connectionId: sourceConnection.id })
+      .then((tree) => {
+        if (probeVersionRef.current === version) setGroupTree(tree);
+      })
+      .catch((err: unknown) => setStepError(errorMessage(err)))
+      .finally(() => setLoading(false));
+  }, [isOpen, sourceConnection]);
+
+  // The connection's live siblings, for the Map step's "already mapped" chips.
+  // A local read of rows the catalog already owns — a failure costs a hint, not
+  // the step, so it degrades to no chips rather than blocking the wizard.
+  useEffect(() => {
+    if (!isOpen || sourceConnection === undefined) return;
+    let cancelled = false;
+    void trpc.cyboflow.tracker.mappings
+      .query({ connectionId: sourceConnection.id })
+      .then((rows) => {
+        if (!cancelled) setExistingMappings(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setExistingMappings([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, sourceConnection]);
 
   // -------------------------------------------------------------------------
   // Probes
   // -------------------------------------------------------------------------
 
-  const loadNarrows = async (nextContainerId: string): Promise<void> => {
-    const rows = await trpc.cyboflow.tracker.wizardNarrows.mutate({
-      credentials,
-      containerId: nextContainerId,
-    });
-    setNarrows(rows);
-    setNarrowId(rows.find((r) => r.kind === 'all')?.id ?? rows[0]?.id ?? null);
+  const ensureGroups = async (): Promise<void> => {
+    if (groupTree !== null) return;
+    const version = probeVersionRef.current;
+    const tree = await trpc.cyboflow.tracker.wizardGroups.mutate({ ...probeSource });
+    if (probeVersionRef.current !== version) return;
+    setGroupTree(tree);
   };
 
-  const ensureContainers = async (): Promise<void> => {
-    if (sourceTree !== null) return;
-    const tree = await trpc.cyboflow.tracker.wizardContainers.mutate({ credentials });
-    setSourceTree(tree);
-    const first = tree.containers[0];
-    if (first) {
-      setContainerId(first.id);
-      await loadNarrows(first.id);
-    }
-  };
-
-  const ensureIssues = async (activeSelection: TrackerSourceSelection): Promise<void> => {
+  // Issues are fetched one mapping at a time: each call is a live provider
+  // request carrying the key, and a mapped workspace can hold dozens of groups.
+  const ensureIssues = async (): Promise<void> => {
     if (issuesLoaded) return;
-    const rows = await trpc.cyboflow.tracker.wizardIssues.mutate({
-      credentials,
-      selection: activeSelection,
-    });
-    setIssues(rows);
+    const version = probeVersionRef.current;
+    const next: Record<string, TrackerIssue[]> = {};
+    for (const group of mappedGroups) {
+      next[group.id] = await trpc.cyboflow.tracker.wizardIssues.mutate({
+        ...probeSource,
+        selection: group.selection,
+      });
+    }
+    if (probeVersionRef.current !== version) return;
+    setIssuesByGroup(next);
     setIssuesLoaded(true);
   };
 
-  const ensureStates = async (activeSelection: TrackerSourceSelection): Promise<void> => {
+  const ensureStates = async (): Promise<void> => {
     if (statesLoaded) return;
-    const rows = await trpc.cyboflow.tracker.wizardStates.mutate({
-      credentials,
-      selection: activeSelection,
-    });
-    setStates(rows);
-    setMapping((prev) => seedStateMapping(rows, prev));
+    const version = probeVersionRef.current;
+    const nextStates: Record<string, TrackerState[]> = {};
+    const nextMapping: Record<string, TrackerStateMapping> = {};
+    for (const scope of stateScopes) {
+      // Any group in the scope answers for all of them — that is what sharing a
+      // scope key means, so only one probe per table is fired.
+      const rows = await trpc.cyboflow.tracker.wizardStates.mutate({
+        ...probeSource,
+        selection: scope.groups[0].selection,
+      });
+      nextStates[scope.key] = rows;
+      nextMapping[scope.key] = seedStateMapping(rows, mappingByScope[scope.key]);
+    }
+    if (probeVersionRef.current !== version) return;
+    setStatesByScope(nextStates);
+    setMappingByScope(nextMapping);
     setStatesLoaded(true);
+  };
+
+  /**
+   * The priority/category mapping tables' vocabulary + seeded defaults. Fired
+   * alongside `ensureStates` (both belong to Step 3) but cached independently
+   * of `mappedGroups`: no selection argument, since none of the three
+   * providers scopes these lists to a container.
+   */
+  const ensureFieldOptions = async (): Promise<void> => {
+    if (fieldOptionsLoaded) return;
+    const version = probeVersionRef.current;
+    const options = await trpc.cyboflow.tracker.wizardFieldOptions.mutate({ ...probeSource });
+    if (probeVersionRef.current !== version) return;
+    setFieldOptions(options);
+    setPriorityMapping(seedPriorityMapping(options.defaultPriorityMapping.toProvider, priorityMapping ?? undefined));
+    setCategoryMapping(seedCategoryMapping(options.defaultCategoryMapping.toProvider, categoryMapping ?? undefined));
+    setFieldOptionsLoaded(true);
   };
 
   const ensureReconcile = async (): Promise<void> => {
     if (reconcileLoaded) return;
-    // Claim this request's version before the await so a later call (a fresh
-    // ensureReconcile, or an invalidation effect below) can supersede it.
+    // Claim this request's version before the awaits so a later call (a fresh
+    // ensureReconcile, or an invalidation effect above) can supersede it.
     const requestId = (reconcileRequestIdRef.current += 1);
-    const rows = await trpc.cyboflow.tracker.reconcilePreview.mutate({
-      projectId: targetProjectId,
-      issues: includedIssues,
-    });
-    // The target project, source, or selection changed while this request was
-    // in flight — its response no longer describes current state, so drop it.
-    // Whatever superseded us already reset `reconcileLoaded`, and the next
-    // visit to this step will re-fetch for the current state.
+    const rowsByProject: Record<number, TrackerReconcileItem[]> = {};
+    for (const pid of targetProjectIds) {
+      rowsByProject[pid] = await trpc.cyboflow.tracker.reconcilePreview.mutate({
+        projectId: pid,
+        issues: includedForProject(pid),
+      });
+    }
+    // The mappings or the selection changed while this was in flight — the
+    // response no longer describes current state, so drop it. Whatever
+    // superseded us already reset `reconcileLoaded`, and the next visit to this
+    // step will re-fetch for the current state.
     if (reconcileRequestIdRef.current !== requestId) return;
-    setReconcileItems(rows);
+    setReconcileByProject(rowsByProject);
     // A row with a suggested match defaults to Link (pre-filled with that
     // suggestion); everything else defaults to Keep.
     const nextDecisions: Record<string, ReconcileAction> = {};
     const nextTargets: Record<string, string> = {};
-    for (const row of rows) {
-      if (row.suggestedExternalId !== null) {
-        nextDecisions[row.entityId] = 'link';
-        nextTargets[row.entityId] = row.suggestedExternalId;
-      } else {
-        nextDecisions[row.entityId] = 'keep';
+    for (const pid of targetProjectIds) {
+      for (const row of rowsByProject[pid] ?? []) {
+        const key = decisionKey(pid, row);
+        if (row.suggestedExternalId !== null) {
+          nextDecisions[key] = 'link';
+          nextTargets[key] = row.suggestedExternalId;
+        } else {
+          nextDecisions[key] = 'keep';
+        }
       }
     }
     setDecisions(nextDecisions);
@@ -454,6 +981,24 @@ export function TrackerWizardModal({
   // -------------------------------------------------------------------------
   // Actions
   // -------------------------------------------------------------------------
+
+  /**
+   * Re-drive the group probe from the Map step itself. The only other caller of
+   * `ensureGroups` is a forward `goToStep`, which add-mapping mode cannot reach
+   * with an empty tree (nothing is mapped, so Continue is disabled) — without
+   * this the step is a dead end whose only live control is Close.
+   */
+  const retryGroups = async (): Promise<void> => {
+    setStepError(null);
+    setLoading(true);
+    try {
+      await ensureGroups();
+    } catch (err) {
+      setStepError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleAuthorize = async (): Promise<void> => {
     setValidating(true);
@@ -470,9 +1015,14 @@ export function TrackerWizardModal({
   };
 
   const goToStep = async (target: number): Promise<void> => {
-    if (target < 0 || target > LAST_STEP) return;
+    if (target < firstStep || target > LAST_STEP) return;
     // Step 0 is the gate: nothing downstream exists without a validated key.
-    if (target > 0 && identity === null) return;
+    // Add-mapping mode enters already past it, carrying the connection's identity.
+    if (target > firstStep && shownIdentity === null) return;
+    // The three middle steps describe mapped groups; with none they are not
+    // enterable in EITHER direction, which is also what makes Back from Review
+    // land on Map rather than on an empty Reconcile (see `prevStepFrom`).
+    if (mappedGroups.length === 0 && target > MAP_STEP && target < LAST_STEP) return;
     setStepError(null);
 
     // Backwards navigation is pure — it never re-probes the provider.
@@ -483,16 +1033,20 @@ export function TrackerWizardModal({
 
     setLoading(true);
     try {
-      if (target >= 2) await ensureContainers();
-      if (target >= 3) {
-        if (selection === null) throw new Error('Pick a source before continuing.');
-        await ensureIssues(selection);
+      if (target >= 1) await ensureGroups();
+      if (mappedGroups.length > 0) {
+        if (target >= 2) await ensureIssues();
+        if (target >= 3) {
+          await ensureStates();
+          await ensureFieldOptions();
+        }
+        if (target >= 4) await ensureReconcile();
+      } else if (target > MAP_STEP && stagedUnlinks.length === 0) {
+        // Past Map with nothing mapped and nothing staged — Review would have no
+        // run to show. (Map itself is always enterable; that is where the run is
+        // assembled.)
+        throw new Error('Map a group or unlink one before continuing.');
       }
-      if (target >= 4) {
-        if (selection === null) throw new Error('Pick a source before continuing.');
-        await ensureStates(selection);
-      }
-      if (target >= 5) await ensureReconcile();
       setStep(target);
       setMaxStep((m) => Math.max(m, target));
     } catch (err) {
@@ -502,48 +1056,178 @@ export function TrackerWizardModal({
     }
   };
 
-  const handleContainerPick = (nextId: string): void => {
-    if (nextId === containerId) return;
-    setContainerId(nextId);
-    setNarrows([]);
-    setNarrowId(null);
-    setLoading(true);
-    setStepError(null);
-    void loadNarrows(nextId)
-      .catch((err: unknown) => setStepError(errorMessage(err)))
-      .finally(() => setLoading(false));
+  /**
+   * Stage a live mapping for unlink. Local only — the disconnect runs at Submit,
+   * so nothing is destroyed by a wizard the user closes, and the group it covers
+   * drops straight into the mappable list below.
+   */
+  const stageUnlink = (connectionId: string): void => {
+    setUnlinkIds((prev) => {
+      if (prev.has(connectionId)) return prev;
+      const next = new Set(prev);
+      next.add(connectionId);
+      return next;
+    });
   };
 
-  const handleConnect = async (): Promise<void> => {
-    if (selection === null) return;
-    let selectionJson: TrackerSelectionJson | null = null;
-    if (mode === 'assignee') selectionJson = { assigneeIds: selectedAssigneeIds };
-    if (mode === 'manual') selectionJson = { issueIds: includedIssues.map((i) => i.externalId) };
+  const handleMap = (groupId: string, value: string): void => {
+    setMappings((prev) => {
+      const next = { ...prev };
+      if (value === '') delete next[groupId];
+      else next[groupId] = Number(value);
+      return next;
+    });
+  };
+
+  /**
+   * The reconcile decisions this mapping carries. A `link` rules on ONE issue,
+   * so it rides the mapping whose included set holds it; every other ruling is
+   * about the cyboflow entity alone and rides the project's first mapping. No
+   * decision is ever sent twice — the service would apply it twice.
+   */
+  const reconcileForGroup = (group: TrackerGroup): TrackerReconcileDecision[] => {
+    const pid = mappings[group.id];
+    const siblings = groupsForProject(pid);
+    const out: TrackerReconcileDecision[] = [];
+    for (const item of reconcileByProject[pid] ?? []) {
+      const key = decisionKey(pid, item);
+      const action = decisions[key] ?? 'keep';
+      const target = linkTargets[key];
+      const owner =
+        action === 'link' && target !== undefined
+          ? (siblings.find((g) =>
+              (includedByGroup[g.id] ?? []).some((i) => i.externalId === target),
+            ) ?? siblings[0])
+          : siblings[0];
+      if (owner.id !== group.id) continue;
+      if (action !== 'link' || target === undefined) {
+        out.push({ entityType: item.entityType, entityId: item.entityId, action });
+        continue;
+      }
+      // Carry the ref chip along with the id — the service persists these on
+      // the link row and nothing back-fills them after connect.
+      const issue = allIssues.find((i) => i.externalId === target);
+      out.push({
+        entityType: item.entityType,
+        entityId: item.entityId,
+        action,
+        linkExternalId: target,
+        linkIdentifier: issue?.identifier,
+        linkUrl: issue?.url,
+      });
+    }
+    return out;
+  };
+
+  /**
+   * Apply the run: staged UNLINKS first, then the connects, each one at a time.
+   *
+   * The order is load-bearing. A disconnect retires the old row's claim on its
+   * issues — `findSiblingLinkForExternal` ignores disconnected connections — so
+   * unlinking before connecting is what lets the same scope land in a new
+   * project with a full fresh import instead of a silent cross-scope skip. It
+   * is also how main hands the push target on: `disconnect` promotes a
+   * surviving sibling, and the connect that follows claims from a clean slate.
+   *
+   * A failed disconnect therefore STOPS the connects: the row it should have
+   * retired is still live, and connecting over it would import nothing. Retry
+   * re-runs the failure first, then everything still pending — `connect` is
+   * idempotent, but re-sending a mapping that already succeeded would re-run
+   * its reconcile decisions, so those are filtered out.
+   */
+  const handleSubmit = async (): Promise<void> => {
+    const pendingUnlinks = stagedUnlinks.filter((m) => unlinkProgress[m.id]?.status !== 'ok');
+    const pendingConnects = mappedGroups.filter((g) => progress[g.id]?.status !== 'ok');
+    if (pendingUnlinks.length === 0 && pendingConnects.length === 0) return;
 
     setSubmitting(true);
     setStepError(null);
-    try {
-      await trpc.cyboflow.tracker.connect.mutate({
-        projectId: targetProjectId,
-        credentials,
-        source: selection,
-        sourceLabel,
-        selectionMode: mode,
-        selectionJson,
-        stateMapping: mapping,
-        statusSyncMode,
-        pullMode,
-        pushMode,
-        mirrorSubissues,
-        conflictMode,
-        reconcile: reconcileDecisions,
-      });
+    let allOk = true;
+
+    const runUnlink = async (m: TrackerConnectionSummary): Promise<boolean> => {
+      setUnlinkProgress((prev) => ({ ...prev, [m.id]: { status: 'connecting', error: null } }));
+      try {
+        await trpc.cyboflow.tracker.disconnect.mutate({ connectionId: m.id });
+        setUnlinkProgress((prev) => ({ ...prev, [m.id]: { status: 'ok', error: null } }));
+        return true;
+      } catch (err) {
+        setUnlinkProgress((prev) => ({
+          ...prev,
+          [m.id]: { status: 'error', error: errorMessage(err) },
+        }));
+        return false;
+      }
+    };
+
+    for (const m of pendingUnlinks) {
+      // The carrier's own unlink is the one exception to the order — see
+      // `deferredUnlinkId`; it runs after the connects that need its key.
+      if (m.id === deferredUnlinkId) continue;
+      if (!(await runUnlink(m))) allOk = false;
+    }
+
+    if (allOk) {
+      for (const group of pendingConnects) {
+        const pid = mappings[group.id];
+        let selectionJson: TrackerSelectionJson | null = null;
+        if (mode === 'assignee') selectionJson = { assigneeIds: selectedAssigneeIds };
+        if (mode === 'manual') {
+          selectionJson = { issueIds: (includedByGroup[group.id] ?? []).map((i) => i.externalId) };
+        }
+        setProgress((prev) => ({ ...prev, [group.id]: { status: 'connecting', error: null } }));
+        try {
+          await trpc.cyboflow.tracker.connect.mutate({
+            projectId: pid,
+            // Exactly one credential source, same rule as the probes: the pasted
+            // key, or the connection whose stored key main resolves on its side.
+            ...(credentialCarrierId !== undefined
+              ? { sourceConnectionId: credentialCarrierId }
+              : { credentials }),
+            source: group.selection,
+            sourceLabel: group.sourceLabel,
+            selectionMode: mode,
+            selectionJson,
+            stateMapping: mappingByScope[group.stateScopeKey] ?? {},
+            statusSyncMode,
+            pullMode,
+            pushMode,
+            contentSyncMode,
+            archiveSyncMode,
+            // Always sent once fetched (Step 3 gates every forward path
+            // through ensureFieldOptions, so this is non-null by Review) —
+            // the seed's own table when the user never touched a picker.
+            ...(priorityMapping !== null ? { priorityMapping: { toProvider: priorityMapping } } : {}),
+            // Omitted entirely for a provider with no category concept: no
+            // table rendered, and an overlay would be silently dropped
+            // server-side anyway (categoryMapping.ts's provider gate).
+            ...(meta.supportsCategorySync && categoryMapping !== null
+              ? { categoryMapping: { toProvider: categoryMapping } }
+              : {}),
+            mirrorSubissues,
+            conflictMode,
+            reconcile: reconcileForGroup(group),
+            pushTarget: pushGroupIdFor(pid) === group.id,
+          });
+          setProgress((prev) => ({ ...prev, [group.id]: { status: 'ok', error: null } }));
+        } catch (err) {
+          allOk = false;
+          setProgress((prev) => ({
+            ...prev,
+            [group.id]: { status: 'error', error: errorMessage(err) },
+          }));
+        }
+      }
+    }
+
+    if (allOk && deferredUnlinkId !== null) {
+      const deferred = pendingUnlinks.find((m) => m.id === deferredUnlinkId);
+      if (deferred !== undefined && !(await runUnlink(deferred))) allOk = false;
+    }
+
+    setSubmitting(false);
+    if (allOk) {
       onConnected();
       onClose();
-    } catch (err) {
-      setStepError(errorMessage(err));
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -677,155 +1361,214 @@ export function TrackerWizardModal({
     </div>
   );
 
-  const renderProject = (): React.JSX.Element => (
+  const renderMap = (): React.JSX.Element => (
     <div className="space-y-5">
       <div>
         <Eyebrow>{STEP_EYEBROWS[1]}</Eyebrow>
         <h3 className="mt-1.5 text-lg font-bold text-text-primary">
-          Which cyboflow project does this sync into?
+          Map {meta.name} onto cyboflow projects
         </h3>
         <p className="mt-1.5 max-w-[560px] text-xs leading-relaxed text-text-secondary">
-          Imported {meta.name} issues land in this project&apos;s backlog, and only this
-          project&apos;s items sync back. One connection maps one cyboflow project to one{' '}
-          {meta.name} source — connect again from another project for more mappings.
+          Every mapped group becomes its own connection. Several groups can feed the same cyboflow
+          project; anything left on “Don&apos;t import” is ignored entirely.
         </p>
-      </div>
-
-      <div className="space-y-1.5">
-        {projects.map((p) => {
-          const selected = p.id === targetProjectId;
-          return (
-            <button
-              key={p.id}
-              type="button"
-              aria-pressed={selected}
-              onClick={() => setTargetProjectId(p.id)}
-              className={cn(
-                CARD,
-                'flex w-full items-center gap-3 px-3 py-2 text-left transition-colors duration-[120ms]',
-                selected ? 'border-interactive' : 'hover:border-border-emphasized',
-              )}
-            >
-              <span
-                className={cn(
-                  'h-2.5 w-2.5 flex-shrink-0 rounded-full border',
-                  selected ? 'border-interactive bg-interactive' : 'border-border-primary',
-                )}
-              />
-              <span className="text-xs font-bold text-text-primary">{p.name}</span>
-              {p.id === projectId && (
-                <span className="rounded-none bg-surface-secondary px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em] text-text-tertiary">
-                  Active
-                </span>
-              )}
-              <span className="ml-auto min-w-0 truncate text-[11px] text-text-tertiary">
-                {p.path}
-              </span>
-            </button>
-          );
-        })}
-        {projects.length === 0 && (
-          <p className={cn(CARD, 'px-3 py-4 text-xs text-text-tertiary')}>
-            Project list unavailable — the connection will use the currently active project.
+        {sourceConnection !== undefined && (
+          <p className="mt-1.5 max-w-[560px] text-xs leading-relaxed text-text-tertiary">
+            What this connection already covers is listed first. Unlink one to stop syncing it —
+            that runs when this wizard finishes, and the group drops into the list below, free to
+            map somewhere else.
           </p>
         )}
       </div>
-    </div>
-  );
 
-  const renderSource = (): React.JSX.Element => {
-    const containerLabel = sourceTree?.containerLabel ?? 'Source';
-    return (
-      <div className="space-y-5">
-        <div>
-          <Eyebrow>{STEP_EYEBROWS[2]}</Eyebrow>
-          <h3 className="mt-1.5 text-lg font-bold text-text-primary">
-            Pick a {containerLabel.toLowerCase()}, then narrow it down
-          </h3>
-        </div>
+      {overlapWarnings.map((warning) => (
+        <p key={warning} className="text-xs text-status-warning">
+          {warning}
+        </p>
+      ))}
 
-        <div>
-          <Eyebrow className="mb-2">{containerLabel}</Eyebrow>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-            {(sourceTree?.containers ?? []).map((c) => {
-              const selected = c.id === containerId;
-              return (
-                <button
-                  key={c.id}
+      {sourceConnection !== undefined && liveMappings.length > 0 && (
+        <div data-testid="tracker-linked-section">
+          <Eyebrow className="mb-2">Linked</Eyebrow>
+          <div className="space-y-1.5">
+            {liveMappings.map((sibling) => (
+              <div
+                key={sibling.id}
+                className={cn(CARD, 'flex items-center gap-3 px-3 py-2')}
+                data-testid={`tracker-linked-${sibling.id}`}
+              >
+                <span className="min-w-0 truncate text-xs font-bold text-text-primary">
+                  {siblingLabel(sibling)} → {projectName(sibling.projectId)}
+                </span>
+                {sibling.pushTarget && (
+                  <span className="flex-shrink-0 rounded-none bg-surface-secondary px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em] text-text-tertiary">
+                    Pushes
+                  </span>
+                )}
+                {sibling.status === 'paused' && (
+                  <span className="flex-shrink-0 rounded-none border border-border-primary px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em] text-text-tertiary">
+                    Paused
+                  </span>
+                )}
+                <Button
                   type="button"
-                  aria-pressed={selected}
-                  onClick={() => handleContainerPick(c.id)}
-                  className={cn(
-                    CARD,
-                    'flex flex-col items-start gap-1.5 p-3 text-left transition-colors duration-[120ms]',
-                    selected ? 'border-interactive shadow-[inset_3px_0_0_var(--color-interactive-primary)]' : 'hover:border-border-emphasized',
-                  )}
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto rounded-none"
+                  data-testid={`tracker-unlink-${sibling.id}`}
+                  onClick={() => stageUnlink(sibling.id)}
                 >
-                  {c.key !== null && (
-                    <span
-                      className={cn(
-                        'rounded-none px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em]',
-                        selected
-                          ? 'bg-interactive text-text-on-interactive'
-                          : 'bg-surface-secondary text-text-tertiary',
-                      )}
-                    >
-                      {c.key}
+                  Unlink
+                </Button>
+              </div>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] text-text-tertiary">
+            Nothing is disconnected yet — unlinking is applied when this run finishes, and closing
+            the wizard forgets it.
+          </p>
+        </div>
+      )}
+
+      {sourceConnection !== undefined && availableGroups(allGroups).length > 0 && (
+        <Eyebrow>Available to map</Eyebrow>
+      )}
+
+      {(groupTree?.sections ?? []).map((section) => {
+        // Add-mapping mode lists only what is still free: a covered scope has a
+        // linked row above instead, so one group cannot be pointed at two
+        // projects from here.
+        const rows = availableGroups(section.groups);
+        if (section.groups.length > 0 && rows.length === 0) return null;
+        return (
+          <div key={section.label}>
+            <Eyebrow className="mb-2">{section.label}</Eyebrow>
+            <div className="space-y-1.5">
+              {rows.map((group) => (
+                <div
+                  key={group.id}
+                  className={cn(CARD, 'flex items-center gap-3 px-3 py-2')}
+                  data-testid={`tracker-group-${group.id}`}
+                >
+                  {group.key !== null && (
+                    <span className="rounded-none bg-surface-secondary px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em] text-text-tertiary">
+                      {group.key}
                     </span>
                   )}
-                  <span className="text-xs font-bold text-text-primary">{c.name}</span>
-                  <span className="text-[11px] text-text-tertiary">
-                    {c.openIssueCount === null ? 'open issues' : `${c.openIssueCount} open issues`}
+                  <span className="min-w-0 truncate text-xs font-bold text-text-primary">
+                    {group.name}
                   </span>
-                </button>
-              );
-            })}
+                  <select
+                    aria-label={`Cyboflow project for ${group.name}`}
+                    value={mappings[group.id] === undefined ? '' : String(mappings[group.id])}
+                    onChange={(e) => handleMap(group.id, e.target.value)}
+                    className={cn(trackerSelectClass, 'ml-auto max-w-[240px]')}
+                  >
+                    <option value="">— Don&apos;t import</option>
+                    {projects.map((p) => (
+                      <option key={p.id} value={String(p.id)}>
+                        {p.id === projectId ? `${p.name} (Active)` : p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+              {section.groups.length === 0 && (
+                <p className={cn(CARD, 'px-3 py-4 text-xs text-text-tertiary')}>
+                  {meta.name} returned nothing in this section.
+                </p>
+              )}
+            </div>
           </div>
-        </div>
+        );
+      })}
 
-        <div>
-          <Eyebrow className="mb-2">Narrow to</Eyebrow>
-          <div className="space-y-1.5">
-            {narrows.map((n) => {
-              const selected = n.id === narrowId;
-              return (
-                <button
-                  key={n.id}
-                  type="button"
-                  aria-pressed={selected}
-                  onClick={() => setNarrowId(n.id)}
-                  className={cn(
-                    CARD,
-                    'flex w-full items-center gap-3 px-3 py-2 text-left transition-colors duration-[120ms]',
-                    selected ? 'border-interactive' : 'hover:border-border-emphasized',
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'h-2.5 w-2.5 flex-shrink-0 rounded-full border',
-                      selected ? 'border-interactive bg-interactive' : 'border-border-primary',
-                    )}
-                  />
-                  <span className="text-xs text-text-primary">{n.name}</span>
-                  <span className="text-[10px] uppercase tracking-[0.12em] text-text-tertiary">
-                    {n.kind}
-                  </span>
-                  <span className="ml-auto text-[11px] text-text-tertiary">
-                    {n.issueCount === null ? '' : `${n.issueCount} issues`}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+      {sourceConnection !== undefined &&
+        groupTree !== null &&
+        allGroups.length > 0 &&
+        availableGroups(allGroups).length === 0 && (
+          <p className={cn(CARD, 'px-3 py-4 text-xs text-text-tertiary')}>
+            Every group this authorization offers is already linked. Unlink one above to map it
+            somewhere else.
+          </p>
+        )}
+
+      {projects.length === 0 && (
+        <p className={cn(CARD, 'px-3 py-4 text-xs text-text-tertiary')}>
+          Project list unavailable — nothing can be mapped until it loads.
+        </p>
+      )}
+
+      {/* No tree and no fetch in flight: the probe failed and nothing else can
+          re-run it from here. Keyed off the missing tree rather than the step
+          error, which a rail click clears while the step stays empty. */}
+      {groupTree === null && !loading && (
+        <div
+          className={cn(CARD, 'flex items-center justify-between gap-3 px-3 py-4')}
+          data-testid="tracker-groups-retry"
+        >
+          <p className="text-xs text-text-tertiary">{meta.name} did not return its groups.</p>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="rounded-none"
+            onClick={() => void retryGroups()}
+          >
+            Retry
+          </Button>
         </div>
-      </div>
-    );
-  };
+      )}
+
+      {/* A project whose pusher is a live mapping outside this run: no radio is
+          offered, so say who keeps filing instead of implying the run decides. */}
+      {pushIncumbents.map(({ projectId: pid, sibling }) => (
+        <p
+          key={pid}
+          className={cn(CARD, 'px-3 py-2 text-xs text-text-tertiary')}
+          data-testid={`tracker-push-incumbent-${pid}`}
+        >
+          New cyboflow ideas in {projectName(pid)} keep pushing through {sibling.sourceLabel}.
+          Change that under Project mappings.
+        </p>
+      ))}
+
+      {pushClusters.map((cluster) => (
+        <fieldset key={cluster.projectId} className={cn(CARD, 'p-3')}>
+          <legend className="px-1 text-[10px] font-bold uppercase tracking-[0.18em] text-text-tertiary">
+            New cyboflow ideas in {projectName(cluster.projectId)} push to:
+          </legend>
+          <div className="mt-1.5 space-y-1.5">
+            {cluster.groups.map((group) => (
+              <label
+                key={group.id}
+                className="flex items-center gap-2 text-xs text-text-primary"
+              >
+                <input
+                  type="radio"
+                  name={`push-target-${cluster.projectId}`}
+                  checked={pushGroupIdFor(cluster.projectId) === group.id}
+                  onChange={() =>
+                    setPushChoice((prev) => ({ ...prev, [cluster.projectId]: group.id }))
+                  }
+                />
+                {group.name}
+              </label>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-text-tertiary">
+            Only one mapping per project creates {meta.name} issues — otherwise a new idea would be
+            filed once per mapping.
+          </p>
+        </fieldset>
+      ))}
+    </div>
+  );
 
   const renderTasks = (): React.JSX.Element => {
     const hint =
       mode === 'all'
-        ? 'Every issue in the source imports, and new ones keep arriving on each sync.'
+        ? 'Every issue in each mapped group imports, and new ones keep arriving on each sync.'
         : mode === 'assignee'
           ? 'Only issues assigned to the people you pick import.'
           : 'Only the issues you tick import. New issues will not be added automatically.';
@@ -833,8 +1576,11 @@ export function TrackerWizardModal({
     return (
       <div className="space-y-4">
         <div>
-          <Eyebrow>{STEP_EYEBROWS[3]}</Eyebrow>
+          <Eyebrow>{STEP_EYEBROWS[2]}</Eyebrow>
           <h3 className="mt-1.5 text-lg font-bold text-text-primary">Which issues come in?</h3>
+          <p className="mt-1.5 text-xs text-text-secondary">
+            One rule applies to every mapping.
+          </p>
         </div>
 
         <Segmented
@@ -872,7 +1618,9 @@ export function TrackerWizardModal({
               );
             })}
             {assigneeOptions.length === 0 && (
-              <p className="text-xs text-text-tertiary">No assignees on the issues in this source.</p>
+              <p className="text-xs text-text-tertiary">
+                No assignees on the issues in these groups.
+              </p>
             )}
           </div>
         )}
@@ -885,7 +1633,7 @@ export function TrackerWizardModal({
                 <button
                   type="button"
                   onClick={() =>
-                    setManual(Object.fromEntries(issues.map((i) => [i.externalId, true])))
+                    setManual(Object.fromEntries(allIssues.map((i) => [i.externalId, true])))
                   }
                   className="text-[10px] font-bold uppercase tracking-[0.12em] text-interactive"
                 >
@@ -901,62 +1649,76 @@ export function TrackerWizardModal({
               </div>
             )}
           </div>
-          <ul className="divide-y divide-border-primary">
-            {issues.map((issue) => {
-              const included = includedIds.has(issue.externalId);
-              return (
-                <li key={issue.externalId}>
-                  <button
-                    type="button"
-                    disabled={mode !== 'manual'}
-                    aria-pressed={mode === 'manual' ? included : undefined}
-                    onClick={() =>
-                      setManual((prev) => ({ ...prev, [issue.externalId]: !included }))
-                    }
-                    className={cn(
-                      'flex w-full items-center gap-3 px-3 py-2 text-left',
-                      mode === 'manual' && !included && 'opacity-50',
-                      mode === 'manual' && 'hover:bg-bg-hover',
-                    )}
-                  >
-                    {mode === 'manual' && (
-                      <span
-                        className={cn(
-                          'flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded-none border',
-                          included
-                            ? 'border-interactive bg-interactive'
-                            : 'border-border-primary',
-                        )}
-                      >
-                        {included && <Check className="h-2.5 w-2.5 text-text-on-interactive" />}
-                      </span>
-                    )}
-                    <span className="w-16 flex-shrink-0 truncate text-[10px] lowercase text-text-tertiary">
-                      {issue.identifier}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
-                      {issue.title}
-                    </span>
-                    {issue.estimate !== null && (
-                      <span className="w-8 flex-shrink-0 text-right text-[10px] text-text-tertiary">
-                        {issue.estimate} pt
-                      </span>
-                    )}
-                    {issue.assignee !== null && (
-                      <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-surface-secondary text-[8px] font-bold text-text-secondary">
-                        {issue.assignee.initials}
-                      </span>
-                    )}
-                  </button>
-                </li>
-              );
-            })}
-            {issues.length === 0 && (
-              <li className="px-3 py-4 text-xs text-text-tertiary">
-                This source has no open issues.
-              </li>
-            )}
-          </ul>
+          {mappedGroups.map((group) => {
+            const rows = issuesByGroup[group.id] ?? [];
+            return (
+              <div key={group.id} data-testid={`tracker-issues-${group.id}`}>
+                <div className="border-b border-border-primary bg-surface-secondary px-3 py-1.5">
+                  <Eyebrow>
+                    {group.name} → {projectName(mappings[group.id])}
+                  </Eyebrow>
+                </div>
+                <ul className="divide-y divide-border-primary">
+                  {rows.map((issue) => {
+                    const included = includedIds.has(issue.externalId);
+                    return (
+                      <li key={issue.externalId}>
+                        <button
+                          type="button"
+                          disabled={mode !== 'manual'}
+                          aria-pressed={mode === 'manual' ? included : undefined}
+                          onClick={() =>
+                            setManual((prev) => ({ ...prev, [issue.externalId]: !included }))
+                          }
+                          className={cn(
+                            'flex w-full items-center gap-3 px-3 py-2 text-left',
+                            mode === 'manual' && !included && 'opacity-50',
+                            mode === 'manual' && 'hover:bg-bg-hover',
+                          )}
+                        >
+                          {mode === 'manual' && (
+                            <span
+                              className={cn(
+                                'flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded-none border',
+                                included
+                                  ? 'border-interactive bg-interactive'
+                                  : 'border-border-primary',
+                              )}
+                            >
+                              {included && (
+                                <Check className="h-2.5 w-2.5 text-text-on-interactive" />
+                              )}
+                            </span>
+                          )}
+                          <span className="w-16 flex-shrink-0 truncate text-[10px] lowercase text-text-tertiary">
+                            {issue.identifier}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
+                            {issue.title}
+                          </span>
+                          {issue.estimate !== null && (
+                            <span className="w-8 flex-shrink-0 text-right text-[10px] text-text-tertiary">
+                              {issue.estimate} pt
+                            </span>
+                          )}
+                          {issue.assignee !== null && (
+                            <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-surface-secondary text-[8px] font-bold text-text-secondary">
+                              {issue.assignee.initials}
+                            </span>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                  {rows.length === 0 && (
+                    <li className="px-3 py-4 text-xs text-text-tertiary">
+                      This group has no open issues.
+                    </li>
+                  )}
+                </ul>
+              </div>
+            );
+          })}
         </div>
       </div>
     );
@@ -965,7 +1727,7 @@ export function TrackerWizardModal({
   const renderStates = (): React.JSX.Element => (
     <div className="space-y-4">
       <div>
-        <Eyebrow>{STEP_EYEBROWS[4]}</Eyebrow>
+        <Eyebrow>{STEP_EYEBROWS[3]}</Eyebrow>
         <h3 className="mt-1.5 text-lg font-bold text-text-primary">
           Map {meta.name} states to cyboflow
         </h3>
@@ -974,56 +1736,173 @@ export function TrackerWizardModal({
         </p>
       </div>
 
-      <div className={CARD}>
+      {stateScopes.map((scope) => {
+        const rows = statesByScope[scope.key] ?? [];
+        const scopeMapping = mappingByScope[scope.key] ?? {};
+        // Counts come from the issues of the groups sharing this table only.
+        const counts: Record<string, number> = {};
+        for (const group of scope.groups) {
+          for (const issue of issuesByGroup[group.id] ?? []) {
+            counts[issue.stateId] = (counts[issue.stateId] ?? 0) + 1;
+          }
+        }
+        return (
+          <div key={scope.key} className={CARD} data-testid={`tracker-state-scope-${scope.key}`}>
+            {stateScopes.length > 1 && (
+              <div className="border-b border-border-primary bg-surface-secondary px-3 py-1.5">
+                <Eyebrow>{scope.label}</Eyebrow>
+              </div>
+            )}
+            <div className="grid grid-cols-[minmax(0,1fr)_240px] gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
+              <Eyebrow>{meta.name} state</Eyebrow>
+              <Eyebrow>Cyboflow state</Eyebrow>
+            </div>
+            <div className="divide-y divide-border-primary">
+              {rows.map((state) => {
+                // Two scopes can publish states of the same NAME, so the label
+                // carries the scope as soon as more than one table is rendered.
+                const label =
+                  stateScopes.length > 1
+                    ? `Cyboflow state for ${state.name} in ${scope.label}`
+                    : `Cyboflow state for ${state.name}`;
+                return (
+                  <div
+                    key={state.id}
+                    className="grid grid-cols-[minmax(0,1fr)_240px] items-center gap-3 px-3 py-2"
+                  >
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span
+                        aria-hidden="true"
+                        className="h-2 w-2 flex-shrink-0 rounded-none bg-text-tertiary"
+                        style={state.color !== null ? { backgroundColor: state.color } : undefined}
+                      />
+                      <span className="truncate text-xs text-text-primary">{state.name}</span>
+                      <span className="text-[10px] text-text-tertiary">
+                        {counts[state.id] ?? 0}
+                      </span>
+                    </div>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <select
+                        aria-label={label}
+                        value={scopeMapping[state.id] ?? 'dont'}
+                        onChange={(e) =>
+                          setMappingByScope((prev) => ({
+                            ...prev,
+                            [scope.key]: {
+                              ...(prev[scope.key] ?? {}),
+                              // The <select> value is always one of MAPPING_TARGETS,
+                              // so the cast stays inside the TrackerMappingTarget union.
+                              [state.id]: e.target.value as TrackerStateMapping[string],
+                            },
+                          }))
+                        }
+                        className={cn(trackerSelectClass, 'w-full')}
+                      >
+                        {MAPPING_TARGETS.map((t) => (
+                          <option key={t.value} value={t.value}>
+                            {t.label}
+                          </option>
+                        ))}
+                      </select>
+                      {(() => {
+                        const note = mappingTargetNote(scopeMapping[state.id] ?? 'dont', meta.name);
+                        return note === null ? null : (
+                          <span className="text-[10px] leading-tight text-text-tertiary">
+                            {note}
+                          </span>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                );
+              })}
+              {rows.length === 0 && (
+                <p className="px-3 py-4 text-xs text-text-tertiary">
+                  {meta.name} returned no workflow states for this scope.
+                </p>
+              )}
+            </div>
+          </div>
+        );
+      })}
+
+      <div className={CARD} data-testid="tracker-priority-mapping">
         <div className="grid grid-cols-[minmax(0,1fr)_240px] gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
-          <Eyebrow>{meta.name} state</Eyebrow>
-          <Eyebrow>Cyboflow state</Eyebrow>
+          <Eyebrow>Cyboflow priority</Eyebrow>
+          <Eyebrow>{meta.name} priority</Eyebrow>
         </div>
         <div className="divide-y divide-border-primary">
-          {states.map((state) => (
+          {PRIORITY_LEVELS.map((level) => (
             <div
-              key={state.id}
+              key={level}
               className="grid grid-cols-[minmax(0,1fr)_240px] items-center gap-3 px-3 py-2"
             >
-              <div className="flex min-w-0 items-center gap-2">
-                <span
-                  aria-hidden="true"
-                  className="h-2 w-2 flex-shrink-0 rounded-none bg-text-tertiary"
-                  style={state.color !== null ? { backgroundColor: state.color } : undefined}
-                />
-                <span className="truncate text-xs text-text-primary">{state.name}</span>
-                <span className="text-[10px] text-text-tertiary">
-                  {stateCounts[state.id] ?? 0}
-                </span>
-              </div>
+              <span className="text-xs text-text-primary">{level}</span>
               <select
-                aria-label={`Cyboflow state for ${state.name}`}
-                value={mapping[state.id] ?? 'dont'}
-                onChange={(e) =>
-                  setMapping((prev) => ({
-                    ...prev,
-                    // The <select> value is always one of MAPPING_TARGETS, so the
-                    // cast below stays inside the TrackerMappingTarget union.
-                    [state.id]: e.target.value as TrackerStateMapping[string],
-                  }))
-                }
+                aria-label={`${meta.name} priority for ${level}`}
+                value={priorityMapping?.[level] ?? ''}
+                onChange={(e) => {
+                  const next = e.target.value === '' ? null : e.target.value;
+                  setPriorityMapping((prev) => ({
+                    ...(prev ?? ({} as Record<Priority, string | null>)),
+                    [level]: next,
+                  }));
+                }}
                 className={cn(trackerSelectClass, 'w-full')}
               >
-                {MAPPING_TARGETS.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
+                <option value="">— Not sent</option>
+                {(fieldOptions?.priorities ?? []).map((token) => (
+                  <option key={token} value={token}>
+                    {token}
                   </option>
                 ))}
               </select>
             </div>
           ))}
-          {states.length === 0 && (
-            <p className="px-3 py-4 text-xs text-text-tertiary">
-              {meta.name} returned no workflow states for this source.
-            </p>
-          )}
         </div>
       </div>
+
+      {meta.supportsCategorySync ? (
+        <div className={CARD} data-testid="tracker-category-mapping">
+          <div className="grid grid-cols-[minmax(0,1fr)_240px] gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
+            <Eyebrow>Cyboflow category</Eyebrow>
+            <Eyebrow>{meta.name} type</Eyebrow>
+          </div>
+          <div className="divide-y divide-border-primary">
+            {ENTITY_CATEGORIES.map((category) => (
+              <div
+                key={category}
+                className="grid grid-cols-[minmax(0,1fr)_240px] items-center gap-3 px-3 py-2"
+              >
+                <span className="text-xs capitalize text-text-primary">{category}</span>
+                <select
+                  aria-label={`${meta.name} type for ${category}`}
+                  value={categoryMapping?.[category] ?? ''}
+                  onChange={(e) => {
+                    const next = e.target.value === '' ? null : e.target.value;
+                    setCategoryMapping((prev) => ({
+                      ...(prev ?? ({} as Record<EntityCategory, string | null>)),
+                      [category]: next,
+                    }));
+                  }}
+                  className={cn(trackerSelectClass, 'w-full')}
+                >
+                  <option value="">— Not sent</option>
+                  {(fieldOptions?.categories ?? []).map((token) => (
+                    <option key={token} value={token}>
+                      {token}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-[11px] text-text-tertiary" data-testid="tracker-category-unsupported">
+          {meta.name} has no issue type — category stays local.
+        </p>
+      )}
 
       <div className={cn(CARD, 'p-3')}>
         <div className="flex items-center justify-between gap-3">
@@ -1078,6 +1957,37 @@ export function TrackerWizardModal({
           />
         </div>
 
+        <div className="mt-3 flex items-center justify-between gap-3 border-t border-border-primary pt-3">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-text-primary">Sync task fields</p>
+            <p className="mt-0.5 text-[11px] text-text-tertiary">
+              Title, description, priority{meta.supportsCategorySync ? ', and category' : ''} push
+              out to {meta.name}.
+            </p>
+          </div>
+          <Segmented
+            options={CONTENT_MODE_OPTIONS}
+            value={contentSyncMode}
+            onChange={setContentSyncMode}
+            ariaLabel="Sync task fields"
+          />
+        </div>
+
+        <div className="mt-3 flex items-center justify-between gap-3 border-t border-border-primary pt-3">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-text-primary">Archive in {meta.name}</p>
+            <p className="mt-0.5 text-[11px] text-text-tertiary">
+              A local archive or delete trashes the linked issue — never a hard delete.
+            </p>
+          </div>
+          <Segmented
+            options={CONTENT_MODE_OPTIONS}
+            value={archiveSyncMode}
+            onChange={setArchiveSyncMode}
+            ariaLabel={`Archive in ${meta.name}`}
+          />
+        </div>
+
         <div className="mt-3 flex items-start gap-3 border-t border-border-primary pt-3">
           <PillToggle
             checked={mirrorSubissues}
@@ -1119,14 +2029,16 @@ export function TrackerWizardModal({
 
   const renderReconcile = (): React.JSX.Element => {
     const setAll = (action: ReconcileAction): void => {
-      setDecisions(Object.fromEntries(reconcileItems.map((i) => [i.entityId, action])));
+      setDecisions(
+        Object.fromEntries(decidedRows.map((row) => [decisionKey(row.projectId, row.item), action])),
+      );
     };
 
     return (
       <div className="space-y-4">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <Eyebrow>{STEP_EYEBROWS[5]}</Eyebrow>
+            <Eyebrow>{STEP_EYEBROWS[4]}</Eyebrow>
             <h3 className="mt-1.5 text-lg font-bold text-text-primary">
               Your existing cyboflow backlog
             </h3>
@@ -1150,95 +2062,105 @@ export function TrackerWizardModal({
         </div>
 
         <p className="text-xs leading-relaxed text-text-secondary">
-          You have {reconcileItems.length} items in cyboflow&apos;s backlog from before this
+          You have {decidedRows.length} items in cyboflow&apos;s backlog from before this
           connection. Decide what happens to each. <strong>Link</strong> merges an item into a
           matching {meta.name} issue so it is not tracked twice.
         </p>
 
-        <div className={CARD}>
-          <div className="grid grid-cols-[minmax(0,1fr)_260px] gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
-            <Eyebrow>Cyboflow backlog item</Eyebrow>
-            <Eyebrow>Action</Eyebrow>
-          </div>
-          <div className="divide-y divide-border-primary">
-            {reconcileItems.map((item) => {
-              const action = decisions[item.entityId] ?? 'keep';
-              const suggestion =
-                item.suggestedExternalId === null
-                  ? null
-                  : includedIssues.find((i) => i.externalId === item.suggestedExternalId) ?? null;
-              return (
-                <div
-                  key={item.entityId}
-                  className={cn(
-                    'grid grid-cols-[minmax(0,1fr)_260px] items-center gap-3 px-3 py-2',
-                    action === 'discard' && 'bg-surface-secondary opacity-60',
-                  )}
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-[10px] lowercase text-text-tertiary">{item.ref}</span>
-                      <span className="truncate text-xs font-semibold text-text-primary">
-                        {item.title}
-                      </span>
-                    </div>
-                    {action === 'link' ? (
-                      <div className="mt-1.5 flex items-center gap-2">
-                        <Eyebrow className="flex-shrink-0">Merge into</Eyebrow>
-                        <select
-                          aria-label={`Merge ${item.ref} into`}
-                          value={linkTargets[item.entityId] ?? ''}
-                          onChange={(e) =>
-                            setLinkTargets((prev) => ({ ...prev, [item.entityId]: e.target.value }))
-                          }
-                          className={cn(trackerSelectClass, 'min-w-0 flex-1')}
-                        >
-                          {includedIssues.map((issue) => (
-                            <option key={issue.externalId} value={issue.externalId}>
-                              {issue.identifier} · {issue.title}
-                            </option>
-                          ))}
-                        </select>
+        {targetProjectIds.map((pid) => {
+          const rows = reconcileByProject[pid] ?? [];
+          const choices = includedForProject(pid);
+          return (
+            <div key={pid} className={CARD} data-testid={`tracker-reconcile-${pid}`}>
+              <div className="border-b border-border-primary bg-surface-secondary px-3 py-1.5">
+                <Eyebrow>{projectName(pid)}</Eyebrow>
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_260px] gap-3 border-b border-border-primary bg-surface-secondary px-3 py-2">
+                <Eyebrow>Cyboflow backlog item</Eyebrow>
+                <Eyebrow>Action</Eyebrow>
+              </div>
+              <div className="divide-y divide-border-primary">
+                {rows.map((item) => {
+                  const key = decisionKey(pid, item);
+                  const action = decisions[key] ?? 'keep';
+                  const suggestion =
+                    item.suggestedExternalId === null
+                      ? null
+                      : (choices.find((i) => i.externalId === item.suggestedExternalId) ?? null);
+                  return (
+                    <div
+                      key={key}
+                      className={cn(
+                        'grid grid-cols-[minmax(0,1fr)_260px] items-center gap-3 px-3 py-2',
+                        action === 'discard' && 'bg-surface-secondary opacity-60',
+                      )}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-[10px] lowercase text-text-tertiary">
+                            {item.ref}
+                          </span>
+                          <span className="truncate text-xs font-semibold text-text-primary">
+                            {item.title}
+                          </span>
+                        </div>
+                        {action === 'link' ? (
+                          <div className="mt-1.5 flex items-center gap-2">
+                            <Eyebrow className="flex-shrink-0">Merge into</Eyebrow>
+                            <select
+                              aria-label={`Merge ${item.ref} into`}
+                              value={linkTargets[key] ?? ''}
+                              onChange={(e) =>
+                                setLinkTargets((prev) => ({ ...prev, [key]: e.target.value }))
+                              }
+                              className={cn(trackerSelectClass, 'min-w-0 flex-1')}
+                            >
+                              {choices.map((issue) => (
+                                <option key={issue.externalId} value={issue.externalId}>
+                                  {issue.identifier} · {issue.title}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        ) : (
+                          suggestion !== null && (
+                            <p className="mt-1 truncate text-[11px] text-interactive">
+                              likely match · {suggestion.identifier} · {suggestion.title}
+                            </p>
+                          )
+                        )}
                       </div>
-                    ) : (
-                      suggestion !== null && (
-                        <p className="mt-1 truncate text-[11px] text-interactive">
-                          likely match · {suggestion.identifier} · {suggestion.title}
-                        </p>
-                      )
-                    )}
-                  </div>
-                  <Segmented
-                    options={RECONCILE_OPTIONS}
-                    value={action}
-                    ariaLabel={`Action for ${item.ref}`}
-                    onChange={(next) => {
-                      setDecisions((prev) => ({ ...prev, [item.entityId]: next }));
-                      if (next === 'link') {
-                        setLinkTargets((prev) =>
-                          prev[item.entityId] !== undefined
-                            ? prev
-                            : {
-                                ...prev,
-                                [item.entityId]:
-                                  item.suggestedExternalId ??
-                                  includedIssues[0]?.externalId ??
-                                  '',
-                              },
-                        );
-                      }
-                    }}
-                  />
-                </div>
-              );
-            })}
-            {reconcileItems.length === 0 && (
-              <p className="px-3 py-4 text-xs text-text-tertiary">
-                Nothing was in this project&apos;s backlog before the connection.
-              </p>
-            )}
-          </div>
-        </div>
+                      <Segmented
+                        options={RECONCILE_OPTIONS}
+                        value={action}
+                        ariaLabel={`Action for ${item.ref}`}
+                        onChange={(next) => {
+                          setDecisions((prev) => ({ ...prev, [key]: next }));
+                          if (next === 'link') {
+                            setLinkTargets((prev) =>
+                              prev[key] !== undefined
+                                ? prev
+                                : {
+                                    ...prev,
+                                    [key]:
+                                      item.suggestedExternalId ?? choices[0]?.externalId ?? '',
+                                  },
+                            );
+                          }
+                        }}
+                      />
+                    </div>
+                  );
+                })}
+                {rows.length === 0 && (
+                  <p className="px-3 py-4 text-xs text-text-tertiary">
+                    Nothing was in this project&apos;s backlog before the connection.
+                  </p>
+                )}
+              </div>
+            </div>
+          );
+        })}
 
         <p className="text-[11px] text-text-tertiary">
           <span className="text-status-success">{tally.keep} kept</span> ·{' '}
@@ -1251,48 +2173,82 @@ export function TrackerWizardModal({
   const renderReview = (): React.JSX.Element => {
     const selectionDetail =
       mode === 'all'
-        ? 'Every issue in the source'
+        ? 'Every issue in each mapped group'
         : mode === 'assignee'
           ? `${selectedAssigneeIds.length} assignees`
           : `${includedIssues.length} hand-picked issues`;
 
-    const cards: { label: string; value: string; detail: string }[] = [
-      {
-        label: 'Cyboflow project',
-        value: targetProjectName,
-        detail: 'Issues import into this backlog',
-      },
-      { label: 'Source', value: sourceLabel, detail: meta.name },
-      {
-        label: 'Selection',
-        value: MODE_OPTIONS.find((m) => m.value === mode)?.label ?? mode,
-        detail: selectionDetail,
-      },
-      {
-        label: 'Direction',
-        value: `Status ${directionLabel(statusSyncMode)} · Pull ${directionLabel(pullMode)} · Push ${directionLabel(pushMode)}`,
-        detail: `${mirrorSubissues ? 'Sub-issue mirroring on' : 'Sub-issue mirroring off'} · conflicts ${
-          conflictMode === 'auto' ? 'auto-resolve' : 'queue for review'
-        }`,
-      },
-      {
-        label: 'Mapping',
-        value: `${states.length - skippedStates.length} of ${states.length} states mapped`,
-        detail:
-          skippedStates.length === 0
-            ? 'Nothing skipped'
-            : `Skipped: ${skippedStates.map((s) => s.name).join(', ')}`,
-      },
-    ];
+    const cards: { label: string; value: string; detail: string }[] = [];
+
+    if (stagedUnlinks.length > 0) {
+      cards.push({
+        label: 'Unlinking',
+        value: `${stagedUnlinks.length} mapping${stagedUnlinks.length === 1 ? '' : 's'}`,
+        detail: 'Disconnected first, before anything else runs',
+      });
+    }
+
+    // An unlink-only run never visited Tasks, States or Reconcile, so the cards
+    // describing those answers would be reporting on nothing.
+    if (mappedGroups.length > 0) {
+      cards.push(
+        {
+          label: 'Mappings',
+          value: `${mappedGroups.length} → ${targetProjectIds.length} cyboflow projects`,
+          detail: 'Each mapping is its own connection',
+        },
+        {
+          label: 'Selection',
+          value: MODE_OPTIONS.find((m) => m.value === mode)?.label ?? mode,
+          detail: selectionDetail,
+        },
+        {
+          label: 'Direction',
+          value: `Status ${directionLabel(statusSyncMode)} · Pull ${directionLabel(pullMode)} · Push ${directionLabel(pushMode)}`,
+          detail: `${mirrorSubissues ? 'Sub-issue mirroring on' : 'Sub-issue mirroring off'} · conflicts ${
+            conflictMode === 'auto' ? 'auto-resolve' : 'queue for review'
+          }`,
+        },
+        {
+          label: 'Mapping',
+          value: `${mappedStates.length - skippedStates.length} of ${mappedStates.length} states mapped`,
+          detail:
+            skippedStates.length === 0
+              ? 'Nothing skipped'
+              : `Skipped: ${skippedStates.map((s) => s.name).join(', ')}`,
+        },
+      );
+    }
+
+    // Add-mapping mode never showed an "Authorized as …" card, so the identity
+    // these connections inherit is stated here instead of left implicit.
+    if (sourceConnection !== undefined && shownIdentity !== null) {
+      cards.push({
+        label: 'Authorization',
+        value: shownIdentity.workspaceName,
+        detail: `Reusing the key authorized as ${shownIdentity.actorLabel}`,
+      });
+    }
 
     return (
       <div className="space-y-4">
         <div>
-          <Eyebrow>{STEP_EYEBROWS[6]}</Eyebrow>
-          <h3 className="mt-1.5 text-lg font-bold text-text-primary">Review the connection</h3>
+          <Eyebrow>{STEP_EYEBROWS[5]}</Eyebrow>
+          <h3 className="mt-1.5 text-lg font-bold text-text-primary">
+            {unlinkOnly ? 'Review the unlinks' : 'Review the connections'}
+          </h3>
           <p className="mt-1.5 text-xs text-text-secondary">
-            {includedIssues.length} issues will import as ideas now. Ongoing changes sync every 5
-            minutes.
+            {unlinkOnly ? (
+              <>
+                Nothing new imports — this run only unlinks, and those mappings stop syncing as
+                soon as it finishes. What they already imported stays in cyboflow.
+              </>
+            ) : (
+              <>
+                {includedIssues.length} issues will import as ideas now. Ongoing changes sync every
+                5 minutes.
+              </>
+            )}
           </p>
         </div>
 
@@ -1306,13 +2262,108 @@ export function TrackerWizardModal({
           ))}
         </div>
 
-        <div className={cn(CARD, 'p-3')}>
-          <Eyebrow>Existing backlog</Eyebrow>
-          <p className="mt-1.5 text-xs text-text-primary">
-            {tally.keep} kept in cyboflow · {tally.link} linked to {meta.name} · {tally.discard}{' '}
-            discarded
-          </p>
+        {stagedUnlinks.length > 0 && (
+          <div className={CARD} data-testid="tracker-unlink-list">
+            <div className="border-b border-border-primary bg-surface-secondary px-3 py-2">
+              <Eyebrow>Unlink first</Eyebrow>
+            </div>
+            <div className="divide-y divide-border-primary">
+              {stagedUnlinks.map((sibling) => {
+                const row = unlinkProgress[sibling.id];
+                return (
+                  <div
+                    key={sibling.id}
+                    className="flex items-center gap-3 px-3 py-2"
+                    data-testid={`tracker-unlink-row-${sibling.id}`}
+                  >
+                    <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
+                      Unlink {siblingLabel(sibling)} from {projectName(sibling.projectId)}
+                    </span>
+                    <span
+                      className={cn(
+                        'flex-shrink-0 text-[11px]',
+                        row?.status === 'ok' && 'text-status-success',
+                        row?.status === 'error' && 'text-status-error',
+                        (row === undefined || row.status === 'connecting') && 'text-text-tertiary',
+                      )}
+                    >
+                      {row === undefined
+                        ? 'Pending'
+                        : row.status === 'connecting'
+                          ? 'Unlinking…'
+                          : row.status === 'ok'
+                            ? 'Unlinked'
+                            : (row.error ?? 'Failed')}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            {deferredUnlinkId !== null && (
+              <p className="border-t border-dashed border-border-primary px-3 py-2 text-[11px] text-text-tertiary">
+                {siblingLabel(stagedUnlinks.find((m) => m.id === deferredUnlinkId) ?? stagedUnlinks[0])}{' '}
+                is unlinked last — its stored key is what authorizes the new mappings. Issues it
+                still holds may take one sync pass to arrive under their new project.
+              </p>
+            )}
+          </div>
+        )}
+
+        {mappedGroups.length > 0 && (
+        <div className={CARD}>
+          <div className="border-b border-border-primary bg-surface-secondary px-3 py-2">
+            <Eyebrow>Connections to create</Eyebrow>
+          </div>
+          <div className="divide-y divide-border-primary">
+            {mappedGroups.map((group) => {
+              const pid = mappings[group.id];
+              const row = progress[group.id];
+              return (
+                <div
+                  key={group.id}
+                  className="flex items-center gap-3 px-3 py-2"
+                  data-testid={`tracker-mapping-${group.id}`}
+                >
+                  <span className="min-w-0 flex-1 truncate text-xs text-text-primary">
+                    {group.sourceLabel} → {projectName(pid)}
+                  </span>
+                  {pushGroupIdFor(pid) === group.id && (
+                    <span className="flex-shrink-0 rounded-none bg-surface-secondary px-1.5 py-px text-[9px] font-bold uppercase tracking-[0.12em] text-text-tertiary">
+                      Push target
+                    </span>
+                  )}
+                  <span
+                    className={cn(
+                      'flex-shrink-0 text-[11px]',
+                      row?.status === 'ok' && 'text-status-success',
+                      row?.status === 'error' && 'text-status-error',
+                      (row === undefined || row.status === 'connecting') && 'text-text-tertiary',
+                    )}
+                  >
+                    {row === undefined
+                      ? 'Pending'
+                      : row.status === 'connecting'
+                        ? 'Connecting…'
+                        : row.status === 'ok'
+                          ? 'Connected'
+                          : (row.error ?? 'Failed')}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
+        )}
+
+        {mappedGroups.length > 0 && (
+          <div className={cn(CARD, 'p-3')}>
+            <Eyebrow>Existing backlog</Eyebrow>
+            <p className="mt-1.5 text-xs text-text-primary">
+              {tally.keep} kept in cyboflow · {tally.link} linked to {meta.name} · {tally.discard}{' '}
+              discarded
+            </p>
+          </div>
+        )}
 
         <div className="flex justify-end">
           <Button
@@ -1321,10 +2372,16 @@ export function TrackerWizardModal({
             size="sm"
             className="rounded-none"
             loading={submitting}
-            loadingText="Connecting…"
-            onClick={() => void handleConnect()}
+            loadingText={unlinkOnly ? 'Unlinking…' : 'Connecting…'}
+            onClick={() => void handleSubmit()}
           >
-            Connect &amp; sync {includedIssues.length} issues
+            {failedCount > 0
+              ? `Retry ${failedCount} failed`
+              : unlinkOnly
+                ? `Unlink ${stagedUnlinks.length} mapping${stagedUnlinks.length === 1 ? '' : 's'}`
+                : stagedUnlinks.length > 0
+                  ? `Unlink ${stagedUnlinks.length} · connect & sync ${includedIssues.length} issues`
+                  : `Connect & sync ${includedIssues.length} issues`}
           </Button>
         </div>
       </div>
@@ -1333,8 +2390,7 @@ export function TrackerWizardModal({
 
   const stepBodies = [
     renderConnect,
-    renderProject,
-    renderSource,
+    renderMap,
     renderTasks,
     renderStates,
     renderReconcile,
@@ -1363,8 +2419,15 @@ export function TrackerWizardModal({
         <div className="flex flex-shrink-0 items-center gap-3 border-b border-border-primary bg-surface-secondary px-4 py-2.5">
           <Eyebrow className="text-text-primary">Integrations</Eyebrow>
           <span className="text-[10px] uppercase tracking-[0.18em] text-text-tertiary">
-            / Connect {meta.name}
+            {sourceConnection !== undefined
+              ? `/ Add a ${meta.name} mapping`
+              : `/ Connect ${meta.name}`}
           </span>
+          {sourceConnection !== undefined && shownIdentity !== null && (
+            <span className="min-w-0 truncate text-[10px] uppercase tracking-[0.18em] text-text-tertiary">
+              / {shownIdentity.workspaceName} · {shownIdentity.actorLabel}
+            </span>
+          )}
           <button
             type="button"
             onClick={onClose}
@@ -1377,14 +2440,24 @@ export function TrackerWizardModal({
         {/* ── Step rail ───────────────────────────────────────────────────── */}
         <div className="flex flex-shrink-0 items-stretch gap-1 overflow-x-auto border-b border-border-primary bg-surface-secondary px-4">
           {STEP_LABELS.map((label, index) => {
+            // Add-mapping mode drops Step 0 from the rail entirely — the step
+            // does not exist for this run, so a disabled stub would misdescribe
+            // it as "not reached yet". Test ids stay ABSOLUTE indices so one
+            // vocabulary addresses the rail in both modes.
+            if (index < firstStep) return null;
             const active = index === step;
             const past = index < step;
-            const reachable = index <= maxStep;
+            // A run with nothing mapped skips the three middle steps — they are
+            // shown rather than hidden (the run still HAS six steps; these three
+            // simply have nothing to describe) and say so on hover.
+            const skipped = mappedGroups.length === 0 && index > MAP_STEP && index < LAST_STEP;
+            const reachable = index <= maxStep && !skipped;
             return (
               <button
                 key={label}
                 type="button"
                 disabled={!reachable}
+                title={skipped ? 'Nothing mapped — this run only unlinks.' : undefined}
                 aria-current={active ? 'step' : undefined}
                 data-testid={`tracker-step-${index}`}
                 onClick={() => void goToStep(index)}
@@ -1406,7 +2479,7 @@ export function TrackerWizardModal({
                         : 'bg-surface-tertiary text-text-tertiary',
                   )}
                 >
-                  {index + 1}
+                  {index - firstStep + 1}
                 </span>
                 {label}
               </button>
@@ -1429,21 +2502,27 @@ export function TrackerWizardModal({
           </div>
         </div>
 
-        {/* ── Footer nav (steps 1–6; Step 0 advances from its own card) ───── */}
+        {/* ── Footer nav (steps 1–5; Step 0 advances from its own card) ───── */}
         {step > 0 && (
           <div className="flex flex-shrink-0 items-center justify-between gap-3 border-t border-dashed border-border-primary bg-bg-primary px-6 py-3">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="rounded-none"
-              onClick={() => void goToStep(step - 1)}
-            >
-              Back
-            </Button>
+            {/* Back is omitted on the run's FIRST step — in add-mapping mode Map
+                has nothing behind it, and an inert button reads as a dead end. */}
+            {step > firstStep ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="rounded-none"
+                onClick={() => void goToStep(prevStepFrom(step))}
+              >
+                Back
+              </Button>
+            ) : (
+              <span />
+            )}
             <div className="flex items-center gap-3">
               <span className="text-[10px] uppercase tracking-[0.12em] text-text-tertiary">
-                Step {step + 1} of {STEP_LABELS.length}
+                Step {step - firstStep + 1} of {STEP_LABELS.length - firstStep}
               </span>
               {step < LAST_STEP && (
                 <Button
@@ -1453,9 +2532,9 @@ export function TrackerWizardModal({
                   className="rounded-none"
                   disabled={nextBlocked || loading}
                   loading={loading}
-                  onClick={() => void goToStep(step + 1)}
+                  onClick={() => void goToStep(nextStepFrom(step))}
                 >
-                  {step === LAST_STEP - 1 ? 'Review' : 'Continue'}
+                  {nextStepFrom(step) === LAST_STEP ? 'Review' : 'Continue'}
                 </Button>
               )}
             </div>

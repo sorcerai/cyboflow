@@ -34,6 +34,7 @@ function makeVariant(overrides: Partial<WorkflowVariantRow> = {}): WorkflowVaria
     agent_runtime: null,
     weight: 1,
     status: 'active',
+    archived_at: null,
     created_at: '',
     updated_at: '',
     ...overrides,

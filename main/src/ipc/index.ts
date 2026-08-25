@@ -24,9 +24,17 @@ import { registerTelemetryHandlers } from './telemetry';
 import { registerModelHandlers } from './models';
 import { registerProviderDetectionHandlers } from './providerDetection';
 import { registerBugReportHandlers } from './bugReport';
+import { installIpcSenderGuard, resolveSenderGuardConfig } from './senderGuard';
 
 
 export function registerIpcHandlers(services: AppServices): void {
+  // Sender validation goes on FIRST: it patches the ipcMain singleton, so it
+  // only covers channels registered after this line. This is the earliest
+  // registration in the boot sequence, which puts every `ipcMain.handle` in the
+  // app — including the modules below that import ipcMain directly and the two
+  // inline handlers in main/src/index.ts — behind the check. See ./senderGuard.
+  installIpcSenderGuard(resolveSenderGuardConfig());
+
   registerAppHandlers(ipcMain, services);
   registerUpdaterHandlers(ipcMain, services);
   registerSessionHandlers(ipcMain, services);

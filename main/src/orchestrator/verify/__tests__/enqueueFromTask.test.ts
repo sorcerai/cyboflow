@@ -10,7 +10,7 @@
  * verification_requests) — the only rows this seam reads/writes; the scheduler's
  * backends/judge are empty/fake (nothing is drained during the test).
  */
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -46,6 +46,7 @@ const baseConfig: ResolvedVisualVerifyConfig = {
   simulatorDevices: [],
   queuedAgeCeilingMs: 15 * 60 * 1000,
   agentSlots: 2,
+  autoBootstrapRunbook: false,
 };
 
 function buildDb(): Database.Database {
@@ -86,7 +87,10 @@ function buildDb(): Database.Database {
       setup_proof      INTEGER NOT NULL DEFAULT 0,
       -- migration 096 (§5.2 seam 3): the content-addressed runbook PIN.
       runbook_hash          TEXT,
-      runbook_local_version INTEGER
+      runbook_local_version INTEGER,
+      -- migration 107 (docs/proposals/lane-runbook-bootstrap.md §5): the
+      -- lane-driven bootstrap proof kind.
+      bootstrap_proof       INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE verify_runbook_local (
       project_id            INTEGER NOT NULL,
@@ -152,7 +156,11 @@ function seedRun(
   );
 }
 
-function initScheduler(db: Database.Database, runbookStore?: VerifyRunbookStore): void {
+function initScheduler(
+  db: Database.Database,
+  runbookStore?: VerifyRunbookStore,
+  over: Partial<Parameters<typeof VerificationScheduler.initialize>[0]> = {},
+): void {
   VerificationScheduler.initialize({
     db: dbAdapter(db),
     backends: {},
@@ -160,6 +168,7 @@ function initScheduler(db: Database.Database, runbookStore?: VerifyRunbookStore)
     artifactsDirResolver: () => '/tmp/a',
     config: baseConfig,
     ...(runbookStore ? { runbookStore } : {}),
+    ...over,
   });
 }
 
@@ -207,6 +216,45 @@ function readRow(id: string): {
     )
     .get(id) as ReturnType<typeof readRow>;
 }
+
+describe('enqueueTaskVerification — the snapshot sha is captured AFTER the bootstrap', () => {
+  // The bootstrap writes up to TWO commits onto the lane's branch: the rung-1
+  // config edit and the runbook. Capturing the sha before them pinned the request
+  // to a tree where the runbook's own enabling edit does not exist — live-observed
+  // as a `failed`/`ambiguous` terminal for a deliverable that was fine, because
+  // the exported `portEnv` was read by a config that had not been edited yet.
+  it('pins the sha the bootstrap left behind, not the one it started from', async () => {
+    seedRun(db, { runId: 'run-snap', enabled: true });
+    initScheduler(db);
+
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: gitRepo }).toString().trim();
+    const spy = vi
+      .spyOn(VerificationScheduler.getInstance(), 'maybeBootstrapRunbook')
+      .mockImplementation(async () => {
+        // Stands in for §8.1's config-edit commit + the runbook commit.
+        writeFileSync(join(gitRepo, 'app.config.mjs'), 'export default { port: Number(process.env.PORT ?? 4320) };\n');
+        execFileSync('git', ['add', '.'], { cwd: gitRepo });
+        execFileSync('git', ['commit', '-q', '-m', 'chore: port-from-env'], { cwd: gitRepo });
+        return { kind: 'not-attempted' } as Awaited<ReturnType<VerificationScheduler['maybeBootstrapRunbook']>>;
+      });
+
+    const result = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-snap',
+      task,
+      laneTaskRef: 'TASK-001',
+      attempt: 1,
+      worktreePath: gitRepo,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe('enqueued');
+    const after = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: gitRepo }).toString().trim();
+    expect(after).not.toBe(before);
+    expect(result.outcome === 'enqueued' && readRow(result.requestId).snapshot_sha).toBe(after);
+    spy.mockRestore();
+  });
+});
 
 describe('enqueueTaskVerification', () => {
   it('a disabled run → skipped(verification-disabled), enqueues nothing', async () => {
@@ -649,5 +697,355 @@ describe('enqueueTaskVerification — §5.2 seam 3 pinned runbook injection', ()
     expect(reason).toContain(FORBIDDEN_DEP_COMMAND_ERROR);
     expect(reason).toContain("committed verification runbook");
     expect(db.prepare('SELECT COUNT(*) AS n FROM verification_requests').get()).toEqual({ n: 0 });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Migration 107 — the LANE-DRIVEN bootstrap proof
+  // (docs/proposals/lane-runbook-bootstrap.md §5 + §9)
+  // ---------------------------------------------------------------------------
+
+  it('gives a bootstrap proof its own enqueue generation, so a prior SKIPPED row cannot dedup it', async () => {
+    // THE DEFECT THIS PINS. `findLiveRequestByEnqueueKey` counts ANY non-canceled
+    // row — terminals included, and 'skipped' explicitly — as a live dedup hit.
+    // A lane that was just skipped for want of a runbook therefore already owns
+    // `${runId}:${ref}:${attempt}`. Firing the proof under that same key would
+    // hand back the SKIPPED row's id and deploy nothing at all, while every
+    // caller read it as an enqueued request: a silent, total no-op.
+    seedRun(db, { runId: 'run_bs' });
+    initScheduler(db);
+
+    const ordinary = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs',
+      task,
+      laneTaskRef: 'TASK-001',
+      attempt: 1,
+      worktreePath: gitRepo,
+    });
+    expect(ordinary.outcome).toBe('enqueued');
+    const skippedId = ordinary.outcome === 'enqueued' ? ordinary.requestId : '';
+    // Terminalize it exactly as the §3.2 degrade gate does.
+    db.prepare("UPDATE verification_requests SET status = 'skipped', error_message = ? WHERE id = ?").run(
+      'no proven verification runbook for this project (run verification setup)',
+      skippedId,
+    );
+
+    const proof = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs',
+      task,
+      laneTaskRef: 'TASK-001',
+      attempt: 1,
+      worktreePath: gitRepo,
+      bootstrapProof: true,
+      bootstrapRound: 1,
+    });
+
+    expect(proof.outcome).toBe('enqueued');
+    const proofId = proof.outcome === 'enqueued' ? proof.requestId : '';
+    expect(proofId).not.toBe(skippedId);
+
+    const row = db
+      .prepare('SELECT enqueue_key AS key, bootstrap_proof AS flag FROM verification_requests WHERE id = ?')
+      .get(proofId) as { key: string; flag: number };
+    expect(row.key).toBe('run_bs:TASK-001:1:bootstrap:1');
+    expect(row.flag).toBe(1);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM verification_requests').get()).toEqual({ n: 2 });
+  });
+
+  it('still dedups a re-fired bootstrap round, so crash recovery re-runs nothing', async () => {
+    // The generation must be UNIQUE PER ROUND, not per call: "resume at the first
+    // incomplete step" after a restart depends on re-firing round N returning the
+    // same request rather than a duplicate deployment.
+    seedRun(db, { runId: 'run_bs2' });
+    initScheduler(db);
+
+    const first = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs2',
+      task,
+      laneTaskRef: 'TASK-002',
+      attempt: 1,
+      worktreePath: gitRepo,
+      bootstrapProof: true,
+      bootstrapRound: 1,
+    });
+    const again = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs2',
+      task,
+      laneTaskRef: 'TASK-002',
+      attempt: 1,
+      worktreePath: gitRepo,
+      bootstrapProof: true,
+      bootstrapRound: 1,
+    });
+    expect(first.outcome).toBe('enqueued');
+    expect(again).toEqual(first);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM verification_requests').get()).toEqual({ n: 1 });
+
+    // …but a SECOND draft round is a genuinely different proof and must deploy.
+    const round2 = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs2',
+      task,
+      laneTaskRef: 'TASK-002',
+      attempt: 1,
+      worktreePath: gitRepo,
+      bootstrapProof: true,
+      bootstrapRound: 2,
+    });
+    expect(round2.outcome).toBe('enqueued');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM verification_requests').get()).toEqual({ n: 2 });
+  });
+
+  it('leaves an ordinary request unflagged and on the plain key', async () => {
+    seedRun(db, { runId: 'run_bs3' });
+    initScheduler(db);
+
+    const res = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run_bs3',
+      task,
+      laneTaskRef: 'TASK-003',
+      attempt: 2,
+      worktreePath: gitRepo,
+    });
+    const id = res.outcome === 'enqueued' ? res.requestId : '';
+    const row = db
+      .prepare('SELECT enqueue_key AS key, bootstrap_proof AS flag FROM verification_requests WHERE id = ?')
+      .get(id) as { key: string; flag: number };
+    expect(row.key).toBe('run_bs3:TASK-003:2');
+    expect(row.flag).toBe(0);
+  });
+});
+
+/**
+ * The runbook BOOTSTRAP at the enqueue seam (lane-runbook-bootstrap.md §12).
+ *
+ * Two contracts, and the second is the one that could break something silently:
+ *
+ *  1. WITH NO RUNNER WIRED — every unit test, and any deployment where the
+ *     toggle can never be on — the enqueue is byte-for-byte what it always was.
+ *     A feature that quietly altered the enqueue on projects that never opted
+ *     into it would be the worst possible outcome, because nobody would be
+ *     looking for it.
+ *  2. THE PROOF MUST NOT RE-ENTER. The bootstrap fires its own attestation-only
+ *     request through THIS SAME function; consulting the bootstrap for that
+ *     request would start a second one while the first is mid-flight, and the
+ *     run-scoped stamp would read the recursion as its own owner re-entering —
+ *     the one shape the single-flight cannot distinguish from a restart.
+ */
+describe('enqueueTaskVerification — the runbook bootstrap', () => {
+  const serveTask: VerificationTaskV1 = {
+    ...task,
+    serve: { cmd: 'pnpm dev --port ${PORT}' },
+  };
+
+  it('enqueues exactly as before when the toggle is ON but no runner is wired', async () => {
+    // The bootstrap-eligible case with the acting half absent. Indistinguishable
+    // from the toggle being off, which is what makes every other test in this
+    // file — and every deployment that never opts in — unaffected.
+    seedRun(db, { runId: 'run-pf1' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+    });
+    const result = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-pf1',
+      task: serveTask,
+      laneTaskRef: 'TASK-1',
+      attempt: 1,
+      worktreePath: gitRepo,
+    });
+
+    expect(result.outcome).toBe('enqueued');
+    if (result.outcome !== 'enqueued') return;
+    // Unchanged key: no `:bootstrap:` generation, because no bootstrap ran.
+    expect(readRow(result.requestId).enqueue_key).toBe('run-pf1:TASK-1:1');
+  });
+
+  it('the scheduler reports the decision it would act on', async () => {
+    seedRun(db, { runId: 'run-pf2' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+    });
+    await expect(
+      VerificationScheduler.getInstance().evaluateRunbookBootstrap({
+        projectId: 1,
+        runId: 'run-pf2',
+        laneTaskRef: 'TASK-1',
+        modality: 'web',
+        task: serveTask,
+        probePath: gitRepo,
+      }),
+    ).resolves.toEqual({ proceed: true, adopt: false });
+  });
+
+  it('declines with the toggle OFF, which is the shipped default', async () => {
+    seedRun(db, { runId: 'run-pf3' });
+    initScheduler(db);
+    await expect(
+      VerificationScheduler.getInstance().evaluateRunbookBootstrap({
+        projectId: 1,
+        runId: 'run-pf3',
+        laneTaskRef: 'TASK-1',
+        modality: 'web',
+        task: serveTask,
+        probePath: gitRepo,
+      }),
+    ).resolves.toEqual({ proceed: false, reason: 'disabled' });
+  });
+
+  it('runs the bootstrap when a runner IS wired, and enqueues afterwards either way', async () => {
+    // The acting path. The lane's own request is still enqueued — the bootstrap
+    // has no channel to fail a lane and must not grow one — and on a decline the
+    // §3.2 gate is what speaks, exactly as it did before this feature existed.
+    const calls: Array<{ runId: string; laneTaskRef: string }> = [];
+    seedRun(db, { runId: 'run-pf5' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+      runbookBootstrap: async ({ runId, laneTaskRef }) => {
+        calls.push({ runId, laneTaskRef });
+        return { kind: 'declined', reason: 'not-possible', detail: 'no dev server' };
+      },
+    });
+
+    const result = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-pf5',
+      task: serveTask,
+      laneTaskRef: 'TASK-1',
+      attempt: 1,
+      worktreePath: gitRepo,
+    });
+
+    expect(calls).toEqual([{ runId: 'run-pf5', laneTaskRef: 'TASK-1' }]);
+    expect(result.outcome).toBe('enqueued');
+    if (result.outcome !== 'enqueued') return;
+    // Still the lane's ORDINARY key — the bootstrap generation belongs to the
+    // proof, never to the lane request that triggered it.
+    expect(readRow(result.requestId).enqueue_key).toBe('run-pf5:TASK-1:1');
+  });
+
+  it('does NOT consult the bootstrap for the bootstrap PROOF itself', async () => {
+    // The recursion guard. Without it, the proof's own enqueue would start a
+    // second bootstrap while the first is mid-flight — and because the stamp is
+    // keyed on (run, project, modality) with the SAME owner ref, that second
+    // claim reads as the owner resuming rather than as a collision.
+    const calls: string[] = [];
+    seedRun(db, { runId: 'run-pf6' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+      runbookBootstrap: async ({ laneTaskRef }) => {
+        calls.push(laneTaskRef);
+        return { kind: 'declined', reason: 'not-possible', detail: 'x' };
+      },
+    });
+
+    const result = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-pf6',
+      task: serveTask,
+      laneTaskRef: 'TASK-1',
+      attempt: 1,
+      worktreePath: gitRepo,
+      bootstrapProof: true,
+      bootstrapRound: 1,
+    });
+
+    expect(calls).toEqual([]);
+    expect(result.outcome).toBe('enqueued');
+    if (result.outcome !== 'enqueued') return;
+    expect(readRow(result.requestId).enqueue_key).toBe('run-pf6:TASK-1:1:bootstrap:1');
+  });
+
+  it('does NOT consult it for a SETUP proof either', async () => {
+    // The verify-setup flow is proving a draft a human already reviewed; a
+    // bootstrap there would derive a rival over the very record being proven.
+    const calls: string[] = [];
+    seedRun(db, { runId: 'run-pf7' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+      runbookBootstrap: async ({ laneTaskRef }) => {
+        calls.push(laneTaskRef);
+        return { kind: 'declined', reason: 'not-possible', detail: 'x' };
+      },
+    });
+
+    await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-pf7',
+      task: serveTask,
+      laneTaskRef: 'TASK-1',
+      attempt: 1,
+      worktreePath: gitRepo,
+      setupProof: true,
+    });
+
+    expect(calls).toEqual([]);
+  });
+
+  it('a THROWING bootstrap runner still enqueues — the seam never crashes a lane', async () => {
+    seedRun(db, { runId: 'run-pf8' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+      runbookBootstrap: async () => {
+        throw new Error('the bootstrap exploded');
+      },
+    });
+
+    const result = await enqueueTaskVerification({
+      db: dbAdapter(db),
+      runId: 'run-pf8',
+      task: serveTask,
+      laneTaskRef: 'TASK-1',
+      attempt: 1,
+      worktreePath: gitRepo,
+    });
+    expect(result.outcome).toBe('enqueued');
+  });
+
+  it('the kill switch overrides the toggle', async () => {
+    // The lever for "this is misbehaving on THIS host, stop now" — it must beat
+    // a persisted preference that may have been set on another machine.
+    const prior = process.env.CYBOFLOW_DISABLE_RUNBOOK_BOOTSTRAP;
+    process.env.CYBOFLOW_DISABLE_RUNBOOK_BOOTSTRAP = '1';
+    try {
+      seedRun(db, { runId: 'run-pf4' });
+      initScheduler(db, undefined, {
+        config: { ...baseConfig, autoBootstrapRunbook: true },
+      });
+      await expect(
+        VerificationScheduler.getInstance().evaluateRunbookBootstrap({
+          projectId: 1,
+          runId: 'run-pf4',
+          laneTaskRef: 'TASK-1',
+          modality: 'web',
+          task: serveTask,
+          probePath: gitRepo,
+        }),
+      ).resolves.toEqual({ proceed: false, reason: 'disabled' });
+    } finally {
+      if (prior === undefined) delete process.env.CYBOFLOW_DISABLE_RUNBOOK_BOOTSTRAP;
+      else process.env.CYBOFLOW_DISABLE_RUNBOOK_BOOTSTRAP = prior;
+    }
+  });
+
+  it('a task that derives no environment is never a bootstrap candidate', async () => {
+    seedRun(db, { runId: 'run-pf5' });
+    initScheduler(db, undefined, {
+      config: { ...baseConfig, autoBootstrapRunbook: true },
+    });
+    await expect(
+      VerificationScheduler.getInstance().evaluateRunbookBootstrap({
+        projectId: 1,
+        runId: 'run-pf5',
+        laneTaskRef: 'TASK-1',
+        modality: 'web',
+        task,
+        probePath: gitRepo,
+      }),
+    ).resolves.toEqual({ proceed: false, reason: 'no-environment' });
   });
 });

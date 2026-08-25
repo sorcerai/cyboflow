@@ -20,6 +20,8 @@ describe('CodexJudge', () => {
     expect(args.prompt).toContain('Return ONLY the structured object');
     expect(args.schema).toBe(JUDGE_OUTPUT_SCHEMA);
     expect(args.model).toBe('gpt-5.4');
+    // Deadline-stretch signal, same as the Claude slots (judgeDeadline).
+    expect(args.diffChars).toBe('diff --git a/x.ts b/x.ts\n+ok'.length);
   });
 
   it('propagates deterministic Codex unavailability', async () => {

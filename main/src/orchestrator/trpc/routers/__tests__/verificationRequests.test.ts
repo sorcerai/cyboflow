@@ -211,7 +211,7 @@ function seedRequest(
  */
 function buildCaller(
   migrations?: readonly string[],
-  verifyRunbookStatus: VerifyRunbookStatusLike = async () => 'proven',
+  verifyRunbookStatus: VerifyRunbookStatusLike = async () => ({ status: 'proven', reason: 'proven' }),
 ): {
   caller: ReturnType<typeof appRouter.createCaller>;
   db: Database.Database;
@@ -886,7 +886,7 @@ describe('verificationRequests.health', () => {
     seedCapability(db, { projectId: 1, modality: 'web', runbookHash: 'hash-new', status: 'active', envFailures: 1, hostGeneration: 2, updatedAt: '2026-08-01T00:00:00.000Z' });
     // The stale row: a superseded revision, tripped, and updated MORE recently.
     seedCapability(db, { projectId: 1, modality: 'web', runbookHash: 'hash-old', status: 'suppressed', reason: 'port taken', envFailures: 5, hostGeneration: 2, suppressedUntil: future, updatedAt: '2026-08-02T00:00:00.000Z' });
-    const caller = appRouter.createCaller(createContext({ db: dbAdapter(db), verifyRunbookStatus: async () => 'proven' }));
+    const caller = appRouter.createCaller(createContext({ db: dbAdapter(db), verifyRunbookStatus: async () => ({ status: 'proven', reason: 'proven' }) }));
 
     const health = await caller.cyboflow.verificationRequests.health({ projectId: 1 });
     const web = health.modalities.find((m) => m.modality === 'web');
@@ -980,7 +980,15 @@ describe('verificationRequests.health', () => {
 
     expect(web).toBeDefined();
     expect(web?.attempts).toBe(0);
-    expect(web?.runbook).toEqual({ status: 'unproven-draft', version: 4, portableHash: 'abc123' });
+    // `origin` is null: this record predates migration 105's provenance column
+    // in the fixture, which is exactly the honestly-unknown case — a reader must
+    // not infer 'setup-flow' from its absence.
+    expect(web?.runbook).toEqual({
+      status: 'unproven-draft',
+      version: 4,
+      portableHash: 'abc123',
+      origin: null,
+    });
   });
 
   it('rejects a non-positive projectId and PRECONDITION_FAILEDs without a db', async () => {
@@ -1389,7 +1397,7 @@ describe('verificationRequests.setupByProject', () => {
    */
   function setup(
     migrations: readonly string[] = [...MIGRATIONS, '096_verify_runbook_local.sql'],
-    verifyRunbookStatus: VerifyRunbookStatusLike = async () => 'proven',
+    verifyRunbookStatus: VerifyRunbookStatusLike = async () => ({ status: 'proven', reason: 'proven' }),
   ): {
     caller: ReturnType<typeof appRouter.createCaller>;
     db: Database.Database;
@@ -1425,8 +1433,8 @@ describe('verificationRequests.setupByProject', () => {
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
     expect(rows).toEqual([
-      { projectId: 1, status: 'proven', provenModalities: ['web'] },
-      { projectId: 2, status: 'unproven', provenModalities: [] },
+      { projectId: 1, status: 'proven', provenModalities: ['web'], hasLaneDerivedRunbook: false },
+      { projectId: 2, status: 'unproven', provenModalities: [], hasLaneDerivedRunbook: false },
     ]);
   });
 
@@ -1440,7 +1448,7 @@ describe('verificationRequests.setupByProject', () => {
 
     // VERIFICATION_MODALITIES order, not insertion order.
     expect(rows).toEqual([
-      { projectId: 1, status: 'proven', provenModalities: ['web', 'cdp-app'] },
+      { projectId: 1, status: 'proven', provenModalities: ['web', 'cdp-app'], hasLaneDerivedRunbook: false },
     ]);
   });
 
@@ -1474,7 +1482,7 @@ describe('verificationRequests.setupByProject', () => {
 
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
-    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [] }]);
+    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [], hasLaneDerivedRunbook: false }]);
   });
 
   it('a record marked proven whose runbook is NOT in the project checkout reads `unproven`', async () => {
@@ -1489,12 +1497,12 @@ describe('verificationRequests.setupByProject', () => {
     // of that — a green badge over precisely the failure it exists to warn
     // about. Observed for real: a project whose proof lived on an unmerged
     // branch showed as set up while every verification it queued was refused.
-    const { caller, db } = setup(undefined, async () => 'unproven-draft');
+    const { caller, db } = setup(undefined, async () => ({ status: 'unproven-draft', reason: 'draft' }));
     seedRunbook(db, 1, 'web', 'proven');
 
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
-    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [] }]);
+    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [], hasLaneDerivedRunbook: false }]);
   });
 
   it('reports `unproven` when no resolver is wired — never a spurious `proven`', async () => {
@@ -1511,7 +1519,7 @@ describe('verificationRequests.setupByProject', () => {
 
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
-    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [] }]);
+    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [], hasLaneDerivedRunbook: false }]);
   });
 
   it('a THROWING resolver degrades that modality rather than failing the query', async () => {
@@ -1522,7 +1530,7 @@ describe('verificationRequests.setupByProject', () => {
 
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
-    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [] }]);
+    expect(rows).toEqual([{ projectId: 1, status: 'unproven', provenModalities: [], hasLaneDerivedRunbook: false }]);
   });
 
   it('does not probe a record already stored unproven — the conjunction can only demote', async () => {
@@ -1532,7 +1540,7 @@ describe('verificationRequests.setupByProject', () => {
     const probed: string[] = [];
     const { caller, db } = setup(undefined, async (projectId, modality) => {
       probed.push(`${projectId}:${modality}`);
-      return 'proven';
+      return { status: 'proven', reason: 'proven' } as const;
     });
     seedRunbook(db, 1, 'web', 'unproven-draft');
     seedRunbook(db, 1, 'cdp-app', 'proven');
@@ -1540,6 +1548,6 @@ describe('verificationRequests.setupByProject', () => {
     const rows = await caller.cyboflow.verificationRequests.setupByProject();
 
     expect(probed).toEqual(['1:cdp-app']);
-    expect(rows).toEqual([{ projectId: 1, status: 'proven', provenModalities: ['cdp-app'] }]);
+    expect(rows).toEqual([{ projectId: 1, status: 'proven', provenModalities: ['cdp-app'], hasLaneDerivedRunbook: false }]);
   });
 });

@@ -23,6 +23,7 @@ import {
   computeTaskOverlay,
 } from '../taskListing';
 import { dbAdapter } from '../__test_fixtures__/dbAdapter';
+import { IDEA_COMPONENT_KEYS } from '../../../../shared/types/ideaComponents';
 
 function buildDb(): Database.Database {
   const db = new Database(':memory:');
@@ -72,6 +73,28 @@ function buildDb(): Database.Database {
   // listRunOwnedOrBatchIdeaIds resolution (the run-owned-ideas fixtures below).
   db.exec(readFileSync(join(migDir, '017_run_seed_idea.sql'), 'utf-8'));
   db.exec(readFileSync(join(migDir, '061_run_seed_idea_ids.sql'), 'utf-8'));
+  // Migration 101 adds the idea component ledger table that selectProjectBacklog/
+  // selectTaskById/selectIdeaDecomposition now resolve for every idea row. It is
+  // self-contained (no dependency on other new tables), so the full file applies
+  // cleanly. resolveIdeaComponentsBatch's 'prototype' derivation arm also reads
+  // `approved_designs` (unconditionally) and `artifacts` (when a linked run is
+  // found) — both are real migrations (082/035) that pull in `sessions`/`artifacts`
+  // column ALTERs this fixture doesn't otherwise need, so — mirroring
+  // resolveIdeaComponents.test.ts's own minimal ad-hoc schema — hand-roll just the
+  // columns the resolver actually selects.
+  db.exec(readFileSync(join(migDir, '101_idea_component_ledger.sql'), 'utf-8'));
+  db.exec(`
+    CREATE TABLE approved_designs (
+      id TEXT PRIMARY KEY,
+      idea_id TEXT NOT NULL,
+      superseded_at TEXT
+    );
+    CREATE TABLE artifacts (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      atype TEXT NOT NULL
+    );
+  `);
   return db;
 }
 
@@ -960,5 +983,101 @@ describe('computeTaskOverlay — inFlow (direct + sprint-batch runs)', () => {
     expect(overlay.inFlow).toEqual([
       { agent: 'agent', runId: 'run-4', stepId: null, runStatus: 'running', sessionId: null, sessionName: null },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idea component ledger overlay (migration 101) — components on IDEA items only
+// ---------------------------------------------------------------------------
+
+describe('taskListing — idea component ledger overlay (migration 101)', () => {
+  it('selectProjectBacklog stamps all FIVE components on an idea, batched in one resolveIdeaComponentsBatch call', () => {
+    const db = buildDb();
+    const { ideaId } = seedFixture(db);
+
+    const backlog = selectProjectBacklog(dbAdapter(db), 1);
+    const idea = backlog.find((t) => t.id === ideaId)!;
+
+    expect(idea.components).toBeDefined();
+    expect(idea.components!.map((c) => c.component)).toEqual([...IDEA_COMPONENT_KEYS]);
+    // No ledger rows exist yet -> every component is DERIVED, never 'skipped'.
+    expect(idea.components!.every((c) => c.source === 'derived')).toBe(true);
+    expect(idea.components!.every((c) => c.state === 'complete' || c.state === 'incomplete')).toBe(true);
+  });
+
+  it('selectProjectBacklog leaves components undefined for epics/tasks — ledger is ideas-only', () => {
+    const db = buildDb();
+    const { epicId, taskId } = seedFixture(db);
+
+    const backlog = selectProjectBacklog(dbAdapter(db), 1);
+    const epic = backlog.find((t) => t.id === epicId)!;
+    const child = epic.children!.find((c) => c.id === taskId)!;
+
+    expect(epic.components).toBeUndefined();
+    expect(child.components).toBeUndefined();
+  });
+
+  it('a ledger row wins over derivation, and only for its own idea', () => {
+    const db = buildDb();
+    const { ideaId } = seedFixture(db);
+    const other = seedSecondProject(db).ideaId;
+    db.prepare(
+      `INSERT INTO idea_components
+         (idea_id, project_id, component, state, source, created_at, updated_at)
+       VALUES (?, '1', 'architecture', 'skipped', 'manual', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    ).run(ideaId);
+
+    const backlog = selectProjectBacklog(dbAdapter(db), null);
+    const idea = backlog.find((t) => t.id === ideaId)!;
+    const architecture = idea.components!.find((c) => c.component === 'architecture')!;
+    expect(architecture.state).toBe('skipped');
+    expect(architecture.source).toBe('manual');
+
+    // The OTHER project's idea has no ledger row -> still purely derived.
+    const otherIdea = backlog.find((t) => t.id === other)!;
+    const otherArchitecture = otherIdea.components!.find((c) => c.component === 'architecture')!;
+    expect(otherArchitecture.source).toBe('derived');
+  });
+
+  it('selectTaskById stamps components for an idea and leaves epic/task undefined', () => {
+    const db = buildDb();
+    const { ideaId, epicId, taskId } = seedFixture(db);
+
+    const idea = selectTaskById(dbAdapter(db), ideaId)!;
+    expect(idea.components?.map((c) => c.component)).toEqual([...IDEA_COMPONENT_KEYS]);
+
+    expect(selectTaskById(dbAdapter(db), epicId)!.components).toBeUndefined();
+    expect(selectTaskById(dbAdapter(db), taskId)!.components).toBeUndefined();
+    // The epic's nested child (a task) also stays undefined.
+    const epic = selectTaskById(dbAdapter(db), epicId)!;
+    expect(epic.children![0].components).toBeUndefined();
+  });
+
+  it('selectIdeaDecomposition stamps components on the root idea only, not its epics/tasks', () => {
+    const db = buildDb();
+    const { ideaId, epicId, taskId } = seedFixture(db);
+
+    const decomp = selectIdeaDecomposition(dbAdapter(db), ideaId)!;
+    expect(decomp.components?.map((c) => c.component)).toEqual([...IDEA_COMPONENT_KEYS]);
+
+    const epic = decomp.children!.find((c) => c.id === epicId)!;
+    expect(epic.components).toBeUndefined();
+    expect(epic.children!.find((c) => c.id === taskId)!.components).toBeUndefined();
+  });
+
+  it('an idea whose body carries the "## Idea spec" heading derives idea-spec complete', () => {
+    const db = buildDb();
+    const ideaId = 'ide_spec';
+    db.prepare(
+      `INSERT INTO ideas (id, project_id, ref, title, body, board_id, stage_id, created_at)
+       VALUES (?, 1, 'IDEA-200', 'Specced idea', ?, 'board-1-default', ?, '2026-01-03T00:00:00.000Z')`,
+    ).run(ideaId, '## Idea spec\n\nThe spec body.', stageId(1));
+
+    const idea = selectTaskById(dbAdapter(db), ideaId)!;
+    const ideaSpec = idea.components!.find((c) => c.component === 'idea-spec')!;
+    expect(ideaSpec.state).toBe('complete');
+    expect(ideaSpec.source).toBe('derived');
+    // No heading for the others -> incomplete.
+    expect(idea.components!.find((c) => c.component === 'architecture')!.state).toBe('incomplete');
   });
 });

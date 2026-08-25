@@ -104,6 +104,37 @@ describe('transitions', () => {
       expect(approval.status).toBe('pending');
     });
 
+    it('(a2) stamps created_at as ISO-8601, not SQLite CURRENT_TIMESTAMP form', () => {
+      // REGRESSION: this writer used to omit created_at and inherit the column's
+      // DEFAULT CURRENT_TIMESTAMP, which spells the timestamp
+      // 'YYYY-MM-DD HH:MM:SS' while every other approval writer uses
+      // toISOString(). StuckDetector's stale scan compared the column against an
+      // ISO cutoff, and since ' ' (0x20) sorts below 'T' (0x54) a same-date row
+      // in the default spelling always compared as older than the cutoff — a
+      // seconds-old approval read as stale and stamped its run 'stuck'. Keep the
+      // column in ONE format at the source.
+      seedRun(db, 'running');
+      const before = new Date().toISOString();
+
+      transitionToAwaitingReview(db, {
+        runId: RUN_ID,
+        approvalId: APPROVAL_ID,
+        toolName: 'bash',
+        toolInputJson: '{"cmd":"ls"}',
+        toolUseId: 'tu-createdat-001',
+        rationale: null,
+      });
+
+      const { created_at: createdAt } = db
+        .prepare('SELECT created_at FROM approvals WHERE id = ?')
+        .get(APPROVAL_ID) as { created_at: string };
+
+      expect(createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      // And it is the real clock, not a constant: it lands in [before, after].
+      expect(createdAt >= before).toBe(true);
+      expect(createdAt <= new Date().toISOString()).toBe(true);
+    });
+
     // -----------------------------------------------------------------------
     // Case (b): Stale-status rejection
     // -----------------------------------------------------------------------

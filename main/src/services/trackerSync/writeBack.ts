@@ -11,16 +11,24 @@
  * durable local record BEFORE it is attempted, which is what makes echo
  * suppression and crash recovery possible.
  *
- * NOTHING HERE IS GATED ON A DIRECTION MODE. An enqueue is a durable statement
- * of INTENT, and 'manual' means "hold this direction until the user asks", not
- * "throw the intent away" — so the modes gate the DRAIN (outboxWorker's
+ * MANUAL DELAYS, OFF DECLINES. An enqueue is a durable statement of INTENT, and
+ * 'manual' means "hold this direction until the user asks", not "throw the
+ * intent away" — so `auto`/`manual` gate the DRAIN (outboxWorker's
  * `allowedKinds`, chosen by trackerSyncService.runPass) and this module records
- * every intent unconditionally. A connection whose status sync is manual still
+ * those intents unconditionally. A connection whose status sync is manual still
  * accumulates its stage writes and emits them, in order, on the next "Sync now".
- * The one flag still read here is `mirror_subissues`, which is a scope choice
+ *
+ * `'off'` — which only the two migration-112 modes have — is the ONE exception,
+ * and it gates HERE, at the enqueue (invariant 5 of
+ * docs/proposals/tracker-field-writeback.md). A row whose direction is off is
+ * not delayed, it is UNDRAINABLE: `claimNextPending` never claims its kind, not
+ * even under "Sync now", while `collectOutboxBlockers` is kind-agnostic and
+ * halts the inbound batch at that issue on every pass. So an off direction
+ * declines the intent outright rather than queueing a permanent inbound stall.
+ * The other flag still read here is `mirror_subissues`, which is a scope choice
  * ("do sub-issues exist at all"), not a cadence.
  *
- * Four write-back triggers. The first three need "the entity is linked AND its
+ * Six write-back triggers. All but the fourth need "the entity is linked AND its
  * connection is active"; the fourth is the only one that fires for an UNLINKED
  * entity:
  *
@@ -45,6 +53,30 @@
  *      one: a provider-authored create (the inbound import's own event), an
  *      idea that already carries a link for that provider, and a body carrying
  *      the tracker-import provenance marker (the unattributed-event backstop).
+ *   5. CONTENT. A linked entity whose title / description / priority / category
+ *      now DIFFERS from the link's baseline enqueues an `update_content`. Its
+ *      payload is EMPTY — the drain composes from the entity as it stands then,
+ *      the `create_issue` precedent — so a burst of edits collapses into one
+ *      write. Gated on `content_sync_mode !== 'off'`.
+ *   6. ARCHIVE. A linked entity picking up an `archived_at` stamp enqueues an
+ *      `archive_issue` — the remote twin is trashed/archived, NEVER deleted.
+ *      Gated on `archive_sync_mode !== 'off'` and on the provider having an
+ *      archive endpoint at all. The mirror image, an UNARCHIVE, writes nothing
+ *      remotely and only clears the idempotence stamp.
+ *
+ * TRIGGERS 5 AND 6 ARE PER-LINK, and deliberately do not settle for the FIRST
+ * active provider link the way the older three do. An idea pushed to two
+ * trackers must get two independent decisions — different modes, different
+ * mappings, different baselines — so they enumerate every link through
+ * {@link resolveAllLinked}. The three older triggers keep the single-link
+ * behavior they have always had; widening them is a separate change with its own
+ * dedupe and supersession consequences (recorded as a follow-up in the plan).
+ *
+ * TWO GUARDS ON EVERY NEW TRIGGER, and neither alone is sufficient. The ACTOR
+ * FILTER skips the inbound half's own writes (every inbound apply runs with
+ * `actor: connection.provider`), which is precise but optional on the event; the
+ * BASELINE DIFF is the correctness backstop for an unattributed event, and is
+ * what makes a replayed event a no-op.
  *
  * Every enqueue is DEDUPED against the connection's unresolved outbox rows, so
  * a burst of events (or a replayed one) can never queue the same remote write
@@ -56,8 +88,17 @@
  */
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import type { TaskChangedEvent } from '../../../../shared/types/tasks';
-import type { EntityExternalLinkRow, TrackerConnectionRow } from '../../database/models';
+import type {
+  BacklogTaskItem,
+  EntityCategory,
+  Priority,
+  TaskChangedEvent,
+} from '../../../../shared/types/tasks';
+import type {
+  EntityExternalLinkRow,
+  TrackerConnectionRow,
+  TrackerOutboxRow,
+} from '../../database/models';
 import type { TrackerProvider, TrackerStateGroup } from '../../../../shared/types/trackerSync';
 import {
   enqueueOutbox,
@@ -68,9 +109,22 @@ import {
   listLinksByParentExternal,
   listUnresolvedOutbox,
   supersedeQueuedStateWrites,
+  supersedeQueuedWrites,
+  updateBaseline,
 } from './store';
 import { resolveStageIds, stageIdToWriteBackGroup, type TrackerStageIds } from './stateMapping';
-import { carriesTrackerProvenance } from './provenance';
+import { carriesTrackerProvenance, normalizeDescription, splitBody } from './provenance';
+import { providerSupportsRemoteArchive } from './providerCapabilities';
+import {
+  providerPriorityToken,
+  providerTokensEqual,
+  resolveEffectivePriorityMapping,
+} from './priorityMapping';
+import {
+  providerCategoryToken,
+  providerSupportsCategorySync,
+  resolveEffectiveCategoryMapping,
+} from './categoryMapping';
 
 // ---------------------------------------------------------------------------
 // Payload shapes
@@ -89,11 +143,26 @@ export interface UpdateStatePayload {
   desiredGroup: WriteBackGroup;
 }
 
-/** `payload_json` for the `create_sub_issue` outbox kind. */
+/**
+ * `payload_json` for the `create_sub_issue` outbox kind.
+ *
+ * The LOCAL priority/category are snapshotted here beside the title and
+ * description, so the whole draft speaks for the one moment the decomposition
+ * captured. The provider TOKENS they map to are deliberately NOT stored: a
+ * mapping can only be resolved against the workspace's live vocabulary, which
+ * exists at drain time and not here (this module makes no network calls).
+ *
+ * Both are NULLABLE for rows queued before these keys existed — a mirror that
+ * has been sitting in a held push direction since an earlier build. A null pair
+ * simply omits the fields from the draft, and the provider's own defaults
+ * apply, exactly as they did then.
+ */
 export interface CreateSubIssuePayload {
   parentExternalId: string;
   title: string;
   description: string | null;
+  priority: Priority | null;
+  category: EntityCategory | null;
 }
 
 /**
@@ -110,20 +179,67 @@ export interface CreateSubIssuePayload {
 export const CREATE_ISSUE_PAYLOAD_JSON = '{}';
 
 /**
+ * `payload_json` for the `update_content` kind: EMPTY, for the same reason
+ * {@link CREATE_ISSUE_PAYLOAD_JSON} is.
+ *
+ * The patch is composed by the WORKER at drain time, from the entity's CURRENT
+ * title/body/priority/category diffed against the link's baseline. A content
+ * row can sit queued for a while ('manual' content sync is the whole point of
+ * the mode), and a burst of edits — the ordinary shape of typing — would
+ * otherwise queue one remote write per keystroke-batch, each carrying a body
+ * that is already stale by the time it is sent. Composing late makes the
+ * dedupe below collapse a burst into exactly one write of the final text.
+ */
+export const UPDATE_CONTENT_PAYLOAD_JSON = '{}';
+
+/**
+ * `payload_json` for the `archive_issue` kind: EMPTY, and it has nothing to
+ * carry — the row's `(connection_id, external_id)` pair IS the instruction.
+ * That is also why the enqueue can happen after a link is about to be orphaned:
+ * the drain addresses the issue, not the link.
+ */
+export const ARCHIVE_ISSUE_PAYLOAD_JSON = '{}';
+
+/**
  * The write-back marker the outbox worker stamps onto a link's
  * `baseline_json` after a successful state write. `stateId` overwrites the
  * baseline's own state field so the inbound poller diffs our own write to
  * "no change" (echo suppression); `lastWrittenGroup` is what this module
  * compares against to avoid re-queueing a group we already wrote.
+ *
+ * `archivedWrittenAt` belongs to the ARCHIVE write and is optional because the
+ * two stamps are written by different paths and must not clobber each other:
+ * `{ ...existing, ...stamp }` followed by `JSON.stringify` DELETES any key the
+ * patch carries as `undefined`, so a state stamp that named the archive key at
+ * all — even as undefined — would silently erase it. The state path therefore
+ * builds an object literal without the key, and the archive path builds one
+ * with only it. See {@link readArchivedWrittenAt}.
  */
 export interface WriteBackBaselineStamp {
   stateId: string;
   lastWrittenGroup: WriteBackGroup;
   lastWrittenAt: string;
+  archivedWrittenAt?: string;
 }
 
-/** Both providers a link can point at — the lookup order for an unknown-provider entity. */
-const PROVIDERS: readonly TrackerProvider[] = ['linear', 'plane'];
+/**
+ * The ARCHIVE half of {@link WriteBackBaselineStamp}, on its own so the archive
+ * path can stamp exactly one key. Its presence means "we have already told this
+ * provider to trash this issue", which is what makes a replayed archive event a
+ * no-op — the provider's own 404-is-success arm covers the rest.
+ */
+export interface ArchiveBaselineStamp {
+  archivedWrittenAt: string;
+}
+
+/** When we last wrote a remote archive for this link, or null when we never have. */
+export function readArchivedWrittenAt(link: EntityExternalLinkRow): string | null {
+  const value = parseJsonObject(link.baseline_json).archivedWrittenAt;
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/** Every provider a link can point at — the lookup order for an unknown-provider entity. */
+const PROVIDERS: readonly TrackerProvider[] = ['linear', 'plane', 'dart'];
 
 // ---------------------------------------------------------------------------
 // Baseline / payload helpers (shared with outboxWorker)
@@ -236,12 +352,22 @@ interface LinkedContext {
   connection: TrackerConnectionRow;
 }
 
-/** Resolve the (link, connection) pair for an entity, or null when it is not syncing. */
-function resolveLinked(
+/**
+ * EVERY live (link, connection) pair for an entity — one per provider at most.
+ *
+ * An idea pushed to two trackers has two links, two connections, two direction
+ * modes, two field mappings and two baselines, and every one of those is a
+ * separate decision: content sync may be `auto` on one and `off` on the other,
+ * a priority may be mapped on one and renamed away on the other. Answering with
+ * the first link would silently make one tracker the only one that ever
+ * receives a content or archive write.
+ */
+function resolveAllLinked(
   db: Database.Database,
   entityType: 'idea' | 'epic' | 'task',
   entityId: string,
-): LinkedContext | null {
+): LinkedContext[] {
+  const linked: LinkedContext[] = [];
   for (const provider of PROVIDERS) {
     const link = getLinkByEntity(db, entityType, entityId, provider);
     // An orphaned link points at an issue the remote no longer has — the
@@ -249,12 +375,13 @@ function resolveLinked(
     if (!link || link.orphaned_at !== null) continue;
     const connection = getConnection(db, link.connection_id);
     if (!connection) continue;
-    // Status only — no direction mode. See the file header: a held direction
-    // still records its intent; only the drain waits.
+    // Status only — no direction mode here. See the file header: a held
+    // direction still records its intent, and only `'off'` declines, which the
+    // individual triggers gate on.
     if (connection.status !== 'active') continue;
-    return { link, connection };
+    linked.push({ link, connection });
   }
-  return null;
+  return linked;
 }
 
 /** Main dispatch for one event — see the three triggers in the file header. */
@@ -274,7 +401,24 @@ function route(deps: WriteBackDeps, event: TaskChangedEvent): void {
     handleIdeaPush(deps, event);
   }
 
-  const linked = resolveLinked(deps.db, entityType, event.taskId);
+  const allLinked = resolveAllLinked(deps.db, entityType, event.taskId);
+
+  // Triggers 5 and 6 run PER LINK (see the header) and skip the provider's own
+  // writes — the inbound half applies everything as `actor: <provider>`, and
+  // echoing those straight back is the loop this filter exists to cut.
+  if (allLinked.length > 0 && !isProviderAuthored(event)) {
+    handleArchiveTransition(deps, event, allLinked, entityType);
+    // An entity on its way OUT of the tracker gets no content write: the
+    // archive above is the last thing we have to say about it, and a title
+    // write racing it is a round trip against an issue about to be trashed.
+    if (event.task.archived_at === null) {
+      handleContentChange(deps, event, allLinked, entityType);
+    }
+  }
+
+  // The three ORIGINAL triggers answer for one provider only — see
+  // {@link resolveAllLinked} for why that is preserved rather than widened here.
+  const linked = allLinked[0] ?? null;
   if (!linked) return;
 
   const stageIds = resolveStageIds(deps.db, event.projectId);
@@ -366,6 +510,9 @@ interface MintedTaskRow {
   title: string;
   summary: string | null;
   body: string | null;
+  /** Both columns are NOT NULL with defaults on every entity table (migs 015/059). */
+  priority: Priority;
+  category: EntityCategory;
 }
 
 /**
@@ -378,7 +525,7 @@ interface MintedTaskRow {
 function listMintedTasks(db: Database.Database, ideaId: string): MintedTaskRow[] {
   return db
     .prepare(
-      `SELECT id, title, summary, body
+      `SELECT id, title, summary, body, priority, category
          FROM tasks
         WHERE originating_idea_id = ? AND archived_at IS NULL
         ORDER BY created_at ASC, ref ASC`,
@@ -428,6 +575,8 @@ function handleDecomposition(
       parentExternalId: link.external_id,
       title: task.title,
       description: task.body ?? task.summary ?? null,
+      priority: task.priority,
+      category: task.category,
     };
     enqueueOutbox(db, {
       connection_id: connection.id,
@@ -519,6 +668,16 @@ function readTaskStage(db: Database.Database, taskId: string): string | null {
 const PROVIDER_ACTORS: ReadonlySet<string> = new Set<string>(PROVIDERS);
 
 /**
+ * Was this event written by the INBOUND half? An `actor` naming a provider says
+ * so exactly; an event with no actor at all is merely UNATTRIBUTED, which is
+ * why every trigger that consults this also diffs against the baseline — the
+ * two guards cover different failure modes and neither is sufficient alone.
+ */
+function isProviderAuthored(event: TaskChangedEvent): boolean {
+  return event.actor !== undefined && PROVIDER_ACTORS.has(event.actor);
+}
+
+/**
  * An idea was just created locally: enqueue a `create_issue` for every active
  * connection in its project that should carry it.
  *
@@ -537,18 +696,28 @@ const PROVIDER_ACTORS: ReadonlySet<string> = new Set<string>(PROVIDERS);
  * Plus the ordinary dedupe: an unresolved `create_issue` already queued for
  * this idea means a replayed event adds nothing.
  *
+ * A FIFTH SKIP IS PER-CONNECTION: `push_target = 0`. Multi-project mapping
+ * (design doc "Multi-project mapping (rev 4)") gives one cyboflow project N
+ * sibling connection rows — one per mapped tracker group, all on the same
+ * workspace — and exactly one of them per provider is the push target. Without
+ * the flag every sibling would enqueue its own `create_issue` and one new idea
+ * would file N identical issues remotely. The ALREADY-LINKED skip cannot cover
+ * this: at enqueue time the idea carries no link for the provider yet, so every
+ * sibling reads it as unrepresented.
+ *
  * `mirror_subissues` is deliberately NOT consulted — it scopes the DECOMPOSITION
  * fan-out (whether an idea's tasks become children), which is a different
  * question from whether the idea itself is represented at all.
  */
 function handleIdeaPush(deps: WriteBackDeps, event: TaskChangedEvent): void {
   const { db } = deps;
-  if (event.actor !== undefined && PROVIDER_ACTORS.has(event.actor)) return;
+  if (isProviderAuthored(event)) return;
   if ((event.task.experiment_id ?? null) !== null) return;
   if (carriesTrackerProvenance(event.task.body)) return;
 
   for (const connection of listConnections(db, event.projectId)) {
     if (connection.status !== 'active') continue;
+    if (connection.push_target === 0) continue;
     if (getLinkByEntity(db, 'idea', event.taskId, connection.provider) !== null) continue;
 
     const duplicate = listUnresolvedOutbox(db, connection.id).some(
@@ -569,4 +738,313 @@ function handleIdeaPush(deps: WriteBackDeps, event: TaskChangedEvent): void {
       payload_json: CREATE_ISSUE_PAYLOAD_JSON,
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Trigger 5 — content write-back (title / description / priority / category)
+// ---------------------------------------------------------------------------
+
+/** The outbox kinds an `update_content` enqueue supersedes: only its own. */
+const CONTENT_SUPERSEDES: readonly TrackerOutboxRow['kind'][] = ['update_content'];
+
+/**
+ * A linked entity changed. For every link whose connection has content sync ON,
+ * enqueue one `update_content` when the entity now DIFFERS from that link's
+ * baseline on a synced field.
+ *
+ * THE BASELINE DIFF IS THE TRIGGER, not the event's `action`. TaskChangeRouter
+ * emits on every committed write — a stage move, a run overlay, an unrelated
+ * field — and enqueuing on "something changed" would file a remote write for
+ * every one of them. The baseline says where the REMOTE stands, so a field that
+ * still matches it has nothing to say to the tracker, and a replayed event is a
+ * no-op by construction.
+ *
+ * PER LINK, and every input is per link: the mode, the effective priority and
+ * category mappings (a connection's own overlay), and the baseline itself. Two
+ * connections on the same entity reach two independent verdicts.
+ */
+function handleContentChange(
+  deps: WriteBackDeps,
+  event: TaskChangedEvent,
+  allLinked: LinkedContext[],
+  entityType: 'idea' | 'task',
+): void {
+  for (const linked of allLinked) {
+    // INVARIANT 5: 'off' declines the intent rather than queueing it. A queued
+    // row of a kind no drain will ever claim is a permanent inbound stall, not
+    // a delay — see the module header.
+    if (linked.connection.content_sync_mode === 'off') continue;
+    if (!contentDiffersFromBaseline(linked, event.task)) continue;
+    enqueueContentWrite(deps, linked, entityType, event.taskId);
+  }
+}
+
+/**
+ * Does this entity now differ from the link's baseline on ANY field the content
+ * write-back carries?
+ *
+ * FOUR FIELDS, EACH WITH ITS OWN NOTION OF "DIFFERENT":
+ *
+ *  - TITLE is literal text.
+ *  - DESCRIPTION is the remote-owned HALF of the body (the provenance footer is
+ *    cyboflow's and never crosses), compared through the same
+ *    {@link normalizeDescription} the inbound merge uses — anything that would
+ *    not become a three-way diff must not become a remote write either.
+ *  - PRIORITY and CATEGORY are compared in PROVIDER SPACE (invariant 2): the
+ *    local value is mapped OUT and the tokens compared case-insensitively. A
+ *    local-space comparison would read "P3 here, P2 there" on an entity nobody
+ *    touched, because seven local levels collapse onto four or five rungs.
+ *
+ * AN ABSENT BASELINE KEY IS NOT A DIFFERENCE (invariant 3, the outbound face of
+ * the backfill arm). `undefined` means the field was never synced, so we do not
+ * know where the remote stands — and "send ours" is exactly as unfounded as
+ * "take theirs". The next inbound pass overlays a real snapshot, and the edit
+ * after that triggers normally. Without this, the first event on every
+ * pre-feature link would push its local priority into the tracker.
+ *
+ * THE MAPPINGS ARE RESOLVED WITHOUT A LIVE OPTION LIST, because this module
+ * makes no network calls: the seed's canonical tokens plus the connection's
+ * persisted overlay. That is the same "stored overlay, defensively parsed"
+ * reading `summarizeConnection` takes of the state mapping, and it is safe
+ * BECAUSE THIS IS ONLY A TRIGGER — the drain re-resolves against the provider's
+ * live vocabulary and composes the actual patch from that, dropping any field
+ * the live list can no longer express. The worst a stale token here can do is
+ * enqueue a row the drain then settles with nothing to send.
+ */
+function contentDiffersFromBaseline(linked: LinkedContext, task: BacklogTaskItem): boolean {
+  const { connection, link } = linked;
+  const baseline = parseJsonObject(link.baseline_json);
+
+  if (typeof baseline.title === 'string' && baseline.title !== task.title) return true;
+
+  if ('description' in baseline) {
+    const remote = typeof baseline.description === 'string' ? baseline.description : null;
+    if (normalizeDescription(splitBody(task.body).description) !== normalizeDescription(remote)) {
+      return true;
+    }
+  }
+
+  if ('priority' in baseline) {
+    const mapping = resolveEffectivePriorityMapping(
+      connection.provider,
+      null,
+      connection.priority_mapping_json,
+    );
+    const local = providerPriorityToken(mapping, task.priority);
+    if (!providerTokensEqual(local, baselineToken(baseline.priority))) return true;
+  }
+
+  // Category is Dart-only by the locked scope decision, and the provider table
+  // — not a `provider === 'dart'` branch — is what says so.
+  if (providerSupportsCategorySync(connection.provider) && 'category' in baseline) {
+    const mapping = resolveEffectiveCategoryMapping(
+      connection.provider,
+      null,
+      connection.category_mapping_json,
+    );
+    const local = providerCategoryToken(mapping, task.category);
+    if (!providerTokensEqual(local, baselineToken(baseline.category))) return true;
+  }
+
+  return false;
+}
+
+/** A stored baseline token, or null for anything that is not a usable string. */
+function baselineToken(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * Queue one content write for a link's issue. Returns true when a row was
+ * actually written.
+ *
+ * THE DEDUPE COLLAPSES `pending` ROWS ONLY, and the exclusion is the whole
+ * point. `listUnresolvedOutbox` also returns `in_flight` and `ambiguous` rows —
+ * writes whose payload was ALREADY COMPOSED, from the entity as it stood before
+ * this edit. Suppressing the new enqueue because one of those exists would lose
+ * the edit outright: the in-flight write is going to land the OLD text, and no
+ * row would be left to represent the new one. A pending row, by contrast, has
+ * composed nothing yet (see {@link UPDATE_CONTENT_PAYLOAD_JSON}) and will pick
+ * up this edit for free when it drains — so collapsing onto it is exactly
+ * right, and is what makes a burst of typing one remote write.
+ *
+ * The successor row a non-pending incumbent gets is safe for the same reason:
+ * the supersession sweep settles anything it replaces, and drain-time compose
+ * means the survivor sends the final text either way.
+ *
+ * SUPERSESSION IS SCOPED TO ITS OWN KIND. A content write and a state write are
+ * ORTHOGONAL statements about the same issue — one moves its status, the other
+ * its text — so neither may ever settle the other. Only `archive_issue` crosses
+ * kinds, and it does so in the other direction (see
+ * {@link enqueueArchiveWrite}).
+ *
+ * Exported for the service's CONFLICT-RESOLUTION path, which queues the same
+ * row when a user accepts the local side of a content conflict — the ruling
+ * needs the identical dedupe and sweep, and a second copy of them is how the
+ * two would drift.
+ */
+export function enqueueContentWrite(
+  deps: WriteBackDeps,
+  linked: LinkedContext,
+  entityType: 'idea' | 'task',
+  entityId: string,
+): boolean {
+  const { db } = deps;
+  const { connection, link } = linked;
+
+  const collapsible = listUnresolvedOutbox(db, connection.id).some(
+    (row) =>
+      row.kind === 'update_content' &&
+      row.external_id === link.external_id &&
+      row.state === 'pending',
+  );
+  if (collapsible) return false;
+
+  const enqueued = enqueueOutbox(db, {
+    connection_id: connection.id,
+    kind: 'update_content',
+    entity_type: entityType,
+    entity_id: entityId,
+    external_id: link.external_id,
+    payload_json: UPDATE_CONTENT_PAYLOAD_JSON,
+  });
+  supersedeQueuedWrites(
+    db,
+    connection.id,
+    link.external_id,
+    enqueued.id,
+    CONTENT_SUPERSEDES,
+    'superseded by a newer content write for the same issue',
+  );
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Trigger 6 — remote archive (never a delete)
+// ---------------------------------------------------------------------------
+
+/**
+ * `archive_issue` supersedes EVERY queued kind for its issue — the one
+ * legitimate cross-kind sweep in the engine.
+ *
+ * Once the twin is going to the tracker's trash, a queued state write ("move it
+ * to Done") and a queued content write ("here is the new title") are not merely
+ * redundant, they are writes against an issue nobody will look at again — and a
+ * backoff that let one of them drain AFTER the archive would resurrect it into
+ * a listing. Creates are unaffected: they carry a null `external_id`, so the
+ * sweep's key never matches one.
+ */
+const ARCHIVE_SUPERSEDES: readonly TrackerOutboxRow['kind'][] = [
+  'update_state',
+  'close_parent',
+  'update_content',
+  'archive_issue',
+];
+
+/**
+ * A linked entity was archived or unarchived locally. This is the PLAIN
+ * archive path — the board's archive toggle, an orchestrator retirement — with
+ * no removal dialog in front of it.
+ *
+ * THE RULED PATH DOES NOT COME THROUGH HERE, and cannot. TrackerSyncService runs
+ * `handleLocalRemoval` BEFORE this listener, and a staged ruling ORPHANS the
+ * link on its way past — after which {@link resolveAllLinked} skips it and this
+ * arm correctly finds nothing to do. That ordering is what makes a double
+ * archive impossible rather than merely unlikely: the ruling's own enqueue
+ * (`dropLink`) and this arm are mutually exclusive by construction, not by a
+ * flag either of them could forget to check.
+ *
+ * IDEMPOTENCE IS A STAMP, not an event shape. The event carries the entity's
+ * CURRENT `archived_at`, never the transition, and an already-archived entity
+ * emits more events (a cascade re-emit, a replay). So the archive fires only
+ * when the link carries no `archivedWrittenAt` — and an UNARCHIVE clears that
+ * stamp so a later re-archive is a genuine first write again.
+ *
+ * UNARCHIVE WRITES NOTHING REMOTELY, and the per-provider asymmetry is why:
+ * Linear's trash is restorable, Dart's `DELETE` is one-way in its public API,
+ * and Plane has no archive endpoint at all. There is no operation the engine
+ * could issue that means the same thing on all three, so v1 restores nothing
+ * and leaves the tracker to the user. In practice the stamp-clear only matters
+ * for a link whose archive row never drained (a mode flip, a held direction):
+ * once a remote archive is CONFIRMED, the drain orphans the link, and an
+ * orphaned link is not enumerated here at all.
+ */
+function handleArchiveTransition(
+  deps: WriteBackDeps,
+  event: TaskChangedEvent,
+  allLinked: LinkedContext[],
+  entityType: 'idea' | 'task',
+): void {
+  const archived = event.task.archived_at !== null;
+
+  for (const linked of allLinked) {
+    const { connection, link } = linked;
+    if (!archived) {
+      if (readArchivedWrittenAt(link) !== null) clearArchiveStamp(deps, link);
+      continue;
+    }
+    // INVARIANT 5 again: 'off' declines rather than queueing an undrainable row.
+    if (connection.archive_sync_mode === 'off') continue;
+    // A provider with no archive endpoint would leave a row its adapter can
+    // only throw on — which halts inbound for that issue forever. The ruling
+    // path falls back to a cancelled-state write for exactly these; the plain
+    // archive path has nothing to fall back TO and simply says nothing.
+    if (!providerSupportsRemoteArchive(connection.provider)) continue;
+    if (readArchivedWrittenAt(link) !== null) continue;
+    enqueueArchiveWrite(deps, linked, entityType, event.taskId);
+  }
+}
+
+/**
+ * Queue one remote archive for a link's issue. Returns true when a row was
+ * written. Exported for the service's RULED-removal path, which enqueues the
+ * same row from inside `dropLink` — before the link is orphaned, since the
+ * dedupe and the supersession sweep both read live rows for that issue.
+ */
+export function enqueueArchiveWrite(
+  deps: WriteBackDeps,
+  linked: LinkedContext,
+  entityType: 'idea' | 'epic' | 'task',
+  entityId: string,
+): boolean {
+  const { db } = deps;
+  const { connection, link } = linked;
+
+  // Any unresolved archive for this issue already says everything this row
+  // would. Unlike the content dedupe there is nothing to re-compose, so an
+  // in-flight incumbent is a reason to stay quiet rather than to succeed it.
+  const duplicate = listUnresolvedOutbox(db, connection.id).some(
+    (row) => row.kind === 'archive_issue' && row.external_id === link.external_id,
+  );
+  if (duplicate) return false;
+
+  const enqueued = enqueueOutbox(db, {
+    connection_id: connection.id,
+    kind: 'archive_issue',
+    entity_type: entityType,
+    entity_id: entityId,
+    external_id: link.external_id,
+    payload_json: ARCHIVE_ISSUE_PAYLOAD_JSON,
+  });
+  supersedeQueuedWrites(
+    db,
+    connection.id,
+    link.external_id,
+    enqueued.id,
+    ARCHIVE_SUPERSEDES,
+    'superseded by a remote archive of the same issue',
+  );
+  return true;
+}
+
+/**
+ * Drop the `archivedWrittenAt` key from a link's baseline. Written as an
+ * explicit `delete` on the parsed blob rather than a patch spread, because a
+ * patch carrying `undefined` is how the OTHER stamps are composed and mixing
+ * the two idioms on one blob is how a key gets erased by accident.
+ */
+function clearArchiveStamp(deps: WriteBackDeps, link: EntityExternalLinkRow): void {
+  const blob = parseJsonObject(link.baseline_json);
+  delete blob.archivedWrittenAt;
+  updateBaseline(deps.db, link.id, JSON.stringify(blob));
 }

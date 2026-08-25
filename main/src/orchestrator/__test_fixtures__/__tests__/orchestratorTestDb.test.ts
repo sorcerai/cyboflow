@@ -6,8 +6,9 @@
  * 2. seedRun with defaults inserts a single workflow + workflow_run in 'running'.
  * 3. seedRun with overrides.status='awaiting_review' honors the override.
  * 4. Column-level parity: GATE_SCHEMA columns match the raw orchestrator schema
- *    after 006_cyboflow_schema.sql + 071_raw_events_dedup.sql
- *    for workflows, workflow_runs, approvals, raw_events.
+ *    after 006_cyboflow_schema.sql + 071_raw_events_dedup.sql +
+ *    111_approval_awaited.sql for workflows, workflow_runs, approvals,
+ *    raw_events.
  * 5. messages table is intentionally absent from GATE_SCHEMA.
  *
  * NOTE on parity test coverage: PRAGMA table_info() does NOT report CHECK
@@ -31,16 +32,20 @@ function createCanonicalDb(): Database.Database {
     process.cwd(),
     'src/database/migrations/006_cyboflow_schema.sql',
   );
-  const dedupMigrationPath = join(
-    process.cwd(),
+  // Every later migration that touches one of the four parity tables must be
+  // listed here as well as in GATE_SCHEMA — that is the whole point of the
+  // guard: the fixture and the real schema drift apart silently otherwise.
+  const laterMigrations = [
     'src/database/migrations/071_raw_events_dedup.sql',
-  );
+    'src/database/migrations/111_approval_awaited.sql',
+  ];
   const sql = readFileSync(schemaPath, 'utf8');
-  const dedupSql = readFileSync(dedupMigrationPath, 'utf8');
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   db.exec(sql);
-  db.exec(dedupSql);
+  for (const rel of laterMigrations) {
+    db.exec(readFileSync(join(process.cwd(), rel), 'utf8'));
+  }
   return db;
 }
 
@@ -281,7 +286,7 @@ describe('GATE_SCHEMA parity vs canonical raw orchestrator schema', () => {
   const TABLES_TO_CHECK = ['workflows', 'workflow_runs', 'approvals', 'raw_events'] as const;
 
   it.each(TABLES_TO_CHECK)(
-    'column set for table "%s" matches the canonical schema through migration 071',
+    'column set for table "%s" matches the canonical schema through migration 111',
     (tableName) => {
       const gateDb = createTestDb();
       const canonicalDb = createCanonicalDb();

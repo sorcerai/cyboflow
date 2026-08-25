@@ -1,10 +1,12 @@
 /**
  * cyboflow.design sub-router — the design-session Approve action + the Approve
  * button's freshness read (design-mode.md "Approve — intent-first recoverable
- * state machine" + "Design-spec draft").
+ * state machine" + "Design-spec draft") + the reopen-in-design-mode idea
+ * resolver (IDEA-013 "make any prototype reopenable").
  *
- *   approve      : mutation -> DesignApproveResult (drives the Approve state machine)
- *   draftStatus  : query    -> DesignDraftStatus | null (draft vs prototype freshness)
+ *   approve          : mutation -> DesignApproveResult (drives the Approve state machine)
+ *   draftStatus      : query    -> DesignDraftStatus | null (draft vs prototype freshness)
+ *   resolveReopenIdea: query    -> { ideaId: string } | null (see reopenIdeaResolver.ts)
  *
  * `approve` forwards to the boot-configured DesignHandoffService singleton (which
  * holds the electron-backed prototype reader + snapshot dir); business failures
@@ -12,7 +14,9 @@
  * the renderer can branch on the exact reason. `draftStatus` reads the session's
  * latest draft, the current prototype artifact on its chat run, and the linked
  * idea's version/title in one call — everything the Approve button + freshness
- * indicator need.
+ * indicator need. `resolveReopenIdea` is the renderer's ONLY way to resolve which
+ * idea a sourceRef-less prototype belongs to (the renderer has no DB access) —
+ * see reopenIdeaResolver.ts for the ownership + ambiguity policy.
  *
  * Standalone-typecheck invariant: no imports from 'electron', 'better-sqlite3', or
  * main/src/services/* (DesignHandoffService is orchestrator-local + standalone).
@@ -25,6 +29,7 @@ import {
   DesignHandoffService,
   type DesignApproveResult,
 } from '../../design/designHandoffService';
+import { resolveReopenIdeaId } from '../../design/reopenIdeaResolver';
 
 function requireDb(db: DatabaseLike | undefined, where: string): DatabaseLike {
   if (!db) {
@@ -177,5 +182,20 @@ export const designRouter = router({
         ideaId,
         linkBroken,
       };
+    }),
+
+  /**
+   * Resolves which idea a sourceRef-less prototype artifact belongs to, from
+   * the run that produced it (ArtifactTabRenderer's "reopen in design mode"
+   * CTA on a planner/sprint-produced ui-prototype/interactive-prototype —
+   * IDEA-013). Returns null when zero or more-than-one idea resolves for the
+   * run — see reopenIdeaResolver.ts for the ownership + ambiguity policy.
+   */
+  resolveReopenIdea: protectedProcedure
+    .input(z.object({ runId: z.string().min(1) }))
+    .query(async ({ input, ctx }): Promise<{ ideaId: string } | null> => {
+      const db = requireDb(ctx.db, 'resolveReopenIdea');
+      const ideaId = resolveReopenIdeaId(db, input.runId);
+      return ideaId !== null ? { ideaId } : null;
     }),
 });

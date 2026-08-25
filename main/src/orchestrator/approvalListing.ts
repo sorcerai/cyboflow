@@ -9,6 +9,7 @@
  * Standalone-typecheck invariant: NO imports from 'electron', 'better-sqlite3',
  * or main/src/services/*. Only narrow interfaces and shared utilities.
  */
+import { providerForRuntimeValue } from '../../../shared/types/agentRuntime';
 import type { Approval } from '../../../shared/types/approvals';
 import { truncatePayloadPreview } from '../../../shared/utils/approvals';
 import type { DatabaseLike } from './types';
@@ -26,11 +27,113 @@ interface DbApprovalRow {
   rationale: string | null;
   createdAt: string;
   status: string;
+  /**
+   * SQLite has no boolean: the column is INTEGER 0/1. Typed as number here so
+   * the coercion to `Approval.awaited` happens in exactly one place below.
+   */
+  awaited: number;
+  /** `sessions.name` via LEFT JOIN; null when the join was not made or the row is gone. */
+  sessionName: string | null;
+  /** `workflow_runs.agent_runtime`; null when the column is absent on an old schema. */
+  agentRuntime: string | null;
+}
+
+/**
+ * WeakMap-cached `PRAGMA table_info` probe, mirroring `taskListing.ts`'s.
+ *
+ * The attribution JOIN is OPTIONAL for a real reason, not just old-schema
+ * politeness: `sessions` is legacy (declared in schema.sql, not a numbered
+ * migration) and the narrow gate fixtures that exercise this query build only
+ * `approvals` + `workflow_runs` + `workflows`. An unconditional join would turn
+ * every one of those into a SQL error, so the columns are probed and the join
+ * is added only when it can succeed. Fail-soft: a PRAGMA error reads back
+ * absent, and the caller simply gets nulls.
+ */
+const columnExistsCache = new WeakMap<DatabaseLike, Map<string, boolean>>();
+
+function columnExists(db: DatabaseLike, table: string, column: string): boolean {
+  let cache = columnExistsCache.get(db);
+  if (!cache) {
+    cache = new Map();
+    columnExistsCache.set(db, cache);
+  }
+  const key = `${table}.${column}`;
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  let present = false;
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+    present = rows.some((r) => r.name === column);
+  } catch {
+    present = false;
+  }
+  cache.set(key, present);
+  return present;
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/** The identity half of an {@link Approval}: who is asking. */
+export interface ApprovalAttribution {
+  sessionName: string | null;
+  agentProvider: string | null;
+}
+
+/**
+ * Coerce one run's raw session name + runtime into the shape the UI reads.
+ *
+ * The single place the rule lives. `selectPendingApprovals` gets these columns
+ * from its own JOIN (one query for the whole queue) while
+ * `buildApprovalCreatedEvent` looks up a single run, and the two projecting the
+ * same row differently is precisely the drift this centralizes away.
+ */
+export function toApprovalAttribution(
+  sessionName: unknown,
+  agentRuntime: unknown,
+): ApprovalAttribution {
+  return {
+    sessionName:
+      typeof sessionName === 'string' && sessionName.length > 0 ? sessionName : null,
+    // A NULL runtime floors to the Claude default inside providerForRuntimeValue,
+    // which would be a guess rather than a reading — so it stays null here and
+    // the UI shows no provider at all.
+    agentProvider:
+      typeof agentRuntime === 'string' && agentRuntime.length > 0
+        ? providerForRuntimeValue(agentRuntime, 'toApprovalAttribution')
+        : null,
+  };
+}
+
+/**
+ * Read one run's attribution, degrading to nulls on any schema or lookup
+ * failure. Used by the created-event bridge, which has a run id rather than a
+ * queue-wide JOIN.
+ */
+export function selectApprovalAttribution(db: DatabaseLike, runId: string): ApprovalAttribution {
+  const hasSession =
+    columnExists(db, 'workflow_runs', 'session_id') && columnExists(db, 'sessions', 'name');
+  const hasRuntime = columnExists(db, 'workflow_runs', 'agent_runtime');
+  if (!hasSession && !hasRuntime) return { sessionName: null, agentProvider: null };
+
+  try {
+    const row = db
+      .prepare(
+        `SELECT
+           ${hasSession ? 's.name' : 'NULL'} AS sessionName,
+           ${hasRuntime ? 'r.agent_runtime' : 'NULL'} AS agentRuntime
+         FROM workflow_runs r
+         ${hasSession ? 'LEFT JOIN sessions s ON s.id = r.session_id' : ''}
+         WHERE r.id = ?`,
+      )
+      .get(runId) as { sessionName?: unknown; agentRuntime?: unknown } | undefined;
+    if (!row) return { sessionName: null, agentProvider: null };
+    return toApprovalAttribution(row.sessionName, row.agentRuntime);
+  } catch {
+    return { sessionName: null, agentProvider: null };
+  }
+}
 
 /**
  * Return all pending approvals ordered oldest-first, projected into the
@@ -43,6 +146,10 @@ interface DbApprovalRow {
  * @returns Approval[] sorted by created_at ASC.
  */
 export function selectPendingApprovals(db: DatabaseLike): Approval[] {
+  const hasSession =
+    columnExists(db, 'workflow_runs', 'session_id') && columnExists(db, 'sessions', 'name');
+  const hasRuntime = columnExists(db, 'workflow_runs', 'agent_runtime');
+
   const rows = db.prepare(
     `SELECT
        a.id          AS id,
@@ -52,10 +159,14 @@ export function selectPendingApprovals(db: DatabaseLike): Approval[] {
        a.tool_input_json AS payloadPreviewRaw,
        a.rationale   AS rationale,
        a.created_at  AS createdAt,
-       a.status      AS status
+       a.status      AS status,
+       a.awaited     AS awaited,
+       ${hasSession ? 's.name' : 'NULL'} AS sessionName,
+       ${hasRuntime ? 'r.agent_runtime' : 'NULL'} AS agentRuntime
      FROM approvals a
      JOIN workflow_runs r ON r.id = a.run_id
      JOIN workflows     w ON w.id = r.workflow_id
+     ${hasSession ? 'LEFT JOIN sessions s ON s.id = r.session_id' : ''}
      WHERE a.status = 'pending'
      ORDER BY a.created_at ASC`,
   ).all() as DbApprovalRow[];
@@ -69,5 +180,9 @@ export function selectPendingApprovals(db: DatabaseLike): Approval[] {
     rationale: row.rationale,
     createdAt: new Date(row.createdAt).toISOString(),
     status: row.status as Approval['status'],
+    // Migration 111 backfills 1, so a row written before it (or by any transport
+    // that never touches the column) reads as awaited — the honest default.
+    awaited: row.awaited !== 0,
+    ...toApprovalAttribution(row.sessionName, row.agentRuntime),
   }));
 }

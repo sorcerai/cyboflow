@@ -52,6 +52,7 @@ const SCHEMA = `
     spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
     agent_provider TEXT, agent_runtime TEXT,
     weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+    archived_at TEXT,  -- migration 116
     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE TABLE experiments (

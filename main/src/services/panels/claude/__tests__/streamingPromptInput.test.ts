@@ -15,6 +15,11 @@
  *   - push after close() returns false (the message would never be delivered);
  *   - a push queued just before close() still drains before the generator returns;
  *   - the persistent variant's push accepts the same steering opt.
+ *
+ * Plus the HUMAN-ORIGIN stamp. From agent-sdk 0.3.224 an unstamped user message
+ * is unattributed and fails closed at the CLI's strict isHuman() trust gates, so
+ * every message this factory emits must carry `origin: { kind: 'human' }` —
+ * initial, plain push, and steering push alike, on BOTH input variants.
  */
 import { describe, it, expect } from 'vitest';
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -38,6 +43,7 @@ describe('createStreamingPromptInput', () => {
       message: { role: 'user', content: 'do the thing' },
       parent_tool_use_id: null,
       session_id: '',
+      origin: { kind: 'human' },
     });
   });
 
@@ -110,6 +116,20 @@ describe('createStreamingPromptInput — mid-turn steering push', () => {
     expect(steered.priority).toBe('now');
   });
 
+  it('stamps origin { kind: human } on the initial turn and on every push', async () => {
+    const { stream, push } = createStreamingPromptInput('initial');
+    const initial = (await stream.next()).value as SDKUserMessage;
+    expect(initial.origin).toEqual({ kind: 'human' });
+
+    push('plain follow');
+    push('steer now', { steering: true });
+
+    const plain = (await stream.next()).value as SDKUserMessage;
+    expect(plain.origin).toEqual({ kind: 'human' });
+    const steered = (await stream.next()).value as SDKUserMessage;
+    expect(steered.origin).toEqual({ kind: 'human' });
+  });
+
   it('push after close() returns false and enqueues nothing', async () => {
     const { stream, push, close } = createStreamingPromptInput('initial');
     await stream.next();
@@ -146,5 +166,17 @@ describe('createPersistentPromptInput — steering opt parity', () => {
     const steered = (await stream.next()).value as SDKUserMessage;
     expect(steered.message.content).toBe('steer');
     expect(steered.priority).toBe('now');
+  });
+
+  it('stamps origin { kind: human } on the initial turn and on cross-turn pushes', async () => {
+    // The warm path is the one that survives across turns, so an unstamped push
+    // here is exactly what a peer-injected turn would look like to isHuman().
+    const { stream, push } = createPersistentPromptInput('initial');
+    const initial = (await stream.next()).value as SDKUserMessage;
+    expect(initial.origin).toEqual({ kind: 'human' });
+
+    expect(push('next turn')).toBe(true);
+    const pushed = (await stream.next()).value as SDKUserMessage;
+    expect(pushed.origin).toEqual({ kind: 'human' });
   });
 });

@@ -47,9 +47,13 @@ function mapRegistryError(err: unknown): TRPCError {
 }
 
 export const variantsRouter = router({
-  /** List a workflow's variants (newest-first). */
+  /**
+   * List a workflow's variants (newest-first). ARCHIVED variants (migration 116)
+   * are excluded unless `includeArchived` — the manager's "Show archived" toggle
+   * is the one caller that opts in.
+   */
   list: protectedProcedure
-    .input(z.object({ workflowId: z.string().min(1) }))
+    .input(z.object({ workflowId: z.string().min(1), includeArchived: z.boolean().optional() }))
     .query(async ({ ctx, input }): Promise<WorkflowVariantRow[]> => {
       if (!ctx.workflowRegistry) {
         throw new TRPCError({
@@ -57,7 +61,9 @@ export const variantsRouter = router({
           message: 'workflowRegistry not wired into tRPC context',
         });
       }
-      return ctx.workflowRegistry.listVariants(input.workflowId);
+      return ctx.workflowRegistry.listVariants(input.workflowId, {
+        includeArchived: input.includeArchived === true,
+      });
     }),
 
   /**
@@ -145,6 +151,32 @@ export const variantsRouter = router({
       }
       try {
         ctx.workflowRegistry.setVariantStatus(input.variantId, input.status);
+      } catch (err) {
+        throw mapRegistryError(err);
+      }
+      return { ok: true };
+    }),
+
+  /**
+   * Archive / unarchive a variant (migration 116). Hides it from the list, the
+   * pickers and the rotation pool without touching its status or run history;
+   * `archived: false` restores it. NOT_FOUND when the variant is missing.
+   */
+  setArchived: protectedProcedure
+    .input(z.object({ variantId: z.string().min(1), archived: z.boolean() }))
+    .mutation(async ({ ctx, input }): Promise<{ ok: true }> => {
+      if (!ctx.workflowRegistry) {
+        throw new TRPCError({
+          code: 'PRECONDITION_FAILED',
+          message: 'workflowRegistry not wired into tRPC context',
+        });
+      }
+      try {
+        if (input.archived) {
+          ctx.workflowRegistry.archiveVariant(input.variantId);
+        } else {
+          ctx.workflowRegistry.unarchiveVariant(input.variantId);
+        }
       } catch (err) {
         throw mapRegistryError(err);
       }

@@ -48,6 +48,7 @@ import type { DatabaseLike, LoggerLike } from '../types';
 import type { RunGitDiff } from '../../../../shared/types/runFiles';
 import { isCyboflowWorkflowName } from '../../../../shared/types/workflows';
 import { computeSpecHash } from '../specHash';
+import { exciseBootstrapDiff } from './exciseBootstrapDiff';
 import { RUBRIC_VERSION } from './rubric';
 import { judgeStaticPromptText } from './judgePromptScaffold';
 import type { GateResults, GateStatus } from './scoring';
@@ -77,6 +78,22 @@ export interface SnapshotDeps {
    * outranks it. Guarded at the call site: a throw here defaults to enabled.
    */
   isEvalEnabled: () => boolean;
+  /**
+   * Repo paths the run's RUNBOOK BOOTSTRAP wrote, excised from the captured diff
+   * before it is frozen (docs/proposals/lane-runbook-bootstrap.md §11).
+   *
+   * This function already exempts verify-setup from auto-eval, and its stated
+   * reason applies verbatim here: a verification runbook's real acceptance test
+   * is its own proof run, not a rubric. The bootstrap moves that diff class into
+   * sprint/ship runs, which ARE graded and A/B-compared — so without this a run
+   * is scored on machine-written JSON none of its agents authored, and projects
+   * that happen to need a bootstrap score differently for reasons unrelated to
+   * the work.
+   *
+   * Absent (unit tests, any deployment with the feature off) ⇒ nothing is
+   * excised, which is byte-identical to the pre-bootstrap behavior.
+   */
+  bootstrapWrittenPaths?: (runId: string) => string[];
   /**
    * Sub-toggle consulted ONLY for variant/experiment-TAGGED runs (A/B testing
    * slice C): the "Auto-grade variant & experiment runs" setting (default ON),
@@ -202,7 +219,26 @@ async function captureFrozenDiff(
   try {
     const captured = await deps.gitDiff(worktreePath, baseRef);
     if (!captured) return { diffText: null, diffStatsJson: null };
-    return { diffText: captured.diff, diffStatsJson: JSON.stringify(captured.stats) };
+    // §11 — drop the runbook bootstrap's own files before the diff is frozen.
+    // Best-effort like everything else on this path: a resolver that throws
+    // leaves the diff exactly as captured, which is what shipped.
+    let effective = captured;
+    try {
+      const excised = deps.bootstrapWrittenPaths?.(runId) ?? [];
+      if (excised.length > 0) {
+        effective = exciseBootstrapDiff(captured, excised);
+        deps.logger?.debug('[eval] excised runbook-bootstrap files from the frozen diff', {
+          runId,
+          paths: excised,
+        });
+      }
+    } catch (err) {
+      deps.logger?.debug('[eval] bootstrap-path resolution failed; grading the diff as captured', {
+        runId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return { diffText: effective.diff, diffStatsJson: JSON.stringify(effective.stats) };
   } catch (err) {
     deps.logger?.warn('[eval] diff capture failed at snapshot', {
       runId,

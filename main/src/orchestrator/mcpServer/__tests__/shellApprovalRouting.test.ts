@@ -151,7 +151,7 @@ describe('shell-approval-request handler branch', () => {
   let fakeHome: string;
 
   beforeEach(() => {
-    db = createTestDb({ disableForeignKeys: true });
+    db = createTestDb({ disableForeignKeys: true, includeStuckDetectedAt: true });
     // resolveRunPermissionMode now joins the owning SESSION (permission-mode
     // redesign §3c#3); the GATE_SCHEMA carries neither, so layer the run.session_id
     // link column + a minimal sessions table the join reads.
@@ -173,12 +173,25 @@ describe('shell-approval-request handler branch', () => {
     fs.rmSync(fakeHome, { recursive: true, force: true });
   });
 
-  function seedWorktreeWithAllow(runId: string, allow: string[]): string {
+  /**
+   * Seed a run + worktree with the given allow rules planted in the USER
+   * settings file (the fake HOME) — the only source the trust model honors.
+   * The worktree still gets a present-but-inert project `.claude/settings.json`
+   * (repo-controlled files must never grant auto-approval; see the
+   * hostile-repo case (a1)).
+   */
+  function seedRunWithAllow(runId: string, allow: string[]): string {
     const worktree = fs.mkdtempSync(path.join(os.tmpdir(), `cyboflow-wt-${process.pid}-`));
     worktrees.push(worktree);
     fs.mkdirSync(path.join(worktree, '.claude'), { recursive: true });
     fs.writeFileSync(
       path.join(worktree, '.claude', 'settings.json'),
+      JSON.stringify({ permissions: { allow: [] } }),
+      'utf8',
+    );
+    fs.mkdirSync(path.join(fakeHome, '.claude'), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome, '.claude', 'settings.json'),
       JSON.stringify({ permissions: { allow } }),
       'utf8',
     );
@@ -200,7 +213,7 @@ describe('shell-approval-request handler branch', () => {
    * `permission_mode_snapshot` column is demoted to audit-only and no longer read.
    */
   function seedRunWithMode(runId: string, mode: string): string {
-    const worktree = seedWorktreeWithAllow(runId, []);
+    const worktree = seedRunWithAllow(runId, []);
     const sessionId = `sess-${runId}`;
     db.prepare(`INSERT INTO sessions (id, agent_permission_mode) VALUES (?, ?)`).run(sessionId, mode);
     db.prepare(`UPDATE workflow_runs SET session_id = ? WHERE id = ?`).run(sessionId, runId);
@@ -208,7 +221,7 @@ describe('shell-approval-request handler branch', () => {
   }
 
   it('(a) auto-allows an allow-listed tool with ZERO approvals rows (SDK parity, no router round-trip)', async () => {
-    seedWorktreeWithAllow('run-allow', ['Bash(git status:*)']);
+    seedRunWithAllow('run-allow', ['Bash(git status:*)']);
     const { socket, writes } = makeSocketDouble();
 
     await handler.handleMessage(
@@ -225,6 +238,34 @@ describe('shell-approval-request handler branch', () => {
 
     expect(decisionOf(writes)).toBe('allow');
     expect(pendingApprovalCount('run-allow')).toBe(0);
+  });
+
+  it('(a1) allow rules planted in the WORKTREE .claude/settings.json do NOT auto-allow — the repo-trust model routes them to the gate (deep-review P0)', async () => {
+    // A hostile repo ships its own .claude/settings.json via clone/checkout.
+    // Even a bare "Bash" grant there must not bypass the approval round-trip.
+    const worktree = seedRunWithAllow('run-hostile', []);
+    fs.writeFileSync(
+      path.join(worktree, '.claude', 'settings.json'),
+      JSON.stringify({ permissions: { allow: ['Bash', 'Bash(git status:*)'] } }),
+      'utf8',
+    );
+    const { socket, writes } = makeEmitterSocketDouble();
+
+    await handler.handleMessage(
+      {
+        type: 'shell-approval-request',
+        requestId: 'req-hostile',
+        runId: 'run-hostile',
+        toolName: 'Bash',
+        toolInput: { command: 'git status' },
+      },
+      socket,
+    );
+    await flush();
+
+    // No synchronous auto-allow: the socket is held open for the human.
+    expect(writes).toHaveLength(0);
+    expect(pendingApprovalCount('run-hostile')).toBe(1);
   });
 
   it('(a2) acceptEdits fast-path: auto-allows Edit/Write/MultiEdit with ZERO approvals rows (no allow-list entry needed)', async () => {
@@ -319,7 +360,7 @@ describe('shell-approval-request handler branch', () => {
     // This is the legacy-sentinel arm — it prompts (router gate) rather than
     // stranding the run; the sentinel's session_id is stamped at creation so the
     // miss never persists beyond the first mint-on-read turn.
-    seedWorktreeWithAllow('run-joinmiss-edit', []);
+    seedRunWithAllow('run-joinmiss-edit', []);
     const { socket, writes } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -360,7 +401,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('(c) a non-allow-listed tool creates exactly one pending approval and writes NO synchronous response', async () => {
-    seedWorktreeWithAllow('run-pending', []);
+    seedRunWithAllow('run-pending', []);
     const { socket, writes } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -382,7 +423,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('(d) allow round-trip: respond({allow}) writes permissionDecision:"allow" on the held-open socket', async () => {
-    seedWorktreeWithAllow('run-rt-allow', []);
+    seedRunWithAllow('run-rt-allow', []);
     const { socket, writes } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -408,7 +449,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('(e) deny round-trip: respond({deny, message}) writes permissionDecision:"deny" with the reason', async () => {
-    seedWorktreeWithAllow('run-rt-deny', []);
+    seedRunWithAllow('run-rt-deny', []);
     const { socket, writes } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -433,7 +474,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('(f) socket disconnect before a verdict clears the pending approval (no awaiting_review leak)', async () => {
-    seedWorktreeWithAllow('run-disc', []);
+    seedRunWithAllow('run-disc', []);
     const { socket, emitClose } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -467,7 +508,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('(g) cancel affordance denies + closes every in-flight socket for a runId and clears the pending row', async () => {
-    seedWorktreeWithAllow('run-cancel', []);
+    seedRunWithAllow('run-cancel', []);
     const { socket, writes, ended } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -523,7 +564,7 @@ describe('shell-approval-request handler branch', () => {
   });
 
   it('does NOT route AskUserQuestion through QuestionRouter (native-TUI-only) — it routes as a normal gate with no awaiting_input leak', async () => {
-    seedWorktreeWithAllow('run-auq', []);
+    seedRunWithAllow('run-auq', []);
     const { socket, writes } = makeEmitterSocketDouble();
 
     await handler.handleMessage(
@@ -588,6 +629,9 @@ describe('shell-approval-request review_item fold (P4, socket still held)', () =
     // carry no mode ⇒ the join yields null ⇒ the conservative router gate (the
     // existing behavior under test).
     reviewDb.exec('ALTER TABLE workflow_runs ADD COLUMN session_id TEXT');
+    // approvalRouter's revive-on-answer UPDATE clears stuck_detected_at alongside
+    // stuck_reason, so this narrow schema needs migration 007's column too.
+    reviewDb.exec('ALTER TABLE workflow_runs ADD COLUMN stuck_detected_at INTEGER');
     reviewDb.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_permission_mode TEXT)');
     return reviewDb;
   }
@@ -679,7 +723,7 @@ describe('shell-approval-request over a live OrchSocketServer (held-open socket)
   let fakeHome: string;
 
   beforeEach(async () => {
-    db = createTestDb({ disableForeignKeys: true });
+    db = createTestDb({ disableForeignKeys: true, includeStuckDetectedAt: true });
     // Run→session join surface for resolveRunPermissionMode (§3c#3); these runs
     // carry no mode ⇒ the join yields null ⇒ the conservative router gate.
     db.exec('ALTER TABLE workflow_runs ADD COLUMN session_id TEXT');

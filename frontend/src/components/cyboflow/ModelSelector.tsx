@@ -53,10 +53,17 @@ interface ModelSelectorProps {
   agentProvider?: AgentProvider;
   agentRuntime?: AgentRuntime;
   /**
-   * When set, prepends a `value=''` option (Claude path only) so the caller can
-   * offer "follow the app default" instead of pinning a concrete alias. The
-   * empty value is never passed to `isAliasUsable`/`unavailableReason`, so it
-   * is always enabled.
+   * When set, prepends a `value=''` option so the caller can offer "follow the
+   * app default" instead of pinning a concrete model. The empty value is never
+   * passed to `isAliasUsable`/`unavailableReason`, so it is always enabled.
+   *
+   * Honored on the CLAUDE and OMP paths, NOT on Codex — the split mirrors
+   * `coerceModelForRuntime` (settings/runTypeOverrides.ts) and rests on the same
+   * fact: an omitted model resolves to the always-Claude floor at launch, which
+   * `normalizeAgentModelSelection` then DROPS under the omp provider (leaving
+   * OMP on its own default) but KEEPS under codex, where it would be the
+   * cross-family pair. Codex advertises an explicit `auto` row for that intent;
+   * OMP advertises none, so absence is the only way to express it.
    */
   allowDefaultOption?: { label: string };
 }
@@ -77,6 +84,10 @@ export function ModelSelector({
   const { options: claudeCatalogOptions } = useClaudeModelCatalog(!isCodexRuntime && !isOmpRuntime);
   const { options: ompOptions, loading: ompLoading, error: ompError } = useOmpModelCatalog(isOmpRuntime);
   const ompGroups = groupOmpOptionsByProvider(ompOptions);
+  // The stand-in row for an empty catalog. Suppressed when a "follow defaults"
+  // row is offered: that row already gives the <select> a valid value, and a
+  // second empty-valued option would collide with it.
+  const ompPlaceholderShown = ompGroups.length === 0 && allowDefaultOption === undefined;
   const codexActive = codexOptions.find((o) => o.id === value);
   const claudeActive = MODEL_OPTIONS.find((o) => o.id === value);
   const claudeDynamicActive = claudeCatalogOptions.find((o) => o.id === value);
@@ -97,21 +108,30 @@ export function ModelSelector({
         aria-label={isOmpRuntime ? 'Select OMP model' : isCodexRuntime ? 'Select Codex model' : 'Select Claude model'}
       >
         {isOmpRuntime ? (
-          ompGroups.length === 0 ? (
-            <option value="" disabled>
-              {ompLoading ? 'Loading OMP models…' : ompError ? 'Could not load OMP models' : 'No OMP models available'}
-            </option>
-          ) : (
-            ompGroups.map(([ompProvider, options]) => (
-              <optgroup key={ompProvider} label={ompProvider}>
-                {options.map((o) => (
-                  <option key={o.id} value={o.id}>
-                    {o.label}
-                  </option>
-                ))}
-              </optgroup>
-            ))
-          )
+          <>
+            {allowDefaultOption && <option value="">{allowDefaultOption.label}</option>}
+            {ompGroups.length === 0 ? (
+              ompPlaceholderShown && (
+                <option value="" disabled>
+                  {ompLoading
+                    ? 'Loading OMP models…'
+                    : ompError
+                      ? 'Could not load OMP models'
+                      : 'No OMP models available'}
+                </option>
+              )
+            ) : (
+              ompGroups.map(([ompProvider, options]) => (
+                <optgroup key={ompProvider} label={ompProvider}>
+                  {options.map((o) => (
+                    <option key={o.id} value={o.id}>
+                      {o.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))
+            )}
+          </>
         ) : isCodexRuntime ? (
           codexOptions.map((o) => (
             <option key={o.id} value={o.id}>
@@ -146,8 +166,24 @@ export function ModelSelector({
         )}
       </select>
       {isOmpRuntime ? (
-        <p className="text-xs text-text-tertiary">
-          {ompActive ? `${ompActive.label} (${ompActive.ompProvider})` : 'Choose an OMP model for this runtime.'}
+        // Carries the catalog's loading/error state too: with a "follow
+        // defaults" row present the <select> keeps a valid value, so the
+        // disabled placeholder above never renders and this is the only place
+        // that can say why the list is empty.
+        <p className="text-xs text-text-tertiary" data-testid="model-selector-omp-hint">
+          {ompActive
+            ? `${ompActive.label} (${ompActive.ompProvider})`
+            : ompPlaceholderShown
+              ? // The placeholder option already states the reason — repeating it
+                // here would render the same sentence twice.
+                'Choose an OMP model for this runtime.'
+              : ompLoading
+                ? 'Loading OMP models…'
+                : ompError !== null
+                  ? `Couldn't load the OMP model list (${ompError}).`
+                  : allowDefaultOption && value === ''
+                    ? 'OMP starts on its own default model.'
+                    : 'Choose an OMP model for this runtime.'}
         </p>
       ) : isCodexRuntime ? (
         <p className="text-xs text-text-tertiary">

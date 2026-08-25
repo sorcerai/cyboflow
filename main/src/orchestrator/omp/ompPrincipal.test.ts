@@ -50,4 +50,37 @@ describe('resolveOmpPrincipal', () => {
       }
     }
   });
+
+  it('grants omp:supervise from Aria mode with no env var set', () => {
+    const restore = withEnv(undefined);
+    try {
+      // The Settings toggle IS the grant: an operator turning on remote-fleet
+      // supervision is exactly the person authorizing it, so a desktop feature
+      // does not need a shell incantation to switch on.
+      expect(resolveOmpPrincipal(true).capabilities.has(OMP_SUPERVISE_CAPABILITY)).toBe(true);
+      expect(resolveOmpPrincipal(false).capabilities.has(OMP_SUPERVISE_CAPABILITY)).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('keeps the env var as an override for hosts with no Settings UI', () => {
+    const restore = withEnv('1');
+    try {
+      // Aria mode off but the env explicitly on — a headless/CI host. Either
+      // source alone grants; they are OR-ed, not AND-ed.
+      expect(resolveOmpPrincipal(false).capabilities.has(OMP_SUPERVISE_CAPABILITY)).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('defaults ariaMode to false so an unaware caller still fails closed', () => {
+    const restore = withEnv(undefined);
+    try {
+      expect(resolveOmpPrincipal().capabilities.size).toBe(0);
+    } finally {
+      restore();
+    }
+  });
 });

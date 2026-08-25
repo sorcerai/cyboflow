@@ -475,10 +475,12 @@ export const useInsightsStore = create<InsightsState>((set, get) => {
    * state derives from `staged_at`). Per-project failures are caught and
    * recorded but never abort the other projects' fetches.
    *
-   * `requireMergedSession: true` scopes the compounding surface to findings whose
-   * session was MERGED (a run in the same session has outcome='merged'); unmerged
-   * work may never land, so its findings might not apply. This is stricter than —
-   * and supersedes — the run-status orphan-hide for findings.
+   * `requireDeliveredSession: true` scopes the compounding surface to findings
+   * whose session DELIVERED its work (the run, or a sibling run in the same
+   * session, carries a DELIVERED_RUN_OUTCOMES stamp — merged / integrated /
+   * completed / pr_open); discarded work never lands, so its findings might not
+   * apply. This is stricter than — and supersedes — the run-status orphan-hide
+   * for findings.
    */
   const fetchTriageFindings = async (
     projectIds: number[],
@@ -491,9 +493,9 @@ export const useInsightsStore = create<InsightsState>((set, get) => {
             projectId,
             status: 'pending',
             kind: 'finding',
-            // Compounding surfaces findings from MERGED sessions only — unmerged
-            // work may never land, so its findings might not apply.
-            requireMergedSession: true,
+            // Compounding surfaces findings from DELIVERED sessions only —
+            // discarded work never lands, so its findings might not apply.
+            requireDeliveredSession: true,
           });
         } catch (err: unknown) {
           recordError(err instanceof Error ? err.message : `reviewItems.list failed for ${projectId}`);

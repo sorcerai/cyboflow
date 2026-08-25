@@ -37,15 +37,29 @@ export interface ThinkingBlock {
 }
 
 /**
+ * Image block inside tool_result content — the base64-embedded shape a tool_result
+ * carries when a tool returns an image (e.g. a visual-verification screenshot). No
+ * `text` field is present on this shape.
+ */
+export interface ToolResultImageBlock {
+  type: 'image';
+  source: { type: string; media_type: string; data: string; [k: string]: unknown };
+  [k: string]: unknown;
+}
+
+/**
  * Tool-result block inside a user message.
  *
  * Research §1 confirms `content` is sometimes a plain string and sometimes an array of
- * `{ type, text }` objects, depending on Claude version and whether the tool succeeded.
+ * block objects, depending on Claude version and whether the tool succeeded. Two array
+ * element shapes are modelled explicitly: image blocks (above) and the loose `{ type,
+ * text? }` catch-all for everything else — `text` is optional there since a block type
+ * other than 'text'/'image' isn't guaranteed to carry one.
  */
 export interface ToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
-  content: string | Array<{ type: string; text: string }>;
+  content: string | Array<ToolResultImageBlock | { type: string; text?: string; [k: string]: unknown }>;
   is_error?: boolean;
 }
 

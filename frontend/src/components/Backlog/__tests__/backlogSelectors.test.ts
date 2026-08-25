@@ -27,6 +27,7 @@ import {
   friendlyStageError,
   isExecutionStage,
   readyForDevChildTaskIds,
+  ideaReadyTaskIds,
   RANK_GAP,
   dropRank,
   movedOrder,
@@ -716,6 +717,45 @@ describe('readyForDevChildTaskIds', () => {
     expect(
       readyForDevChildTaskIds(
         item({ id: 'EPIC-3', type: 'epic', children: [item({ id: 'TASK-x', stage_position: 1 })] }),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe('ideaReadyTaskIds', () => {
+  it('collects ready tasks from BOTH decomposition shapes: epic-less direct task + tasks under the idea\'s epics', () => {
+    const rows = [
+      // The single epic-less task directly under the idea (top-level row).
+      item({ id: 'TASK-direct', stage_position: 6, originating_idea_id: 'idea-1' }),
+      // An epic of the idea with a ready child, an unready child, and a done child.
+      item({
+        id: 'EPIC-mine',
+        type: 'epic',
+        originating_idea_id: 'idea-1',
+        children: [
+          item({ id: 'TASK-under-epic', stage_position: 6 }),
+          item({ id: 'TASK-planning', stage_position: 1 }),
+          item({ id: 'TASK-done', stage_position: 6, isDone: true }),
+        ],
+      }),
+      // Another idea's ready work must never leak in.
+      item({ id: 'TASK-foreign', stage_position: 6, originating_idea_id: 'idea-2' }),
+      item({
+        id: 'EPIC-foreign',
+        type: 'epic',
+        originating_idea_id: 'idea-2',
+        children: [item({ id: 'TASK-foreign-child', stage_position: 6 })],
+      }),
+    ];
+    expect(ideaReadyTaskIds(rows, 'idea-1')).toEqual(['TASK-direct', 'TASK-under-epic']);
+  });
+
+  it('returns [] when the idea has no decomposition or nothing ready', () => {
+    expect(ideaReadyTaskIds([], 'idea-1')).toEqual([]);
+    expect(
+      ideaReadyTaskIds(
+        [item({ id: 'TASK-a', stage_position: 7, originating_idea_id: 'idea-1' })],
+        'idea-1',
       ),
     ).toEqual([]);
   });

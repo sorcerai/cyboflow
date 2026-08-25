@@ -8,14 +8,19 @@
  * Coverage: exactly two rows regardless of what came back; connections are
  * listed ACROSS projects with a project chip (a connection on a non-active
  * project must not render as "Not connected"); paused renders as a warning, not
- * green; Connect stays while the active project lacks a connection; no active
- * project disables Connect; the live subscription re-reads on a change event.
+ * green; Connect renders only for a provider with NO live connection (an
+ * already-connected one adds mappings through Manage → Add mapping instead);
+ * no active project disables Connect; the live subscription re-reads on a
+ * change event; and Manage → Add mapping stacks the wizard in add-mapping mode
+ * over the connected view it was launched from.
  */
 import '@testing-library/jest-dom';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TrackerConnectionSummary } from '../../../../../shared/types/trackerSync';
 
+// The connected view and the add-mapping wizard are rendered for real once
+// Manage is pressed, so their procedures are stubbed here too.
 vi.mock('../../../trpc/client', () => ({
   trpc: {
     cyboflow: {
@@ -23,6 +28,10 @@ vi.mock('../../../trpc/client', () => ({
         connections: { query: vi.fn() },
         conflicts: { query: vi.fn() },
         onTrackerChanged: { subscribe: vi.fn() },
+        mappings: { query: vi.fn() },
+        setPushTarget: { mutate: vi.fn() },
+        disconnect: { mutate: vi.fn() },
+        wizardGroups: { mutate: vi.fn() },
       },
     },
   },
@@ -35,12 +44,15 @@ vi.mock('../../../utils/api', () => ({
 
 // Imported after the mock so vi.mock hoisting is in effect.
 import { TrackerIntegrationSection } from './TrackerIntegrationSection';
+import { TRACKER_PROVIDERS } from './trackerVocabulary';
 import { trpc } from '../../../trpc/client';
 import { API } from '../../../utils/api';
 import { useNavigationStore } from '../../../stores/navigationStore';
 
 const mockConnections = vi.mocked(trpc.cyboflow.tracker.connections.query);
 const mockSubscribe = vi.mocked(trpc.cyboflow.tracker.onTrackerChanged.subscribe);
+const mockMappings = vi.mocked(trpc.cyboflow.tracker.mappings.query);
+const mockWizardGroups = vi.mocked(trpc.cyboflow.tracker.wizardGroups.mutate);
 const mockProjectsGetAll = vi.mocked(API.projects.getAll);
 
 const PROJECTS = [
@@ -74,12 +86,21 @@ function makeConnection(
     actorLabel: 'J. Kesteva',
     baseUrl: null,
     sourceLabel: 'Core · Current cycle',
+    sourceScope: { containerId: 'team-1', narrowId: 'cycle-12', narrowKind: 'cycle' },
     selectionMode: 'all',
     statusSyncMode: 'auto',
     pullMode: 'auto',
     pushMode: 'auto',
+    contentSyncMode: 'off',
+    archiveSyncMode: 'off',
+    priorityMapping: {
+      toProvider: { P0: '1', P1: '2', P2: '3', P3: '3', P4: '4', P5: '4', P6: '0' },
+      toLocal: { '0': 'P6', '1': 'P0', '2': 'P1', '3': 'P2', '4': 'P4' },
+    },
+    categoryMapping: { toProvider: { feature: null, bug: null, chore: null }, toLocal: {} },
     mirrorSubissues: true,
     conflictMode: 'auto',
+    pushTarget: true,
     stateMapping: { s1: 'idea', s2: 'ready' },
     lastSyncAt: '2026-07-30T10:00:00.000Z',
     lastSyncLog: [],
@@ -100,32 +121,44 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockConnections.mockResolvedValue([]);
   mockSubscribe.mockReturnValue({ unsubscribe: vi.fn() });
+  mockMappings.mockResolvedValue([]);
+  mockWizardGroups.mockResolvedValue({ sections: [] });
   mockProjectsGetAll.mockResolvedValue({ success: true, data: PROJECTS });
   useNavigationStore.setState({ activeProjectId: 7 });
 });
 
 describe('TrackerIntegrationSection', () => {
-  it('renders exactly the Linear and Plane rows', async () => {
+  it('renders exactly the catalog rows and nothing else', async () => {
     render(<TrackerIntegrationSection />);
 
     expect(await screen.findByText('Linear')).toBeInTheDocument();
     expect(screen.getByText('Plane')).toBeInTheDocument();
+    expect(screen.getByText('Dart')).toBeInTheDocument();
     // No GitHub/Jira/Slack rows survive from the prototype.
     expect(screen.queryByText('GitHub')).not.toBeInTheDocument();
     expect(screen.queryByText('Jira')).not.toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(2);
+    // Counted off the catalog rather than restated: the section is data-driven,
+    // so adding a provider must not require editing an arithmetic literal here.
+    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(
+      TRACKER_PROVIDERS.length,
+    );
   });
 
-  it('shows Connected + Manage for a connected provider and leaves its sibling connectable', async () => {
+  it('shows Connected + Manage for a connected provider and drops its Connect CTA', async () => {
     stubConnections({ 7: [makeConnection()] });
     render(<TrackerIntegrationSection />);
 
     expect(await screen.findByText('Connected')).toBeInTheDocument();
     expect(screen.getByText('Cyboflow')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Manage' })).toBeInTheDocument();
-    // Plane is still the one connectable row: Linear's active project is taken.
-    expect(screen.getByText('Not connected')).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(1);
+    // Only Linear's active project is taken, so every OTHER row stays connectable.
+    expect(screen.getAllByText('Not connected')).toHaveLength(TRACKER_PROVIDERS.length - 1);
+    // Linear's own row loses Connect: further mappings on an existing
+    // authorization are added through Manage (add-mapping mode), and a standing
+    // Connect would mint a second workspace when the user means another mapping.
+    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(
+      TRACKER_PROVIDERS.length - 1,
+    );
   });
 
   it('lists a connection on a NON-active project with its project chip', async () => {
@@ -136,8 +169,11 @@ describe('TrackerIntegrationSection', () => {
     expect(await screen.findByText('Connected')).toBeInTheDocument();
     expect(screen.getByText('Website')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Manage' })).toBeInTheDocument();
-    // The ACTIVE project still has no Plane connection, so both rows keep Connect.
-    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(2);
+    // The hide rule is per PROVIDER, not per project: Plane is connected
+    // (wherever), so its Connect goes; the untouched providers keep theirs.
+    expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(
+      TRACKER_PROVIDERS.length - 1,
+    );
   });
 
   it('renders a paused connection as a warning, never green', async () => {
@@ -184,5 +220,31 @@ describe('TrackerIntegrationSection', () => {
 
     expect(await screen.findByTestId('tracker-wizard-modal')).toBeInTheDocument();
     expect(screen.getByText('/ Connect Linear')).toBeInTheDocument();
+  });
+
+  it('stacks the add-mapping wizard over the connected view that launched it', async () => {
+    const connection = makeConnection();
+    stubConnections({ 7: [connection] });
+    mockMappings.mockResolvedValue([connection]);
+    render(<TrackerIntegrationSection />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage' }));
+    // The manage view resolves the sibling rows' project chips through the
+    // catalog's own name lookup, so the section must hand it `projectName`.
+    expect(await screen.findByTestId('tracker-mappings-card')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('tracker-add-mapping'));
+
+    // The wizard opens in add-mapping mode — no Connect step, no key prompt —
+    // and against the connection Manage was opened on.
+    expect(await screen.findByTestId('tracker-wizard-modal')).toBeInTheDocument();
+    expect(screen.getByText('/ Add a Linear mapping')).toBeInTheDocument();
+    expect(screen.queryByTestId('tracker-step-0')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(mockWizardGroups).toHaveBeenCalledWith({ connectionId: 'conn-1' }),
+    );
+
+    // Both surfaces stay mounted: dismissing the wizard lands back on the card.
+    expect(screen.getByTestId('tracker-mappings-card')).toBeInTheDocument();
   });
 });

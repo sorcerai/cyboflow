@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { ExternalLink, Copy, Check } from 'lucide-react';
+import { ExternalLink, Copy, Check, CheckCircle2 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { API } from '../../utils/api';
@@ -29,18 +29,23 @@ function parseGitHubCompareUrl(remoteUrl: string, branchName: string): string | 
   return null;
 }
 
-type Step = 'confirm' | 'pushing' | 'fallback';
+// 'closeout' replaces the old unconditional delete-on-push: the branch is
+// pushed either way, but archiving the session is a separate choice — the
+// agent may still want the worktree around while the PR is reviewed.
+type Step = 'confirm' | 'pushing' | 'fallback' | 'closeout';
 
 export function SessionCreatePrDialog({ isOpen, onClose, sessionId, sessionName, onSuccess }: SessionCreatePrDialogProps) {
   const [step, setStep] = useState<Step>('confirm');
   const [fallbackBranch, setFallbackBranch] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isStamping, setIsStamping] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       setStep('confirm');
       setFallbackBranch(null);
       setCopied(false);
+      setIsStamping(false);
     }
   }, [isOpen]);
 
@@ -73,10 +78,13 @@ export function SessionCreatePrDialog({ isOpen, onClose, sessionId, sessionName,
       const compareUrl = parseGitHubCompareUrl(remoteUrl, branchName);
 
       if (compareUrl) {
+        // Push succeeded and GitHub is open with the compare view — the PR
+        // side of this dialog's job is done. Whether the SESSION gets
+        // archived is a separate question, asked next in 'closeout'; do NOT
+        // delete or fire onSuccess here (onSuccess also closes this dialog
+        // from CyboflowRoot, which would skip that choice entirely).
         await window.electronAPI.openExternal(compareUrl);
-        await API.sessions.delete(sessionId);
-        onSuccess?.();
-        onClose();
+        setStep('closeout');
       } else {
         setFallbackBranch(branchName);
         setStep('fallback');
@@ -88,15 +96,55 @@ export function SessionCreatePrDialog({ isOpen, onClose, sessionId, sessionName,
       });
       setStep('confirm');
     }
+  }, [sessionId]);
+
+  // The manual-PR fallback's "Done" no longer archives directly either — the
+  // branch is already pushed at this point, so it proceeds to the same
+  // closeout choice as the GitHub-compare path.
+  const handleFallbackDone = useCallback(() => {
+    setStep('closeout');
+  }, []);
+
+  const handleMarkComplete = useCallback(async () => {
+    setIsStamping(true);
+    try {
+      const stampResult = await API.sessions.markComplete(sessionId);
+      if (!stampResult.success) {
+        // Do NOT delete on a failed stamp — dismissing anyway would silently
+        // discard the findings this whole flow exists to preserve.
+        useErrorStore.getState().showError({
+          title: 'Mark complete failed',
+          error: stampResult.error ?? 'Unknown error',
+        });
+        return;
+      }
+      const deleteResult = await API.sessions.delete(sessionId);
+      if (!deleteResult.success) {
+        useErrorStore.getState().showError({
+          title: 'Dismiss failed',
+          error: deleteResult.error ?? 'Unknown error',
+        });
+        return;
+      }
+      onSuccess?.();
+      onClose();
+    } catch (err) {
+      useErrorStore.getState().showError({
+        title: 'Mark complete failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setIsStamping(false);
+    }
   }, [sessionId, onSuccess, onClose]);
 
-  const handleFallbackDone = useCallback(async () => {
-    try {
-      await API.sessions.delete(sessionId);
-    } catch { /* best-effort cleanup */ }
-    onSuccess?.();
+  // Leave the session (and its worktree + findings) exactly as-is. The PR
+  // itself was already created/pushed in the prior step, so this is purely
+  // about NOT archiving — no delete, no onSuccess "Pull request created"
+  // toast tied to an archive that never happened.
+  const handleKeepOpen = useCallback(() => {
     onClose();
-  }, [sessionId, onSuccess, onClose]);
+  }, [onClose]);
 
   const handleCopyBranch = useCallback(async () => {
     if (!fallbackBranch) return;
@@ -147,7 +195,35 @@ export function SessionCreatePrDialog({ isOpen, onClose, sessionId, sessionName,
               </button>
             </div>
             <div className="flex justify-end">
-              <Button onClick={() => void handleFallbackDone()}>Done</Button>
+              <Button onClick={handleFallbackDone}>Done</Button>
+            </div>
+          </div>
+        )}
+
+        {step === 'closeout' && (
+          <div>
+            <div className="flex items-center gap-2 mb-3 text-status-success">
+              <CheckCircle2 size={18} />
+              <span className="text-sm font-medium text-text-primary">Branch pushed.</span>
+            </div>
+            <p className="text-sm text-text-secondary mb-4">
+              The branch is pushed either way — this only decides whether to close the session
+              out now. Mark complete keeps the findings its runs produced (they describe code
+              that is now pushed); keeping the session open leaves the worktree and findings
+              untouched while the PR is reviewed.
+            </p>
+            <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+              <Button variant="secondary" onClick={handleKeepOpen} disabled={isStamping}>
+                Keep session open
+              </Button>
+              <Button
+                data-testid="create-pr-mark-complete"
+                onClick={() => void handleMarkComplete()}
+                loading={isStamping}
+                loadingText="Marking complete..."
+              >
+                Mark complete
+              </Button>
             </div>
           </div>
         )}

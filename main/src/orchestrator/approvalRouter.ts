@@ -54,6 +54,7 @@ import {
   resolvePermissionReviewItem,
   resolveReviewItemById,
   hasReviewItemsTable,
+  setPermissionReviewItemBlocking,
 } from './reviewItemListing';
 import { emitReviewItemChangedById } from './reviewItemRouter';
 
@@ -231,6 +232,17 @@ export class ApprovalRouter extends EventEmitter {
    *                       review_item (default 'approval'; the interactive shell
    *                       path passes 'approval:interactive'). Optional so every
    *                       existing SDK caller is unchanged.
+   * @param onCreated    - Invoked with the minted approvalId the moment the row
+   *                       is committed, so a caller that must ADDRESS the
+   *                       approval later can. Only the omp-sdk lane needs this:
+   *                       its gate hangs up at ~25s and must then mark the ask
+   *                       {@link setAwaited}(false), which requires the id. The
+   *                       promise this method returns carries only the decision,
+   *                       and 'approvalCreated' cannot be correlated back to one
+   *                       call without racing a concurrent sibling. Fired inside
+   *                       the queue task, before the event: a throw here would
+   *                       break the grab, so it is wrapped by the caller-facing
+   *                       contract "must not throw".
    */
   async requestApproval(
     runId: string,
@@ -238,6 +250,7 @@ export class ApprovalRouter extends EventEmitter {
     input: Record<string, unknown>,
     socketReply: (decision: ApprovalDecision) => void,
     source: string = 'approval',
+    onCreated?: (approvalId: string) => void,
   ): Promise<ApprovalDecision> {
     if (!this.db) throw new Error('ApprovalRouter db handle undefined');
 
@@ -341,6 +354,19 @@ export class ApprovalRouter extends EventEmitter {
             resolve: resolveDecision,
             reject: rejectDecision,
           });
+          // Hand the id to the caller BEFORE the event: the omp lane records it
+          // on its deferred entry, and its gate can hang up ~25s later, so the
+          // entry must already know which approval it owns. Fail-soft — a
+          // caller's bookkeeping error must never roll back a committed grab.
+          if (onCreated) {
+            try {
+              onCreated(approvalId);
+            } catch (err) {
+              console.warn(
+                `[ApprovalRouter] onCreated callback threw for approval ${approvalId}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
           // Notify renderer subscribers (e.g. the review queue UI).
           this.emit('approvalCreated', request);
           return 'grabbed';
@@ -465,9 +491,33 @@ export class ApprovalRouter extends EventEmitter {
       const now = new Date().toISOString();
 
       if (decision.behavior === 'allow') {
+        // The status test is a LIVENESS proof, not a state machine step: it must
+        // pass for a run that is still going and fail for one that is canceled /
+        // completed / failed, because the point is never to revive a dead run.
+        //
+        // 'running' is accepted alongside 'awaiting_review' because
+        // {@link orphanPendingForRun} hands the gate back while the approval
+        // stays pending — the omp-sdk lane's whole premise. Under the older
+        // one-status test a human approving an orphaned ask read as "the run was
+        // canceled", and their YES was silently converted into a deny. No other
+        // caller can observe the widening: on every other transport the run is in
+        // 'awaiting_review' at respond() time, and before orphaning existed the
+        // only path to 'running' with a live pending entry was a cancel that
+        // settled the entry first.
+        // 'stuck' is accepted alongside these for the same reason 'running' is:
+        // it is a NON-terminal state everywhere else in the system (runLauncher's
+        // live-run set, runRecovery), and it is precisely the state a human's
+        // answer exists to clear. StuckDetector marks a run stuck after 5 minutes
+        // of a stale pending approval — SHORTER than the ~30 minutes the OMP gate
+        // now gives a human to decide — so without this an OMP approval answered
+        // after ~6 minutes had the human's YES converted into a synthetic deny.
+        // Observed live on 2026-08-21: run marked stuck (cross_run_deadlock) at
+        // 5m23s, approved at 6m14s, recorded 'rejected' by 'auto-policy'.
         const updateStmt = this.db.prepare(
-          `UPDATE workflow_runs SET status = 'running', updated_at = ?
-           WHERE id = ? AND status = 'awaiting_review'`,
+          `UPDATE workflow_runs
+              SET status = 'running', updated_at = ?,
+                  stuck_reason = NULL, stuck_detected_at = NULL
+           WHERE id = ? AND status IN ('awaiting_review', 'running', 'stuck')`,
         );
         const info = updateStmt.run(now, request.runId) as { changes: number };
 
@@ -508,10 +558,14 @@ export class ApprovalRouter extends EventEmitter {
         // deny: transition workflow_runs back to 'running' so the agent can
         // retry with a different tool/approach. The user denied this specific
         // call, not the entire run. Guarded UPDATE so a concurrent cancel
-        // wins — if the run is no longer awaiting_review, it stays where it is.
+        // wins — if the run is terminal, it stays where it is. 'stuck' revives
+        // for the same reason it does on the allow path above: the human just
+        // answered, which is the event that unblocks it.
         this.db.prepare(
-          `UPDATE workflow_runs SET status = 'running', updated_at = ?
-           WHERE id = ? AND status = 'awaiting_review'`,
+          `UPDATE workflow_runs
+              SET status = 'running', updated_at = ?,
+                  stuck_reason = NULL, stuck_detected_at = NULL
+           WHERE id = ? AND status IN ('awaiting_review', 'stuck')`,
         ).run(now, request.runId);
 
         this.db.prepare(
@@ -621,6 +675,114 @@ export class ApprovalRouter extends EventEmitter {
       restoreRunning: true,
       denyMessage: 'Approval requester disconnected before a decision was made',
     });
+  }
+
+  /**
+   * Hand the run's gate back WITHOUT settling its pending approvals.
+   *
+   * The third disposition, alongside {@link clearPendingForRun} (the run is
+   * gone) and {@link abandonPendingForRun} (the requester is gone AND the ask is
+   * void). Here the requester is gone but THE ASK IS STILL LIVE: the OMP gate's
+   * human-decision budget expired, and the human has simply not answered yet.
+   *
+   * WHY THIS EXISTS. `abandonPendingForRun` settles every pending approval as a
+   * system deny, which on the omp-sdk lane means the human is given ~25 seconds
+   * to answer before cyboflow answers "no" on their behalf — measured live on
+   * 2026-08-19 as 17 approvals, 17 system rejections, zero human verdicts. That
+   * is correct for a `preToolUseShellHook` subprocess that DIED (nothing will
+   * ever consume the verdict) and wrong for an OMP gate that merely stopped
+   * waiting: OMP's 30s extension-handler cap bounds how long the REQUESTER can
+   * block, not how long the QUESTION stays worth asking. This method keeps the
+   * approvals row `pending`, keeps the in-memory entry so a later `respond()`
+   * still resolves it, and keeps the folded review_item in the inbox — the card
+   * stays put until a human decides, which is the router's own documented
+   * invariant (§5: "Approvals do NOT auto-expire").
+   *
+   * WHAT IT DELIBERATELY GIVES UP. The single-pending-per-run model is a
+   * consequence of run status: `requestApproval`'s guarded UPDATE only INSERTs
+   * while the run is 'running', and a pending approval holds it in
+   * 'awaiting_review'. Restoring 'running' with a row still pending therefore
+   * lets a SECOND approval exist for the same run. That is the intended trade —
+   * the alternative is the wedge `abandonPendingForRun` documents, where no
+   * approval is ever INSERTed again — and the caller is responsible for not
+   * multiplying cards for the SAME call (mcpQueryHandler re-attaches a retry to
+   * the orphaned approval rather than opening a new one).
+   *
+   * Terminal cleanup is unchanged: `clearPendingForRun`'s DB sweep settles any
+   * row orphaned this way when the run finally ends, so nothing leaks.
+   */
+  orphanPendingForRun(runId: string): void {
+    // Guarded exactly like the restore in settlePendingForRun: a run that
+    // concurrently went canceled/completed/failed is never revived, and a DB
+    // error must not propagate into the socket-disconnect handler calling us.
+    try {
+      this.db.prepare(
+        `UPDATE workflow_runs SET status = 'running', updated_at = ?
+         WHERE id = ? AND status = 'awaiting_review'`,
+      ).run(new Date().toISOString(), runId);
+    } catch (err) {
+      console.warn(
+        `[ApprovalRouter] orphanPendingForRun: run-status restore failed for run ${runId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Record whether anything is actually blocked on a pending approval.
+   *
+   * "Pending" used to mean one thing — an agent is halted right here — because
+   * every transport held its requester for the whole decision window. The
+   * omp-sdk lane broke that: OMP kills an extension handler at 30s, so the gate
+   * hangs up at ~25s and tells the model to retry, and from that moment until
+   * the next retry NOBODY is waiting. The row stays pending because the verdict
+   * is still collectable (a live smoke on 2026-08-20 had a human decision made
+   * ~5 minutes later replay into a retry in a LATER turn and execute), but the
+   * queue was still painting it as a halted agent — a red "blocked Nm" badge on
+   * a run that had long since moved on.
+   *
+   * This is the reason there is no expiry sweep here. A TTL was the obvious
+   * reaper and it is the wrong tool: short enough to keep the queue tidy is
+   * short enough to destroy the cross-turn replay, and long enough to preserve
+   * it barely reaps. §5's "approvals do NOT auto-expire" stands; what changes is
+   * only what the surfaces are told.
+   *
+   * Writes BOTH halves of the truth in one place — `approvals.awaited` (which
+   * feeds the approvals-derived cards) and the folded permission review_item's
+   * `blocking` flag (which feeds the inbox counters) — because they are read by
+   * different surfaces and disagreeing is worse than either being wrong.
+   *
+   * IDEMPOTENT and guarded on `status='pending'`: re-marking the current value
+   * writes nothing and emits nothing, so the model's retry storm (measured at
+   * one attempt every ~30s) cannot spam the renderer. A decided/vanished
+   * approval is a silent no-op.
+   */
+  setAwaited(approvalId: string, awaited: boolean): void {
+    if (!this.db) return;
+    try {
+      const now = new Date().toISOString();
+      const info = this.db
+        .prepare(
+          `UPDATE approvals SET awaited = ?
+            WHERE id = ? AND status = 'pending' AND awaited != ?`,
+        )
+        .run(awaited ? 1 : 0, approvalId, awaited ? 1 : 0) as { changes: number };
+      if (info.changes === 0) return;
+
+      const reviewItemId = setPermissionReviewItemBlocking(this.db, approvalId, awaited, now);
+      if (reviewItemId !== null) emitReviewItemChangedById(this.db, reviewItemId, 'mutated');
+
+      // Re-announce the approval so the review-queue store refreshes the row it
+      // already holds. There is no dedicated "approval updated" channel, and
+      // 'approvalCreated' is the one that carries a whole Approval — the store's
+      // addApproval upserts by id, and the bridge re-reads `awaited` from the
+      // row we just wrote, so the delta lands without a third subscription.
+      const entry = this.pending.get(approvalId);
+      if (entry) this.emit('approvalCreated', entry.request);
+    } catch (err) {
+      console.warn(
+        `[ApprovalRouter] setAwaited(${approvalId}, ${String(awaited)}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**

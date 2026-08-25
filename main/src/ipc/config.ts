@@ -8,6 +8,10 @@ import {
   resolveAgentProviderAccess,
 } from '../../../shared/types/agentRuntime';
 import { ALL_EFFORT_LEVELS } from '../../../shared/types/reasoningEffort';
+import {
+  clampSprintMaxTasks,
+  type SprintMaxTasksOverrides,
+} from '../../../shared/types/sprintBatch';
 import { PERMISSION_MODES } from '../../../shared/types/workflows';
 
 const runTypeDefaultsFields = {
@@ -65,9 +69,33 @@ export function registerConfigHandlers(ipcMain: IpcMain, { configManager, claude
       if (updates.agentProviderAccess !== undefined && !isAgentProviderAccess(updates.agentProviderAccess)) {
         return { success: false, error: 'Invalid agentProviderAccess payload' };
       }
-      const normalized = updates.agentProviderAccess === undefined
+      let normalized = updates.agentProviderAccess === undefined
         ? updates
         : { ...updates, agentProviderAccess: resolveAgentProviderAccess(updates.agentProviderAccess) };
+
+      // Same treatment for the sprint cap override: reject a malformed shape at
+      // the boundary, and STORE the clamped map so config.json never holds a 0 or
+      // a 10_000 that every reader would have to re-clamp. A member the caller
+      // clears (undefined / null) drops out entirely, which is how the UI resets a
+      // substrate back to its built-in default.
+      if (updates.sprintMaxTasks !== undefined) {
+        const patch: unknown = updates.sprintMaxTasks;
+        if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+          return { success: false, error: 'Invalid sprintMaxTasks payload' };
+        }
+        const raw = patch as Record<string, unknown>;
+        const clean: SprintMaxTasksOverrides = {};
+        for (const substrate of ['sdk', 'interactive'] as const) {
+          const value = raw[substrate];
+          if (value === undefined || value === null) continue;
+          const clamped = clampSprintMaxTasks(value);
+          if (clamped === null) {
+            return { success: false, error: `Invalid sprintMaxTasks.${substrate}: expected a number` };
+          }
+          clean[substrate] = clamped;
+        }
+        normalized = { ...normalized, sprintMaxTasks: clean };
+      }
 
       await configManager.updateConfig(normalized);
       

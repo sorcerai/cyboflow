@@ -1,13 +1,15 @@
 /**
- * CategoryTag (migration 059) + FlowMarker (session-attribution seam) unit
- * tests. markers.tsx otherwise has no direct test coverage — TaskCard/
- * BacklogPane exercise the other markers indirectly.
+ * CategoryTag (migration 059) + FlowMarker (session-attribution seam) +
+ * LedgerChip (idea component ledger, migration 101) unit tests. markers.tsx
+ * otherwise has no direct test coverage — TaskCard/BacklogPane exercise the
+ * other markers indirectly.
  */
 import '@testing-library/jest-dom';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
-import { CategoryTag, FlowMarker } from '../markers';
+import { CategoryTag, FlowMarker, LedgerChip, ledgerChipVisualState } from '../markers';
 import type { EntityCategory, FlowOverlay } from '../../../../../shared/types/tasks';
+import type { IdeaComponentState } from '../../../../../shared/types/ideaComponents';
 
 describe('CategoryTag', () => {
   it.each<[EntityCategory, string]>([
@@ -84,5 +86,68 @@ describe('FlowMarker', () => {
 
     render(<FlowMarker flow={flow({ runStatus: 'queued' })} />);
     expect(document.querySelector('.animate-ping')).toBeNull();
+  });
+});
+
+describe('LedgerChip', () => {
+  function component(over: Partial<IdeaComponentState> = {}): IdeaComponentState {
+    return {
+      component: 'prototype',
+      state: 'incomplete',
+      source: 'derived',
+      sourceRunId: null,
+      sourceSessionId: null,
+      builtAgainstVersion: null,
+      staleAt: null,
+      staleReason: null,
+      updatedAt: null,
+      ...over,
+    };
+  }
+
+  it('labels the chip from IDEA_COMPONENT_LABELS, not a re-derived string', () => {
+    render(<LedgerChip component={component({ component: 'idea-spec' })} />);
+    expect(screen.getByTestId('ledger-chip-idea-spec')).toHaveTextContent('Idea spec');
+  });
+
+  it('renders the success treatment for a complete component', () => {
+    render(<LedgerChip component={component({ state: 'complete' })} />);
+    const chip = screen.getByTestId('ledger-chip-prototype');
+    expect(chip).toHaveAttribute('data-ledger-state', 'complete');
+    expect(chip.className).toContain('status-success');
+  });
+
+  it('renders the muted, dashed treatment for a skipped component', () => {
+    render(<LedgerChip component={component({ state: 'skipped' })} />);
+    const chip = screen.getByTestId('ledger-chip-prototype');
+    expect(chip).toHaveAttribute('data-ledger-state', 'skipped');
+    expect(chip.className).toContain('border-dashed');
+  });
+
+  // THE regression guard: staleness is a separate axis from state, so an
+  // incomplete-with-prior-work component must never collapse into the same
+  // visual as one that was simply never started.
+  it('gives "needs review" (stale) a DIFFERENT treatment than "not started"', () => {
+    const { unmount } = render(
+      <LedgerChip component={component({ state: 'incomplete', staleAt: '2026-08-01T00:00:00Z' })} />,
+    );
+    const staleChip = screen.getByTestId('ledger-chip-prototype');
+    expect(staleChip).toHaveAttribute('data-ledger-state', 'needs-review');
+    expect(staleChip.className).toContain('status-warning');
+    const staleClassName = staleChip.className;
+    unmount();
+
+    render(<LedgerChip component={component({ state: 'incomplete', staleAt: null })} />);
+    const freshChip = screen.getByTestId('ledger-chip-prototype');
+    expect(freshChip).toHaveAttribute('data-ledger-state', 'not-started');
+    expect(freshChip.className).not.toBe(staleClassName);
+    expect(freshChip.className).not.toContain('status-warning');
+  });
+
+  it('ledgerChipVisualState resolves all four states from (state, staleAt)', () => {
+    expect(ledgerChipVisualState({ state: 'complete', staleAt: null })).toBe('complete');
+    expect(ledgerChipVisualState({ state: 'skipped', staleAt: null })).toBe('skipped');
+    expect(ledgerChipVisualState({ state: 'incomplete', staleAt: null })).toBe('not-started');
+    expect(ledgerChipVisualState({ state: 'incomplete', staleAt: '2026-08-01T00:00:00Z' })).toBe('needs-review');
   });
 });

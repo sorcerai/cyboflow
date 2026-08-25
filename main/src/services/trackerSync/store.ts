@@ -20,12 +20,14 @@
  *
  * Grouped into four sections mirroring the four tables:
  *   - Connections: insertConnection / getConnection / listConnections /
- *     updateConnectionSettings / connectionMatchesIdentity /
- *     findDisconnectedConnection / reactivateConnection / advanceCursor /
+ *     listConnectionsByIdentity / updateConnectionSettings /
+ *     connectionMatchesIdentity / findDisconnectedConnection /
+ *     storedSourceContainerId / reactivateConnection / advanceCursor /
  *     storeSecret / readSecret / clearSecret.
  *   - Links: upsertLink / getLinkByEntity / getLinkById / getLinkByExternal /
- *     listLinks / updateBaseline / markOrphaned / listLinksByParentExternal /
- *     listActiveLinksWithoutEntity / hasActiveLinkedDescendant.
+ *     findSiblingLinkForExternal / listLinks / updateBaseline / markOrphaned /
+ *     listLinksByParentExternal / listActiveLinksWithoutEntity /
+ *     hasActiveLinkedDescendant.
  *   - Outbox: enqueueOutbox / supersedeQueuedStateWrites / claimNextPending /
  *     resolveOutbox / listUnresolvedOutbox / findOutboxByClientKey /
  *     requeueInFlightAsAmbiguous.
@@ -62,13 +64,15 @@ export function insertConnection(db: Database.Database, row: NewConnectionRow): 
       `INSERT INTO tracker_connections (
          id, project_id, provider, status, workspace_id, workspace_name, actor_label,
          base_url, secret_ciphertext, source_json, selection_mode, selection_json,
-         state_mapping_json, status_sync_mode, pull_mode, push_mode,
+         state_mapping_json, status_sync_mode, pull_mode, push_mode, push_target,
+         content_sync_mode, archive_sync_mode, priority_mapping_json, category_mapping_json,
          mirror_subissues, conflict_mode,
          cursor_updated_at, cursor_external_id, last_sync_at, last_sync_log_json
        ) VALUES (
          @id, @project_id, @provider, @status, @workspace_id, @workspace_name, @actor_label,
          @base_url, @secret_ciphertext, @source_json, @selection_mode, @selection_json,
-         @state_mapping_json, @status_sync_mode, @pull_mode, @push_mode,
+         @state_mapping_json, @status_sync_mode, @pull_mode, @push_mode, @push_target,
+         @content_sync_mode, @archive_sync_mode, @priority_mapping_json, @category_mapping_json,
          @mirror_subissues, @conflict_mode,
          @cursor_updated_at, @cursor_external_id, @last_sync_at, @last_sync_log_json
        )
@@ -125,6 +129,16 @@ export interface ConnectionSettingsPatch {
   status_sync_mode?: TrackerConnectionRow['status_sync_mode'];
   pull_mode?: TrackerConnectionRow['pull_mode'];
   push_mode?: TrackerConnectionRow['push_mode'];
+  /** 0 | 1 — see TrackerConnectionRow.push_target (migration 110). */
+  push_target?: number;
+  /** Field write-back cadence (migration 118). */
+  content_sync_mode?: TrackerConnectionRow['content_sync_mode'];
+  /** Remote archive/trash cadence (migration 118). */
+  archive_sync_mode?: TrackerConnectionRow['archive_sync_mode'];
+  /** The priority mapping overlay JSON (migration 118); see priorityMapping.ts. */
+  priority_mapping_json?: string;
+  /** The category mapping overlay JSON (migration 118); see categoryMapping.ts. */
+  category_mapping_json?: string;
   mirror_subissues?: number;
   conflict_mode?: TrackerConnectionRow['conflict_mode'];
   source_json?: string | null;
@@ -144,6 +158,11 @@ const CONNECTION_SETTINGS_COLUMNS = [
   'status_sync_mode',
   'pull_mode',
   'push_mode',
+  'push_target',
+  'content_sync_mode',
+  'archive_sync_mode',
+  'priority_mapping_json',
+  'category_mapping_json',
   'mirror_subissues',
   'conflict_mode',
   'source_json',
@@ -183,17 +202,18 @@ export function updateConnectionSettings(
  * The base URL a provider addresses when `base_url` is NULL — i.e. what "no
  * base URL" actually means on the wire.
  *
- * Linear is cloud-only (its endpoint is baked into the adapter and the wizard
- * offers no field), so nothing can be equal to its default. Plane's wizard
- * PRE-FILLS the cloud origin, so one life of a cloud connection can store the
- * literal string while another stores NULL — the same instance, spelled two
- * ways. Mirrors planeAdapter.ts's own DEFAULT_BASE_URL; the two are the same
- * fact stated for two different purposes (addressing vs. identity), and a
- * self-hosted instance never collides with either.
+ * Linear and Dart are both cloud-only (each endpoint is baked into its adapter
+ * and the wizard offers no field), so nothing can be equal to their default.
+ * Plane's wizard PRE-FILLS the cloud origin, so one life of a cloud connection
+ * can store the literal string while another stores NULL — the same instance,
+ * spelled two ways. Mirrors planeAdapter.ts's own DEFAULT_BASE_URL; the two are
+ * the same fact stated for two different purposes (addressing vs. identity),
+ * and a self-hosted instance never collides with either.
  */
 const PROVIDER_DEFAULT_BASE_URL: Record<TrackerConnectionRow['provider'], string | null> = {
   linear: null,
   plane: 'https://api.plane.so',
+  dart: null,
 };
 
 /**
@@ -289,6 +309,18 @@ export function connectionMatchesIdentity(
  * canonicalize a URL, and matching the stored string verbatim would fork the
  * identity on a trailing slash.
  *
+ * `sourceContainerId` JOINED THE KEY with multi-project mapping (design doc
+ * "Multi-project mapping (rev 4)"): one workspace now legitimately owns SEVERAL
+ * retired rows in one project — one per mapped tracker group — and they differ
+ * in nothing but their source. Without this, re-connecting one group would
+ * revive whichever sibling was touched last and rewrite it onto the new source,
+ * stranding that sibling's links on a row now pointing somewhere else. The
+ * container is compared, not the whole selection, because it is the level a
+ * mapping is minted at; re-picking a NARROW under the same container is still
+ * the same mapping and still revives (a narrowed scope cannot strand a link —
+ * the cursor reset re-fetches it and the deletion sweep's point lookup
+ * distinguishes out-of-scope from deleted).
+ *
  * Only `disconnected` rows are candidates. An active or paused connection is
  * still the project's live connection for that workspace, and silently
  * repointing it from a wizard run would move someone else's links. A stored
@@ -305,6 +337,7 @@ export function findDisconnectedConnection(
   provider: TrackerConnectionRow['provider'],
   workspaceId: string,
   baseUrl: string | null,
+  sourceScope: StoredSourceScope,
 ): TrackerConnectionRow | null {
   const rows = db
     .prepare(
@@ -313,7 +346,191 @@ export function findDisconnectedConnection(
         ORDER BY updated_at DESC, id DESC`,
     )
     .all(projectId, provider, workspaceId) as TrackerConnectionRow[];
-  return rows.find((row) => connectionMatchesIdentity(row, workspaceId, baseUrl)) ?? null;
+  return (
+    rows.find(
+      (row) =>
+        connectionMatchesIdentity(row, workspaceId, baseUrl) &&
+        revivableSourceMatch(storedSourceScope(row), sourceScope),
+    ) ?? null
+  );
+}
+
+/**
+ * The source scope a row's persisted selection names — the FULL
+ * (containerId, narrowId, narrowKind) triple — or null when it has none (a row
+ * minted before a source was chosen, or an unparseable blob).
+ *
+ * All three keys matter for mapping identity: every Linear project group under
+ * one team shares the team's `containerId` and differs only in
+ * `narrowId`/`narrowKind`, so a container-only read would collapse distinct
+ * mappings into one. `narrowKind` defaults to 'all' the way
+ * parseSourceSelection's does, so a pre-narrowKind blob still yields a scope.
+ *
+ * `source_json` is the wizard's selection PLUS its display label on one blob
+ * (see TrackerSyncService.connect), so only these keys are read and everything
+ * else is ignored — the same by-name read parseSourceSelection does.
+ */
+export interface StoredSourceScope {
+  containerId: string;
+  narrowId: string;
+  narrowKind: string;
+}
+
+export function storedSourceScope(row: TrackerConnectionRow): StoredSourceScope | null {
+  if (row.source_json === null) return null;
+  try {
+    const parsed = JSON.parse(row.source_json) as {
+      containerId?: unknown;
+      narrowId?: unknown;
+      narrowKind?: unknown;
+    };
+    if (typeof parsed.containerId !== 'string' || typeof parsed.narrowId !== 'string') return null;
+    return {
+      containerId: parsed.containerId,
+      narrowId: parsed.narrowId,
+      narrowKind: typeof parsed.narrowKind === 'string' ? parsed.narrowKind : 'all',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Exact scope equality — the mapping-identity comparison connect() no-ops on. */
+export function sourceScopeEquals(a: StoredSourceScope | null, b: StoredSourceScope | null): boolean {
+  return (
+    a !== null &&
+    b !== null &&
+    a.containerId === b.containerId &&
+    a.narrowId === b.narrowId &&
+    a.narrowKind === b.narrowKind
+  );
+}
+
+/**
+ * Does a retired row's stored scope qualify it for revival under `incoming`?
+ *
+ * Exact equality, or the incoming scope strictly WIDENS the stored one:
+ *
+ *  - a whole-container scope (narrowId 'all') claims any narrow of the SAME
+ *    container — a legacy row pinned to a cycle/view/project narrow revives
+ *    into the team/project-wide mapping that contains it;
+ *  - a Dart SPACE scope claims a retired row pinned to one of its member
+ *    BOARDS (stored container "Engineering/Sprint" under incoming space
+ *    "Engineering") — pre-rev-4 Dart rows are board-scoped and the Map step
+ *    only offers the space now;
+ *  - a stored NULL scope (no source ever recorded) contradicts nothing and is
+ *    claimed by anything, matching the pre-scope-key behavior for such rows.
+ *
+ * Widening-only is the load-bearing property. Reviving rewrites the row onto
+ * the incoming scope, and a SUPERSET scope cannot strand a link: every
+ * retained link's issue stays fetchable and the reset cursor re-fetches from
+ * the beginning. A NARROWER or SIBLING incoming scope (a Linear project group
+ * arriving at another project group's retired row — same containerId,
+ * different narrowId) must NOT match: it would repoint the other mapping's
+ * links onto a row that no longer polls them, and mints its own row instead.
+ */
+function revivableSourceMatch(stored: StoredSourceScope | null, incoming: StoredSourceScope): boolean {
+  if (stored === null) return true;
+  if (sourceScopeEquals(stored, incoming)) return true;
+  if (incoming.narrowId === 'all' && incoming.containerId === stored.containerId) return true;
+  return (
+    incoming.narrowKind === 'space' && stored.containerId.startsWith(`${incoming.containerId}/`)
+  );
+}
+
+/**
+ * Make `winnerId` the ONE live push target for `(projectId, provider)` in a
+ * single atomic statement: the winner is armed and every other non-disconnected
+ * sibling is demoted.
+ *
+ * This is connect()'s enforcement of the invariant push_target exists for — at
+ * most one pusher per (project, provider) — and it deliberately spans WIZARD
+ * RUNS: a later run mapping a second tracker group into an already-mapped
+ * project would otherwise leave two armed rows, and one new idea would file two
+ * remote issues (writeBack.handleIdeaPush skips only push_target = 0).
+ */
+export function claimPushTarget(
+  db: Database.Database,
+  projectId: number,
+  provider: TrackerConnectionRow['provider'],
+  winnerId: string,
+): void {
+  db.prepare(
+    `UPDATE tracker_connections
+        SET push_target = CASE WHEN id = ? THEN 1 ELSE 0 END,
+            updated_at = datetime('now')
+      WHERE project_id = ? AND provider = ? AND status != 'disconnected'
+        AND push_target != (CASE WHEN id = ? THEN 1 ELSE 0 END)`,
+  ).run(winnerId, projectId, provider, winnerId);
+}
+
+/**
+ * Every (project, provider) pair holding MORE THAN ONE armed push target among
+ * its live rows — a state no connect() leaves behind, but one a ledger-wiped
+ * migration replay can manufacture: 105's table recreate predates 110, so a
+ * full replay drops push_target and 110 re-adds it at DEFAULT 1 on every row
+ * (see 110's header). Boot reconciliation reads this and demotes all but the
+ * oldest row per pair.
+ */
+export function listDuplicatePushTargets(
+  db: Database.Database,
+): { project_id: number; provider: TrackerConnectionRow['provider'] }[] {
+  return db
+    .prepare(
+      `SELECT project_id, provider FROM tracker_connections
+        WHERE status != 'disconnected' AND push_target = 1
+        GROUP BY project_id, provider
+       HAVING COUNT(*) > 1`,
+    )
+    .all() as { project_id: number; provider: TrackerConnectionRow['provider'] }[];
+}
+
+/** The live rows for one (project, provider) pair, oldest first. */
+export function listConnectionsForProviderProject(
+  db: Database.Database,
+  projectId: number,
+  provider: TrackerConnectionRow['provider'],
+): TrackerConnectionRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM tracker_connections
+        WHERE project_id = ? AND provider = ? AND status != 'disconnected'
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(projectId, provider) as TrackerConnectionRow[];
+}
+
+/**
+ * Every LIVE connection (active or paused) sharing one tracker identity —
+ * `(provider, workspace_id, base_url)`, across ALL projects.
+ *
+ * The fan-out set for a credential rotation. Multi-project mapping mints N
+ * sibling rows from one wizard run, each holding its OWN copy of the same
+ * encrypted key, so rotating the key on one of them would leave the others
+ * paused on a credential that no longer works — with no affordance to fix them
+ * except re-pasting the key once per mapping. One paste resumes all of them.
+ *
+ * Disconnected rows are excluded: their secret was deliberately cleared, and a
+ * rotation must not silently re-arm a connection the user retired.
+ *
+ * Base-URL comparison is the NORMALIZED one for the reason
+ * {@link findDisconnectedConnection} gives — sqlite cannot canonicalize a URL —
+ * so it runs in JS over the workspace-scoped candidate set.
+ */
+export function listConnectionsByIdentity(
+  db: Database.Database,
+  provider: TrackerConnectionRow['provider'],
+  workspaceId: string,
+  baseUrl: string | null,
+): TrackerConnectionRow[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM tracker_connections
+        WHERE provider = ? AND workspace_id = ? AND status != 'disconnected'
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(provider, workspaceId) as TrackerConnectionRow[];
+  return rows.filter((row) => connectionMatchesIdentity(row, workspaceId, baseUrl));
 }
 
 /**
@@ -348,6 +565,9 @@ export function reactivateConnection(
          selection_mode = @selection_mode, selection_json = @selection_json,
          state_mapping_json = @state_mapping_json,
          status_sync_mode = @status_sync_mode, pull_mode = @pull_mode, push_mode = @push_mode,
+         push_target = @push_target,
+         content_sync_mode = @content_sync_mode, archive_sync_mode = @archive_sync_mode,
+         priority_mapping_json = @priority_mapping_json, category_mapping_json = @category_mapping_json,
          mirror_subissues = @mirror_subissues, conflict_mode = @conflict_mode,
          cursor_updated_at = @cursor_updated_at, cursor_external_id = @cursor_external_id,
          last_sync_at = @last_sync_at, last_sync_log_json = @last_sync_log_json,
@@ -505,6 +725,68 @@ export function getLinkByExternal(
     .prepare('SELECT * FROM entity_external_links WHERE connection_id = ? AND external_id = ?')
     .get(connectionId, externalId) as EntityExternalLinkRow | undefined;
   return row ?? null;
+}
+
+/** {@link findSiblingLinkForExternal}'s lookup key — a tracker identity plus one issue. */
+export interface SiblingLinkQuery {
+  provider: EntityExternalLinkRow['provider'];
+  workspaceId: string;
+  baseUrl: string | null;
+  externalId: string;
+  /** The connection ASKING. Its own link is never its sibling. */
+  excludeConnectionId: string;
+}
+
+/**
+ * The link some OTHER live connection on the same tracker identity —
+ * `(provider, workspace_id, base_url)` — already holds for `externalId`, or
+ * null when the issue is unclaimed.
+ *
+ * The cross-scope duplicate-import guard (design doc "Multi-project mapping
+ * (rev 4)"). Mapped groups can OVERLAP by construction: a Linear team group and
+ * a project group beneath it both fetch the same issue, and a remote move
+ * between two mapped groups hands it to a second connection while the first
+ * still owns it. Either way the issue is already an idea in some cyboflow
+ * project, and importing it again would mint a second one that no local edit
+ * could ever reconcile — the two ideas would fight over one remote issue.
+ *
+ * Orphaned links do NOT claim: their remote issue was deleted/archived and
+ * applied locally, so a re-appearance is a fresh import, not a duplicate.
+ * `disconnected` connections do not claim either — a retired mapping's retained
+ * links exist only so a REVIVAL can re-bind them, and nothing else reads them.
+ *
+ * Base-URL comparison is the NORMALIZED one ({@link findDisconnectedConnection}
+ * explains why it cannot live in the WHERE clause), so it runs in JS over the
+ * workspace-scoped candidate set.
+ */
+export function findSiblingLinkForExternal(
+  db: Database.Database,
+  query: SiblingLinkQuery,
+): EntityExternalLinkRow | null {
+  const rows = db
+    .prepare(
+      `SELECT l.*, c.base_url AS connection_base_url FROM entity_external_links l
+         JOIN tracker_connections c ON c.id = l.connection_id
+        WHERE l.provider = ? AND l.external_id = ? AND l.orphaned_at IS NULL
+          AND l.connection_id != ?
+          AND c.workspace_id = ? AND c.status != 'disconnected'
+        ORDER BY l.created_at ASC, l.id ASC`,
+    )
+    .all(
+      query.provider,
+      query.externalId,
+      query.excludeConnectionId,
+      query.workspaceId,
+    ) as Array<EntityExternalLinkRow & { connection_base_url: string | null }>;
+  const hit = rows.find(
+    (row) =>
+      normalizeBaseUrl(query.provider, row.connection_base_url) ===
+      normalizeBaseUrl(query.provider, query.baseUrl),
+  );
+  // Re-read by id rather than hand back the joined row: the connection column
+  // was only ever an argument to the filter, and a link row with an extra key
+  // on it is a shape no caller should have to know about.
+  return hit === undefined ? null : getLinkById(db, hit.id);
 }
 
 /**
@@ -689,8 +971,8 @@ export function enqueueOutbox(db: Database.Database, input: EnqueueOutboxInput):
 }
 
 /**
- * Settle every still-QUEUED status write for `externalId` that `newRowId`
- * replaces, so a stale one can never reach the tracker after it.
+ * Settle every still-QUEUED write of one of `kinds` for `externalId` that
+ * `newRowId` replaces, so a stale one can never reach the tracker after it.
  *
  * WHY IT IS NEEDED AT ENQUEUE TIME. The drain is serial, so two writes are
  * never in flight at once — but they still land out of ORDER when the older one
@@ -712,15 +994,53 @@ export function enqueueOutbox(db: Database.Database, input: EnqueueOutboxInput):
  *     order.
  *   - `id < newRowId`, so this only ever settles rows the caller's own insert
  *     supersedes.
- *   - BOTH status kinds, deliberately not `kind` alone: `update_state` and
- *     `close_parent` move the SAME issue's state, so a later one of either kind
- *     states the truth the earlier one is now wrong about. Same key the enqueue
- *     dedupe uses.
+ *   - `kinds` is a SET, not the caller's own kind, because supersession is
+ *     about what a write SAYS rather than which code path enqueued it: see
+ *     {@link SUPERSEDING_KINDS} in outboxWorker for the table, and its header
+ *     for why content and state writes never cross-supersede while an archive
+ *     supersedes everything.
  *
  * `done` rather than `failed`: nothing went wrong and nothing is left to
- * attempt — the instruction was replaced. The reason is recorded on the row.
+ * attempt — the instruction was replaced. `reason` is recorded on the row.
  *
- * Returns how many rows were settled.
+ * Returns how many rows were settled. An EMPTY `kinds` settles nothing.
+ */
+export function supersedeQueuedWrites(
+  db: Database.Database,
+  connectionId: string,
+  externalId: string,
+  newRowId: number,
+  kinds: readonly TrackerOutboxRow['kind'][],
+  reason: string,
+): number {
+  if (kinds.length === 0) return 0;
+  // Parameterized IN list — the kinds are a closed union, but the placeholders
+  // keep this module's "no string-interpolated values in SQL" property intact.
+  const placeholders = kinds.map(() => '?').join(', ');
+  const result = db
+    .prepare(
+      `UPDATE tracker_outbox
+          SET state = 'done',
+              last_error = ?,
+              next_attempt_at = NULL,
+              updated_at = datetime('now')
+        WHERE connection_id = ? AND external_id = ? AND id < ?
+          AND state = 'pending'
+          AND kind IN (${placeholders})`,
+    )
+    .run(reason, connectionId, externalId, newRowId, ...kinds);
+  return result.changes;
+}
+
+/** The two kinds that both move ONE issue's state — see {@link supersedeQueuedWrites}. */
+const STATE_WRITE_KINDS: readonly TrackerOutboxRow['kind'][] = ['update_state', 'close_parent'];
+
+/**
+ * {@link supersedeQueuedWrites} for a newly-enqueued STATE write: it settles
+ * both status kinds, deliberately not `kind` alone, because `update_state` and
+ * `close_parent` move the SAME issue's state, so a later one of either kind
+ * states the truth the earlier one is now wrong about. Same key the enqueue
+ * dedupe uses.
  */
 export function supersedeQueuedStateWrites(
   db: Database.Database,
@@ -728,18 +1048,55 @@ export function supersedeQueuedStateWrites(
   externalId: string,
   newRowId: number,
 ): number {
+  return supersedeQueuedWrites(
+    db,
+    connectionId,
+    externalId,
+    newRowId,
+    STATE_WRITE_KINDS,
+    'superseded by a newer state write for the same issue',
+  );
+}
+
+/**
+ * Settle every PENDING row of `kinds` for a connection, whatever issue it
+ * addresses — the "a direction was turned OFF" sweep.
+ *
+ * WHY A TURNED-OFF DIRECTION MUST NOT JUST STOP DRAINING. `'off'` gates at the
+ * ENQUEUE (invariant 5 of docs/proposals/tracker-field-writeback.md) precisely
+ * because {@link claimNextPending} will never claim a kind whose direction is
+ * off — so a row enqueued while the mode was `auto`/`manual` and left behind by
+ * the flip is not merely delayed, it is UNDRAINABLE. And an undrainable row is
+ * not inert: `collectOutboxBlockers` is kind-agnostic, so the inbound batch
+ * halts at that issue on every pass, forever. Settling the strandable rows at
+ * the moment of the flip is what keeps turning a direction off from wedging
+ * the direction the user did NOT turn off.
+ *
+ * `in_flight` rows are deliberately left alone: their request is already out
+ * and their resolution stamps the baseline. `ambiguous` likewise — its outcome
+ * is unknown, and only the reconcile may speak for it.
+ *
+ * Returns how many rows were settled.
+ */
+export function cancelPendingKinds(
+  db: Database.Database,
+  connectionId: string,
+  kinds: readonly TrackerOutboxRow['kind'][],
+  reason: string,
+): number {
+  if (kinds.length === 0) return 0;
+  const placeholders = kinds.map(() => '?').join(', ');
   const result = db
     .prepare(
       `UPDATE tracker_outbox
           SET state = 'done',
-              last_error = 'superseded by a newer state write for the same issue',
+              last_error = ?,
               next_attempt_at = NULL,
               updated_at = datetime('now')
-        WHERE connection_id = ? AND external_id = ? AND id < ?
-          AND state = 'pending'
-          AND kind IN ('update_state', 'close_parent')`,
+        WHERE connection_id = ? AND state = 'pending'
+          AND kind IN (${placeholders})`,
     )
-    .run(connectionId, externalId, newRowId);
+    .run(reason, connectionId, ...kinds);
   return result.changes;
 }
 
@@ -830,6 +1187,42 @@ export function listUnresolvedOutbox(db: Database.Database, connectionId: string
         ORDER BY created_at ASC, id ASC`,
     )
     .all(connectionId) as TrackerOutboxRow[];
+}
+
+/**
+ * The client key of the CREATE that produced an entity's remote issue, or null
+ * when no create row records one (an issue this connection IMPORTED, so no
+ * cyboflow create ever ran for it).
+ *
+ * WHY THE OUTBOX IS THE RIGHT PLACE TO ASK. On a provider without idempotent
+ * creates, every issue this app creates carries a `cyboflow-sync: <clientKey>`
+ * recovery marker in its description, and an outbound BODY write-back has to
+ * re-append it (invariant 4 of docs/proposals/tracker-field-writeback.md) or
+ * `findIssueByClientKey`'s absence proof stops holding for that link. The
+ * marker's key is not on the link and is stripped from every description the
+ * adapters return, so the create row that minted it is the only durable record
+ * of it. Outbox rows are never pruned, so a long-settled create still answers.
+ *
+ * NEWEST FIRST: an entity re-created after an earlier create was orphaned
+ * carries the LATEST create's marker.
+ */
+export function findCreateClientKey(
+  db: Database.Database,
+  connectionId: string,
+  entityType: EntityExternalLinkRow['entity_type'],
+  entityId: string,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT client_key FROM tracker_outbox
+        WHERE connection_id = ? AND entity_type = ? AND entity_id = ?
+          AND kind IN ('create_issue', 'create_sub_issue')
+          AND client_key IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1`,
+    )
+    .get(connectionId, entityType, entityId) as { client_key: string } | undefined;
+  return row?.client_key ?? null;
 }
 
 /** Look up an outbox row by its client-generated idempotency key (outbox recovery). */

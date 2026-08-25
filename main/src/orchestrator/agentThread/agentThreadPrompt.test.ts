@@ -37,17 +37,34 @@ describe('agentThreadPrompt', () => {
       'cyboflow_fs_read',
       'cyboflow_fs_list',
       'cyboflow_fs_grep',
+      'cyboflow_history',
     ]) {
       expect(prompt).toContain(tool);
     }
   });
 
-  it('is dense but not padded — within the ~60-160 line target', () => {
+  it('is dense but not padded — within the ~60-230 line target', () => {
     // Ceiling widened from 130 → 160 when the "What cyboflow is" product
-    // overview + the cyboflow_reference tool bullet were added; the prompt now
-    // carries a compact feature summary on top of the tool/contract guidance.
+    // overview + the cyboflow_reference tool bullet were added, then 160 → 230
+    // when the "Recommending the right flow" section (decision map + compound
+    // pressure), the cyboflow_history tool bullet, and the launch-run seed
+    // semantics were added; the prompt now carries proactive flow-recommendation
+    // guidance on top of the tool/contract/recap guidance.
     const lines = getAgentSystemPrompt().split('\n').length;
     expect(lines).toBeGreaterThanOrEqual(60);
-    expect(lines).toBeLessThanOrEqual(160);
+    expect(lines).toBeLessThanOrEqual(230);
+  });
+
+  it('mentions recommending the right flow', () => {
+    expect(getAgentSystemPrompt()).toMatch(/recommending the right flow/i);
+  });
+
+  it('states the compound-pressure suggestion (findingIds seeding a Compound run)', () => {
+    // Anchored on the NEW section's own text — `findingIds` and "Compound"
+    // both pre-existed elsewhere in the prompt, so matching only those would
+    // pass even with the compound-pressure paragraph deleted.
+    const prompt = getAgentSystemPrompt();
+    expect(prompt).toMatch(/Compound pressure/);
+    expect(prompt).toMatch(/five or more open findings/i);
   });
 });

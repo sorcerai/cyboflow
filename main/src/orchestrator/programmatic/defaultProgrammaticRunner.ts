@@ -161,6 +161,13 @@ export interface DefaultProgrammaticRunnerDeps {
    */
   runOwnedIdeaIdsProvider?: (runId: string) => readonly string[];
   /**
+   * Repo paths a run's RUNBOOK BOOTSTRAP wrote
+   * (docs/proposals/lane-runbook-bootstrap.md §11), rendered as a do-not-touch
+   * list on address-review. Absent ⇒ no section, which is every run that did not
+   * bootstrap.
+   */
+  bootstrapProtectedPathsProvider?: (runId: string) => readonly string[];
+  /**
    * Per-step agent RUNTIME resolver (Codex-per-step mixing). Threaded to the
    * run's SpawnStepRunner as a run-bound thunk (`(agentKey) =>
    * resolveStepAgent(runId, agentKey)`) so a workflow-scoped agent config that
@@ -250,6 +257,8 @@ export class DefaultProgrammaticRunner implements ProgrammaticRunner {
     // guess. A raw-prompt Ship run starts with no seed_idea_id; its context turn
     // can create the idea whose flags later control ui-prototype / architecture.
     const runOwnedIdeaIds = (): readonly string[] => this.deps.runOwnedIdeaIdsProvider?.(ctx.runId) ?? [];
+    const bootstrapProtectedPaths = (): readonly string[] =>
+      this.deps.bootstrapProtectedPathsProvider?.(ctx.runId) ?? [];
 
     // Re-read the run's resolved approve-ideas gate verdicts per step (launch's
     // batch gate). Undefined until the human resolves the gate — pre-gate steps
@@ -312,6 +321,7 @@ export class DefaultProgrammaticRunner implements ProgrammaticRunner {
         runOwnedIdeaIds,
         approveIdeasDecisions,
         projectBrief,
+        bootstrapProtectedPaths,
         ...(resolveStepAgent ? { resolveStepAgent } : {}),
       },
       this.deps.logger,

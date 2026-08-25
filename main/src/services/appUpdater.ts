@@ -8,6 +8,37 @@ const EVENT_CHANNEL = 'updater:event';
 // 'available' event isn't dropped against a not-yet-ready webContents.
 const INITIAL_CHECK_DELAY_MS = 8_000;
 
+/** Parse the leading MAJOR.MINOR.PATCH of a version string; null if absent. */
+function releaseTriple(version: string): [number, number, number] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * True when `latest` is strictly newer than `current`.
+ *
+ * A plain `latest !== current` is wrong: the update feed can legitimately sit
+ * BEHIND the installed build (a dev build ahead of the published dev feed, or
+ * a stable feed rolled back), and electron-updater refuses to stage a
+ * downgrade. Offering one produces a Download button that can only ever fail
+ * with "Please check update first".
+ *
+ * Comparison is on the numeric release triple only. If the triples tie but the
+ * full strings differ (a prerelease/build suffix on one side), or either string
+ * has no parseable triple, fall back to inequality — cyboflow ships plain
+ * MAJOR.MINOR.PATCH today, and this keeps an unfamiliar future format
+ * offerable rather than silently unreachable.
+ */
+export function isNewerVersion(latest: string, current: string): boolean {
+  const a = releaseTriple(latest);
+  const b = releaseTriple(current);
+  if (!a || !b) return latest !== current;
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return latest !== current;
+}
+
 /**
  * Wraps electron-updater for cyboflow. Reads the generic update feed baked into
  * the packaged app-update.yml — which feed (.../stable vs .../dev) is fixed at
@@ -69,7 +100,7 @@ export class AppUpdater {
     try {
       const result = await autoUpdater.checkForUpdates();
       const latestVersion = result?.updateInfo?.version;
-      const updateAvailable = !!latestVersion && latestVersion !== currentVersion;
+      const updateAvailable = !!latestVersion && isNewerVersion(latestVersion, currentVersion);
       return { supported: true, currentVersion, updateAvailable, latestVersion };
     } catch (error) {
       this.logger?.error('[AppUpdater] check failed', error instanceof Error ? error : undefined);

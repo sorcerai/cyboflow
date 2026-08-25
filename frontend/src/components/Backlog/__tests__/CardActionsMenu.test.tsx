@@ -10,15 +10,17 @@
  * without a board.
  *
  * The tracker-sync local-removal ruling: Archive/Delete first ask
- * tracker.linkForEntity, an UNLINKED item goes straight to its confirm dialog,
- * a LINKED one gets TrackerUnlinkDialog first (and only reaches the confirm
- * dialog once a ruling was STAGED — never unlinkEntity, so backing out of the
- * confirm mutates nothing), a cascading idea/epic delete also asks
- * tracker.hasLinkedDescendants for the dialog's copy, and neither lookup
- * failing can block the delete. Backing out of the CONFIRM additionally CLEARS
- * the staged ruling (it is keyed by entity alone, so an abandoned one would stay
- * consumable by an unrelated later removal); a COMMITTED confirm does not, since
- * its own entity write already spent it.
+ * tracker.linksForEntity (EVERY live link, not just one), an item with an EMPTY
+ * link array goes straight to its confirm dialog, a LINKED one gets
+ * TrackerUnlinkDialog first — passed the whole link array so it can name every
+ * provider — (and only reaches the confirm dialog once a ruling was STAGED —
+ * never unlinkEntity, so backing out of the confirm mutates nothing), a
+ * cascading idea/epic delete also asks tracker.hasLinkedDescendants for the
+ * dialog's copy, and neither lookup failing can block the delete. Backing out
+ * of the CONFIRM additionally CLEARS the staged ruling (it is keyed by entity
+ * alone, so an abandoned one would stay consumable by an unrelated later
+ * removal); a COMMITTED confirm does not, since its own entity write already
+ * spent it.
  *
  * Reorder items (WCAG 2.5.7): Move up / Move down / Move to top appear only
  * when `onReorder` is wired, fire it with the right direction, and disable per
@@ -45,7 +47,7 @@ const {
   mockSetStage,
   mockArchive,
   mockDelete,
-  mockLinkForEntity,
+  mockLinksForEntity,
   mockHasLinkedDescendants,
   mockStageUnlinkRuling,
   mockClearUnlinkRuling,
@@ -54,7 +56,7 @@ const {
   mockSetStage: vi.fn(),
   mockArchive: vi.fn(),
   mockDelete: vi.fn(),
-  mockLinkForEntity: vi.fn(),
+  mockLinksForEntity: vi.fn(),
   mockHasLinkedDescendants: vi.fn(),
   mockStageUnlinkRuling: vi.fn(),
   mockClearUnlinkRuling: vi.fn(),
@@ -70,7 +72,7 @@ vi.mock('../../../trpc/client', () => ({
         delete: { mutate: mockDelete },
       },
       tracker: {
-        linkForEntity: { query: mockLinkForEntity },
+        linksForEntity: { query: mockLinksForEntity },
         hasLinkedDescendants: { query: mockHasLinkedDescendants },
         stageUnlinkRuling: { mutate: mockStageUnlinkRuling },
         clearUnlinkRuling: { mutate: mockClearUnlinkRuling },
@@ -143,7 +145,7 @@ beforeEach(() => {
   mockArchive.mockReset().mockResolvedValue({ taskId: 'tsk_1' });
   mockDelete.mockReset().mockResolvedValue({ taskId: 'tsk_1' });
   // The overwhelmingly common case: nothing on this board is tracker-synced.
-  mockLinkForEntity.mockReset().mockResolvedValue(null);
+  mockLinksForEntity.mockReset().mockResolvedValue([]);
   mockHasLinkedDescendants.mockReset().mockResolvedValue(false);
   mockStageUnlinkRuling.mockReset().mockResolvedValue({ ok: true });
   mockClearUnlinkRuling.mockReset().mockResolvedValue({ ok: true });
@@ -247,26 +249,33 @@ describe('CardActionsMenu', () => {
       provider: 'linear' as const,
       externalIdentifier: 'CORE-142',
       externalUrl: 'https://linear.app/acme/issue/CORE-142',
+      removalAction: 'archive' as const,
+    };
+    const DART_LINK = {
+      provider: 'dart' as const,
+      externalIdentifier: 'DART-7',
+      externalUrl: 'https://app.itsdart.com/t/DART-7',
+      removalAction: 'archive' as const,
     };
 
     it('asks for the link on the CLICK, and an unlinked item deletes with no extra dialog', async () => {
       render(<CardActionsMenu task={makeTask()} />);
       // Nothing is asked while the card just sits there.
-      expect(mockLinkForEntity).not.toHaveBeenCalled();
+      expect(mockLinksForEntity).not.toHaveBeenCalled();
 
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
 
       expect(await screen.findByTestId('delete-confirm-dialog')).toBeInTheDocument();
       expect(screen.queryByTestId('tracker-unlink-dialog')).not.toBeInTheDocument();
-      expect(mockLinkForEntity).toHaveBeenCalledTimes(1);
-      expect(mockLinkForEntity).toHaveBeenCalledWith({ entityType: 'task', entityId: 'tsk_1' });
+      expect(mockLinksForEntity).toHaveBeenCalledTimes(1);
+      expect(mockLinksForEntity).toHaveBeenCalledWith({ entityType: 'task', entityId: 'tsk_1' });
       expect(mockStageUnlinkRuling).not.toHaveBeenCalled();
       expect(mockUnlinkEntity).not.toHaveBeenCalled();
     });
 
     it('a LINKED item gets the ruling first; "Keep" STAGES and then opens the delete confirm', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -288,14 +297,34 @@ describe('CardActionsMenu', () => {
       expect(screen.queryByTestId('tracker-unlink-dialog')).not.toBeInTheDocument();
     });
 
-    it('"Cancel in <provider>" stages cancelRemote and then opens the archive confirm', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+    it('an entity linked to TWO providers discloses both in the ruling dialog', async () => {
+      // The regression this route rename fixed: linkForEntity used to return
+      // only the FIRST provider's link, so the dialog said "Archive in Linear"
+      // while handleLocalRemoval/unlinkEntity would ALSO trash the Dart task,
+      // undisclosed. linksForEntity returns every live link, and the dialog now
+      // gets the whole array.
+      mockLinksForEntity.mockResolvedValue([LINK, DART_LINK]);
+      render(<CardActionsMenu task={makeTask()} />);
+      fireEvent.click(screen.getByTestId('task-actions-trigger'));
+      fireEvent.click(screen.getByText('Delete'));
+
+      const dialog = await screen.findByTestId('tracker-unlink-dialog');
+      expect(dialog).toHaveTextContent('CORE-142');
+      expect(dialog).toHaveTextContent('DART-7');
+      expect(screen.getByTestId('tracker-unlink-keep')).toHaveTextContent('Keep in Linear and Dart');
+      expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
+        'Archive in Linear and Dart',
+      );
+    });
+
+    it('"Archive in <provider>" stages cancelRemote and then opens the archive confirm', async () => {
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask({ type: 'idea', id: 'ide_9' })} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Archive'));
 
       expect(await screen.findByTestId('tracker-unlink-dialog')).toBeInTheDocument();
-      expect(mockLinkForEntity).toHaveBeenCalledWith({ entityType: 'idea', entityId: 'ide_9' });
+      expect(mockLinksForEntity).toHaveBeenCalledWith({ entityType: 'idea', entityId: 'ide_9' });
       // An archive cascades into nothing, so the children question is not asked.
       expect(mockHasLinkedDescendants).not.toHaveBeenCalled();
 
@@ -315,7 +344,7 @@ describe('CardActionsMenu', () => {
       // consumable for its whole TTL, so an answer the user backed out of here
       // could be spent by an unrelated later archive/delete of the same entity
       // — cancelling a tracker issue they explicitly declined to cancel.
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -340,7 +369,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('COMPLETING the delete does NOT clear — its own entity write spent the ruling', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -359,7 +388,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('a FAILED confirm keeps the ruling until the user actually backs out', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       mockArchive.mockRejectedValueOnce(new Error('active_runs: cancel the run first'));
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
@@ -394,7 +423,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('asks about synced children for a cascading idea/epic DELETE only', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       mockHasLinkedDescendants.mockResolvedValue(true);
       render(<CardActionsMenu task={makeTask({ type: 'idea', id: 'ide_9' })} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
@@ -409,7 +438,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('never asks about children for a TASK — nothing cascades under one', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -419,7 +448,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('dismissing the ruling abandons the delete entirely', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -437,7 +466,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('a failing link lookup never blocks the delete', async () => {
-      mockLinkForEntity.mockRejectedValue(new Error('PRECONDITION_FAILED'));
+      mockLinksForEntity.mockRejectedValue(new Error('PRECONDITION_FAILED'));
       render(<CardActionsMenu task={makeTask()} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));
       fireEvent.click(screen.getByText('Delete'));
@@ -447,7 +476,7 @@ describe('CardActionsMenu', () => {
     });
 
     it('a failing children lookup never blocks the delete either', async () => {
-      mockLinkForEntity.mockResolvedValue(LINK);
+      mockLinksForEntity.mockResolvedValue([LINK]);
       mockHasLinkedDescendants.mockRejectedValue(new Error('PRECONDITION_FAILED'));
       render(<CardActionsMenu task={makeTask({ type: 'idea', id: 'ide_9' })} />);
       fireEvent.click(screen.getByTestId('task-actions-trigger'));

@@ -1,6 +1,6 @@
-import { execSync, ExtendedExecSyncOptions } from '../utils/commandExecutor';
-import { runGitAsync, RunGitOptions } from '../utils/runGit';
+import { runGit, runGitAsync, RunGitOptions, END_OF_OPTIONS } from '../utils/runGit';
 import * as fs from 'fs';
+import * as nodePath from 'path';
 
 /**
  * Optimized git commands using plumbing (low-level) commands
@@ -159,8 +159,14 @@ export async function fastGetAheadBehind(
   }
 
   try {
-    // Arg-array form also kills the shell-injection/quoting risk baseBranch used to carry.
-    const result = (await runGitAsync(cwd, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`], options)).trim();
+    // Arg-array form also kills the shell-injection/quoting risk baseBranch used
+    // to carry; END_OF_OPTIONS additionally stops a branch named `--foo` from
+    // reaching git's option parser.
+    const result = (await runGitAsync(
+      cwd,
+      ['rev-list', '--left-right', '--count', END_OF_OPTIONS, `${baseBranch}...HEAD`],
+      options,
+    )).trim();
 
     const [behind, ahead] = result.split('\t').map(n => parseInt(n, 10));
     return {
@@ -242,8 +248,8 @@ export function isPathModified(cwd: string, path: string): boolean {
   }
 
   try {
-    // TODO(TASK-680): migrate to runGit(cwd, args[]) — see main/src/utils/runGit.ts
-    execSync(`git diff-files --quiet --ignore-submodules -- "${path}"`, { cwd, encoding: 'utf8', silent: true });
+    // `--` keeps a path that starts with `-` in the pathspec position.
+    runGit(cwd, ['diff-files', '--quiet', '--ignore-submodules', '--', path]);
     return false;
   } catch {
     return true;
@@ -263,11 +269,11 @@ export function getCurrentBranch(cwd: string): string | null {
   }
 
   try {
-    return execSync('git symbolic-ref --short HEAD', { cwd }).toString().trim();
+    return runGit(cwd, ['symbolic-ref', '--short', 'HEAD']).trim();
   } catch {
     // Might be in detached HEAD state
     try {
-      return execSync('git rev-parse --short HEAD', { cwd }).toString().trim();
+      return runGit(cwd, ['rev-parse', '--short', 'HEAD']).trim();
     } catch {
       return null;
     }
@@ -286,11 +292,15 @@ export function isRebasing(cwd: string): boolean {
     return false;
   }
 
-  try {
-    // Check for rebase directories
-    execSync('test -d .git/rebase-merge || test -d .git/rebase-apply', { cwd });
-    return true;
-  } catch {
-    return false;
-  }
+  // Check for rebase directories. This was a `test -d ... || test -d ...` shell
+  // command; the fs equivalent keeps the same literal `<cwd>/.git/<dir>` lookup
+  // (and therefore the same result inside a linked worktree, where `.git` is a
+  // file rather than a directory).
+  return ['rebase-merge', 'rebase-apply'].some(dir => {
+    try {
+      return fs.statSync(nodePath.join(cwd, '.git', dir)).isDirectory();
+    } catch {
+      return false;
+    }
+  });
 }

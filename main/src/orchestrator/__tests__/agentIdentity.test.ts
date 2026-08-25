@@ -69,8 +69,8 @@ describe('AC-P0-3: no phantom labels remapped', () => {
 });
 
 describe('CANONICAL_AGENT_KEYS shape + isCanonicalAgentKey guard', () => {
-  it('has exactly 19 canonical keys', () => {
-    expect(CANONICAL_AGENT_KEYS.length).toBe(19);
+  it('has exactly 20 canonical keys', () => {
+    expect(CANONICAL_AGENT_KEYS.length).toBe(20);
   });
 
   it('includes the verify-setup flow agent', () => {

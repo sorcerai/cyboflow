@@ -111,12 +111,110 @@ export const ENV_GATE_CONFIG = 'CYBOFLOW_OMP_GATE_CONFIG';
 export const ENV_GATE_SENTINEL = 'CYBOFLOW_OMP_GATE_SENTINEL';
 
 /**
- * OMP's subagent-dispatch tool (`tools/builtin-names.ts:19`). Denied outside
- * `dontAsk` until hook scope inside OMP subagents is verified — OMP's docs say
- * subagents run forced-yolo, and whether this extension's `tool_call` handler
- * is even installed in a subagent session is UNKNOWN.
+ * OMP's subagent-dispatch tool (`tools/builtin-names.ts:19`).
+ *
+ * Was denied in every mode while hook scope inside OMP subagents was unverified.
+ * It is verified now — the handler and its config reach a subagent at depth 2,
+ * measured; see `ompGateConfigBuilder.ts` for the probe and for why the
+ * "OMP's docs say subagents run forced-yolo" claim this comment used to carry
+ * was an assumption rather than a citation. `denyTaskTool` still exists and
+ * still blocks at rule 2 whenever it is set, which is what the fail-closed
+ * defaults rely on.
  */
 export const OMP_TASK_TOOL_NAME = 'task';
+
+/**
+ * OMP's shell tool (`tools/builtin-names.ts:2`). Matched EXACTLY wherever a
+ * command is classified — a differently-cased name is one this gate has not
+ * verified, and falling through to the human is the fail-closed direction for
+ * every auto-allow path.
+ */
+export const OMP_BASH_TOOL_NAME = 'bash';
+
+/**
+ * OMP's peer-messaging / job-supervision tool (`tools/hub/index.ts`, summary
+ * "Message peer agents, control background jobs, and supervise long-running
+ * processes").
+ *
+ * ONE NAME, TWO VERY DIFFERENT POWERS — which is why this gate classifies it by
+ * ARGUMENT and never by name. Its `op` spans pure coordination (message a peer,
+ * wait for a reply, read an inbox) and full process control: `start` takes an
+ * `application` + `args` + `env` + `cwd` and runs it. That last one is
+ * arbitrary execution wearing a different key name — it carries no `command`
+ * string, so the bash classifier never sees it — and before this rung existed
+ * `auto` mode auto-allowed it by name, since `hub` is not in
+ * {@link AUTO_MODE_HAZARD_TOOLS}.
+ */
+export const OMP_HUB_TOOL_NAME = 'hub';
+
+/**
+ * `hub` operations that only move MESSAGES or READ state — no process is
+ * created, signalled, or destroyed by any of them:
+ *
+ *   wait / inbox   receive or peek at peer messages, or await a job's lifecycle
+ *   list / jobs    enumerate peer agents and running jobs
+ *   ps / describe  inspect a job
+ *   logs           read a job's captured output (`grep`/`lines` narrow it)
+ *
+ * `send` is DELIBERATELY ABSENT from this set even though it is the archetypal
+ * coordination op, because it is overloaded — see {@link isCoordinationHubCall}.
+ *
+ * `start`, `stop`, `restart` and `cancel` are absent because they are process
+ * lifecycle: launching, killing, and re-launching real processes on the user's
+ * machine. Those reach the human in every mode.
+ */
+const OMP_HUB_COORDINATION_OPS: ReadonlySet<string> = new Set([
+  'wait',
+  'inbox',
+  'list',
+  'jobs',
+  'ps',
+  'describe',
+  'logs',
+]);
+
+/**
+ * The `send` arguments that turn a peer message into PROCESS INPUT.
+ *
+ * `hub {op:'send'}` means one of two unrelated things depending on whether it
+ * addresses an agent (`to`) or a running job (`name`):
+ *
+ *   to:   "deliver this text to another agent"            — coordination
+ *   name: "write `text` to that process's stdin, append   — remote control of a
+ *          Enter, send terminal `keys`, deliver `signal`"    live PTY
+ *
+ * The second form can type any command into an interactive shell the agent
+ * started earlier, or SIGKILL it. Presence of ANY of these keys therefore
+ * disqualifies the coordination shortcut, regardless of what else the call
+ * carries — a `send` that names both a recipient and a process is exactly the
+ * ambiguity to refuse rather than resolve.
+ */
+const OMP_HUB_PROCESS_INPUT_KEYS: readonly string[] = ['name', 'text', 'keys', 'signal'];
+
+/**
+ * True when a `hub` call is provably coordination-only, and therefore safe to
+ * auto-allow at the same tier as `read`/`glob`: it touches nothing outside the
+ * agent group's own message bus and job table.
+ *
+ * Fail-closed in every uncertain direction — a missing `op`, a non-string `op`,
+ * an unrecognized `op` (a future OMP addition), or a `send` that carries any
+ * process-input key all answer `false` and reach the human.
+ */
+export function isCoordinationHubCall(input: Record<string, unknown>): boolean {
+  const op = input['op'];
+  if (typeof op !== 'string') return false;
+  const normalized = op.trim().toLowerCase();
+
+  if (normalized === 'send') {
+    if (OMP_HUB_PROCESS_INPUT_KEYS.some((key) => input[key] !== undefined)) return false;
+    // A peer send must actually name a peer. Without `to` the op is
+    // underspecified, and guessing what OMP would do with it is not this gate's
+    // job.
+    return typeof input['to'] === 'string' && input['to'].trim().length > 0;
+  }
+
+  return OMP_HUB_COORDINATION_OPS.has(normalized);
+}
 
 /**
  * A URI scheme sitting at a token boundary inside a tool argument: `ssh://`,
@@ -145,6 +243,54 @@ export const OMP_TASK_TOOL_NAME = 'task';
 const URI_SCHEME_TARGET = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\//i;
 
 /**
+ * Tool arguments that carry AUTHORED FILE TEXT rather than a target, keyed by
+ * the tool that carries them.
+ *
+ * WHY THIS EXCLUSION EXISTS (the defect it closes): {@link URI_SCHEME_TARGET}
+ * disqualifies every auto-allow rung when a scheme appears ANYWHERE in the
+ * arguments, and {@link scanForUriScheme} recurses into every value. For a
+ * write-tier tool that means it reads the FILE BODY. A local write of a README,
+ * an HTML page, a JSON report, or any source file with a link in a comment
+ * therefore fell through to the human — observed live on 2026-08-19, where an
+ * `auto`-mode session could not write its own report because the report's text
+ * contained `https://example.com`. The file's CARGO is not its DESTINATION, and
+ * the escalation the scan defends against (`read.ts:401`, `grep.ts:906`) is a
+ * property of the target only.
+ *
+ * EXCLUSION, NOT AN ALLOWLIST OF TARGET KEYS, and the asymmetry is the reason:
+ * a target hiding under `content` / `new_string` / `out` would require OMP to
+ * put a path in a field whose entire purpose is text the model authored, while
+ * a FUTURE OMP version adding a new target key to `write` is ordinary version
+ * drift. Naming the body keys fails safe against the drift that can actually
+ * happen; naming the target keys would not.
+ *
+ * Scoped per tool, exact-name matched, for the same reason every other rung in
+ * this file is: a tool this gate has not verified gets the unnarrowed scan.
+ *
+ *   write     `content`                     (`tools/write.ts`; target: `path`)
+ *   edit      `old_string` / `new_string`   (`edit/index.ts:382975`; target: `path`)
+ *   ast_edit  `pat` / `out` inside `ops`    (`tools/ast-edit.ts:569362`; target: `paths`)
+ */
+const FILE_BODY_KEYS_BY_TOOL: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['write', new Set(['content'])],
+  ['edit', new Set(['old_string', 'new_string'])],
+  ['ast_edit', new Set(['pat', 'out'])],
+  // `message` is text bound for another agent, `pattern`/`grep` are regexes
+  // filtering a job's output. All three are cargo. `hub`'s real target keys —
+  // `application` and `cwd` — occur only on `start`, which this gate never
+  // auto-allows, so excluding the cargo keys cannot widen anything.
+  ['hub', new Set(['message', 'pattern', 'grep'])],
+]);
+
+/**
+ * The body keys to skip when scanning `toolName`'s arguments — empty for every
+ * tool that does not carry a file body, which is the unnarrowed scan.
+ */
+function fileBodyKeysFor(toolName: string): ReadonlySet<string> | undefined {
+  return FILE_BODY_KEYS_BY_TOOL.get(toolName);
+}
+
+/**
  * How long we wait for a human verdict before giving up ourselves.
  *
  * OMP caps every `tool_call` handler at 30s
@@ -156,7 +302,18 @@ const URI_SCHEME_TARGET = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\//i;
  *
  * 25s leaves a 5s margin for the block to travel back through
  * `emitToolCall` before OMP's cap fires, so OUR reason is what the model sees.
- * Raising this above 30s would be inert; the OMP cap would simply win.
+ *
+ * NO LONGER THE WHOLE STORY, as of omp 17.3.5. The cap became the setting
+ * `extensionHandlers.toolCallTimeoutMs` ("Made extension tool-call timeouts
+ * configurable and paused them during user dialogs"), with no upper clamp, and
+ * cyboflow now raises it per spawn via a config overlay
+ * (`ompHandlerTimeoutOverlay.ts`) and passes the matching budget down as
+ * {@link OmpGateConfig.humanDecisionBudgetMs}.
+ *
+ * So this constant is the FLOOR, not the policy: it is what the gate uses when
+ * the host sent no budget — an OMP older than 17.3.5, a spawn whose overlay
+ * could not be written, or a damaged config. Raising THIS number is still inert
+ * on those paths, because the un-raised OMP cap would simply win.
  */
 export const HUMAN_DECISION_BUDGET_MS = 25_000;
 
@@ -188,6 +345,13 @@ const PERMISSION_MODES: readonly OmpGatePermissionMode[] = [
 /** Shell control operators that separate independently-evaluated commands. */
 const SHELL_SEPARATORS = ['&&', '||', ';', '|'] as const;
 
+/**
+ * Newline separators, kept apart from {@link SHELL_SEPARATORS} because that
+ * tuple is indexed positionally below. Port of `permissionRules.ts`'s
+ * `SHELL_NEWLINE_SEPARATORS`.
+ */
+const SHELL_NEWLINE_SEPARATORS: readonly string[] = ['\n', '\r'];
+
 // ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
@@ -204,11 +368,28 @@ export interface OmpGateLogger {
   error(message: string): void;
 }
 
-const stderrLogger: OmpGateLogger = {
-  debug: (m: string) => void process.stderr.write(`[cyboflow-omp-gate] ${m}\n`),
-  warn: (m: string) => void process.stderr.write(`[cyboflow-omp-gate] ${m}\n`),
-  error: (m: string) => void process.stderr.write(`[cyboflow-omp-gate] ${m}\n`),
-};
+/**
+ * Per-process instance counter, used to tell one loaded gate from another.
+ *
+ * OMP's extension API hands the factory nothing that identifies WHO it is
+ * gating — no session id, no agent name, only `on` and `setLabel`. That is
+ * survivable while one process means one agent, and stops being survivable the
+ * moment subagents enter the picture: the binary initializes an extension
+ * runner per task, so several gates can be live in one pid at once and every
+ * line they write is indistinguishable. A pid plus an ordinal is the most
+ * identity available here, and it is enough to answer the question that
+ * actually matters when reading a log — did THIS agent's call reach a gate, or
+ * did no gate see it at all.
+ */
+let gateInstanceSeq = 0;
+
+function makeStderrLogger(tag: string): OmpGateLogger {
+  const write = (m: string): void => void process.stderr.write(`[cyboflow-omp-gate ${tag}] ${m}\n`);
+  return { debug: write, warn: write, error: write };
+}
+
+/** Untagged sink for tests and for {@link resolveGateRuntime}'s default. */
+const stderrLogger: OmpGateLogger = makeStderrLogger('-');
 
 // ---------------------------------------------------------------------------
 // Config parsing — defensive, never fails open
@@ -266,7 +447,26 @@ export function parseGateConfig(raw: string | undefined, logger: OmpGateLogger):
     // Anything that is not an explicit `false` denies the subagent tool.
     denyTaskTool: obj['denyTaskTool'] === false ? false : true,
     cyboflowMcpToolNames: stringArray(obj['cyboflowMcpToolNames']) ?? [],
+    // A budget is honored only as a POSITIVE FINITE number. Anything else —
+    // absent, a string, NaN, zero, negative — leaves the field unset, and an
+    // unset field means the built-in ~25s budget. That asymmetry is deliberate:
+    // the damage from wrongly believing OMP will wait 30 minutes is a lost
+    // error message and a stranded socket, while the damage from wrongly
+    // keeping 25s is only a retry the deferred-approval path already handles.
+    ...(positiveBudget(obj['humanDecisionBudgetMs']) !== undefined
+      ? { humanDecisionBudgetMs: positiveBudget(obj['humanDecisionBudgetMs']) }
+      : {}),
   };
+}
+
+/**
+ * A `humanDecisionBudgetMs` value we are willing to act on: a finite number
+ * strictly greater than zero. `typeof x === 'number'` alone would admit NaN
+ * and Infinity, either of which turns `setTimeout` into "never fire".
+ */
+function positiveBudget(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +498,10 @@ export function parsePermissionRule(rule: string): ParsedGateRule | null {
   return content.length === 0 ? { toolName } : { toolName, content };
 }
 
-/** Split a command on unquoted shell separators. Port of permissionRules.ts:84-125. */
+/**
+ * Split a command on unquoted shell separators — `&&`, `||`, `;`, `|`, and a raw
+ * newline. Port of permissionRules.ts's `splitShellSegments`.
+ */
 export function splitShellSegments(command: string): string[] {
   const segments: string[] = [];
   let current = '';
@@ -323,7 +526,11 @@ export function splitShellSegments(command: string): string[] {
       i++;
       continue;
     }
-    if (ch === SHELL_SEPARATORS[2] || ch === SHELL_SEPARATORS[3]) {
+    if (
+      ch === SHELL_SEPARATORS[2] ||
+      ch === SHELL_SEPARATORS[3] ||
+      SHELL_NEWLINE_SEPARATORS.includes(ch)
+    ) {
       segments.push(current);
       current = '';
       continue;
@@ -663,6 +870,7 @@ function isLocalOnlyGitWriteSegment(segment: string): boolean {
 export function isSafeReadOnlyBashCommand(rawCommand: string): boolean {
   const command = rawCommand.trim();
   if (command.length === 0) return false;
+  if (/[\r\n]/.test(command)) return false;
   const segments = splitShellSegments(command);
   if (segments.length === 0) return false;
   return segments.every(isSafeReadOnlySegment);
@@ -676,6 +884,7 @@ export function isSafeReadOnlyBashCommand(rawCommand: string): boolean {
 export function isLocalOnlyGitWriteCommand(rawCommand: string): boolean {
   const command = rawCommand.trim();
   if (command.length === 0) return false;
+  if (/[\r\n]/.test(command)) return false;
   const segments = splitShellSegments(command);
   if (segments.length === 0) return false;
   return segments.every(isLocalOnlyGitWriteSegment);
@@ -687,14 +896,19 @@ export function isLocalOnlyGitWriteCommand(rawCommand: string): boolean {
  * fine — `git status && git add -A && git commit -m x` is the shape a lane agent
  * actually runs.
  *
- * The raw-newline refusal is a NARROWING the mirrored classifier does not have.
- * {@link splitShellSegments} treats only `&&`, `||`, `;` and `|` as separators
- * (it must, to stay byte-identical to cyboflow's rule grammar in
- * {@link matchesAllowRules}), so `git status\nrm -rf ~` arrives as ONE segment
- * that whitespace-tokenizes to `git status` plus stray positionals — read-only
- * by the table, catastrophic in fact. Teaching the splitter a new separator
- * would desync the allow-rule matcher; refusing the character is the narrow fix,
- * and a multi-line command simply reaches the human instead of being auto-run.
+ * The raw-newline refusal is now belt AND braces. {@link splitShellSegments}
+ * splits on a newline like any other separator, so `git status\nrm -rf ~`
+ * arrives as two segments and the `rm` one fails the tables. The blunt refusal
+ * stays on top because a newline INSIDE quotes survives the split, and because
+ * the mirrored classifier refuses identically — the parity test pins the two
+ * together. A multi-line command simply reaches the human instead of being
+ * auto-run.
+ *
+ * It did not always work this way: the splitter originally ignored newlines
+ * "to stay byte-identical to cyboflow's rule grammar", which left that same
+ * grammar (and the acceptEdits classifier) auto-approving the command above.
+ * Splitting is strictly more conservative for both — an unmatched segment falls
+ * through to the human — so the sync was restored in the safe direction.
  */
 export function isGateSafeBashCommand(rawCommand: string): boolean {
   const command = rawCommand.trim();
@@ -708,6 +922,567 @@ export function isGateSafeBashCommand(rawCommand: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// `auto` mode — the allow-unless-hazardous tier
+// ---------------------------------------------------------------------------
+
+/**
+ * `auto` INVERTS the gate's default posture, and only `auto`.
+ *
+ * `default` and `acceptEdits` are prove-it-safe: a call is auto-allowed only if
+ * it matches a vetted name list or a provably-read-only command, and everything
+ * else reaches a human. `auto` is allow-unless-hazardous: a call is auto-allowed
+ * unless it trips one of the tables below.
+ *
+ * WHY THE ASYMMETRY IS THE POINT. On Claude, `auto` installs NO PreToolUse hook
+ * at all — the native classifier owns gating (`orchestrator/permissionModeMapper.ts`,
+ * the `case 'auto': return undefined` arm). OMP ships no such classifier, so the
+ * original mapping (proposal §5.3) defined OMP's `auto` as "acceptEdits plus the
+ * merged allow-rules". That is strictly NARROWER than what the same word means
+ * one runtime over: measured on a live session, `pnpm test`, `mkdir -p`, `node
+ * scripts/x.mjs` and every other ordinary build command fell through to rule 6
+ * and blocked on a human, which is not what a user selecting "Auto" is asking
+ * for. This tier is the classifier's stand-in: a hand-written hazard list rather
+ * than a model, but the same posture.
+ *
+ * THE TRUST BOUNDARY THIS DOES NOT CROSS. Rules 1-3 of {@link decideToolCall}
+ * still apply first and are untouched — `disallowedTools` still refuses, the
+ * `task` subagent tool is still denied, and the URI-scheme narrowing
+ * ({@link hasUriSchemeTarget}) still disqualifies EVERY shortcut below, so
+ * anything naming a remote target still reaches a human. This is a deliberate
+ * widening of `auto` alone, chosen by the user; `default` and `acceptEdits` are
+ * byte-identical to before.
+ *
+ * THE KNOWN COST. An OMP builtin this file has never heard of is auto-allowed
+ * in `auto` (it is absent from the hazard set). That is inherent to
+ * allow-unless-hazardous and is why the inversion is scoped to one mode. Foreign
+ * MCP tools are the deliberate exception — see {@link isAutoModeAllowedTool}.
+ */
+
+/**
+ * OMP builtins `auto` refuses to auto-allow. Each reaches outside the agent's
+ * own worktree-and-model loop:
+ *
+ *   computer  — native desktop capture AND INPUT (keystrokes/clicks on the
+ *               user's real machine, outside any sandbox this gate can reason about)
+ *   browser   — drives the user's own Chrome over the CDP relay, with their
+ *               live cookies and logged-in sessions
+ *   github    — authenticated writes to real repositories/issues/PRs
+ *   eval      — executes code the tables never vetted, which is the whole
+ *               premise of a hazard list
+ *   debug     — attaches a debugger to a live process
+ *
+ * `task` is absent because it is already refused unconditionally, in every mode,
+ * by rule 2 — listing it here would imply the deny is mode-scoped.
+ */
+const AUTO_MODE_HAZARD_TOOLS: readonly string[] = [
+  'computer',
+  'browser',
+  'github',
+  'eval',
+  'debug',
+];
+
+/** OMP's MCP tool-name prefix (`mcp/tool-bridge.ts` composes `mcp__<server>_<tool>`). */
+const OMP_MCP_TOOL_PREFIX = 'mcp__';
+
+/**
+ * Whether `auto` may auto-allow a NON-bash tool by name (bash has its own
+ * argument-aware rung — {@link isAutoModeAllowedBashCommand}).
+ *
+ * Foreign MCP tools are excluded even though they are not in the hazard list,
+ * and the reason is the same one {@link isCyboflowMcpTool} is exact-name
+ * matched: OMP auto-imports the user's own MCP configs, so `mcp__*` names an
+ * arbitrary third-party server whose semantics this gate cannot know. Allowing
+ * a whole category on the strength of "we have no reason to think it is
+ * dangerous" is precisely the reasoning that does not hold for code we have
+ * never seen. Cyboflow's own MCP tools never reach here — rule 3 allows them
+ * first, by exact composed name.
+ */
+export function isAutoModeAllowedTool(toolName: string): boolean {
+  const name = toolName.toLowerCase();
+  if (name.startsWith(OMP_MCP_TOOL_PREFIX)) return false;
+  return !AUTO_MODE_HAZARD_TOOLS.includes(name);
+}
+
+/** Programs that run as, or become, another user. */
+const PRIVILEGE_ESCALATION_PROGRAMS: ReadonlySet<string> = new Set([
+  'sudo',
+  'su',
+  'doas',
+  'pkexec',
+]);
+
+/**
+ * Programs that execute code this classifier never sees — a shell, an inline
+ * evaluator, or a wrapper that runs whatever it is handed.
+ *
+ * The shells are what the tail of a `curl … | sh` tokenizes to:
+ * {@link splitShellSegments} splits on `|`, so that pipeline arrives here as a
+ * segment whose program is `sh`, and refusing the shells refuses the pipeline.
+ */
+const CODE_EXECUTING_PROGRAMS: ReadonlySet<string> = new Set([
+  'sh',
+  'bash',
+  'zsh',
+  'fish',
+  'ksh',
+  'csh',
+  'tcsh',
+  'dash',
+  'eval',
+  'exec',
+  'source',
+  '.',
+  'env',
+  'xargs',
+  'nohup',
+  'osascript',
+]);
+
+/**
+ * Programs that destroy data outright. Always hazardous, with no path analysis:
+ * `rm -rf node_modules` asking for a confirmation is a small cost, and the
+ * alternative — deciding from a pathspec whether a delete stays inside the
+ * worktree — is exactly the kind of parse this file refuses to trust elsewhere.
+ */
+const DESTRUCTIVE_PROGRAMS: ReadonlySet<string> = new Set([
+  'rm',
+  'rmdir',
+  'shred',
+  'srm',
+  'dd',
+  'mkfs',
+  'fdisk',
+  'diskutil',
+  'mount',
+  'umount',
+  'chmod',
+  'chown',
+  'chgrp',
+  'chflags',
+  'kill',
+  'killall',
+  'pkill',
+  'reboot',
+  'shutdown',
+  'halt',
+  'launchctl',
+  'systemctl',
+  'crontab',
+  'defaults',
+  'csrutil',
+  'spctl',
+  'security',
+  'passwd',
+  'visudo',
+]);
+
+/**
+ * Programs that move bytes to, or execute on, another host. `curl`/`wget` are
+ * deliberately ABSENT: they are ubiquitous in a build loop, and the URI-scheme
+ * narrowing already forces any invocation carrying a `scheme://` target to a
+ * human before this classifier is consulted at all.
+ */
+const REMOTE_TRANSPORT_PROGRAMS: ReadonlySet<string> = new Set([
+  'ssh',
+  'scp',
+  'sftp',
+  'rsync',
+  'nc',
+  'ncat',
+  'netcat',
+  'telnet',
+  'ftp',
+  'tftp',
+]);
+
+/**
+ * Interpreters that are ordinary programs with a script argument (`node
+ * scripts/build.mjs`) but arbitrary-code evaluators with an inline flag. Keyed
+ * by program → the flags that make it the latter, so the common form stays
+ * auto-allowed and only the evaluator form asks.
+ */
+const INLINE_CODE_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['node', new Set(['-e', '--eval', '-p', '--print'])],
+  ['bun', new Set(['-e', '--eval', '-p', '--print'])],
+  ['deno', new Set(['eval'])],
+  ['python', new Set(['-c'])],
+  ['python3', new Set(['-c'])],
+  ['perl', new Set(['-e', '-E'])],
+  ['ruby', new Set(['-e'])],
+  ['php', new Set(['-r'])],
+]);
+
+/** `find` flags that turn a search into an execution or a delete. */
+const FIND_EXECUTING_FLAGS: ReadonlySet<string> = new Set([
+  '-exec',
+  '-execdir',
+  '-delete',
+  '-ok',
+  '-okdir',
+]);
+
+/**
+ * git subcommands `auto` refuses. Two groups, one rationale each:
+ *
+ *  - PUBLISHES OR FETCHES (push, pull, fetch, clone, remote, submodule): leaves
+ *    the machine, using the user's own credentials.
+ *  - DESTROYS UNCOMMITTED OR SHARED WORK (reset, checkout, switch, clean,
+ *    stash, rebase, merge, cherry-pick, revert, apply, am, filter-branch,
+ *    worktree, gc, prune, config): a human or a sibling sprint lane may own the
+ *    state being discarded. This is the same line
+ *    {@link LOCAL_ONLY_GIT_WRITE_SUBCOMMANDS} already draws for `acceptEdits`,
+ *    kept in `auto` rather than relaxed — "may this agent record its own edits"
+ *    and "may it discard someone else's" stay different questions.
+ *
+ * `add`/`commit`/`restore`/`rm`/`mv` are absent, so they auto-allow — they
+ * already do under `acceptEdits` via the local-only-write tier.
+ */
+const AUTO_MODE_HAZARD_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'push',
+  'pull',
+  'fetch',
+  'clone',
+  'remote',
+  'submodule',
+  'reset',
+  'checkout',
+  'switch',
+  'clean',
+  'stash',
+  'rebase',
+  'merge',
+  'cherry-pick',
+  'revert',
+  'apply',
+  'am',
+  'filter-branch',
+  'worktree',
+  'gc',
+  'prune',
+  'config',
+]);
+
+/** Programs whose hazard depends on whether an argument escapes the worktree. */
+const PATH_ESCAPE_SENSITIVE_PROGRAMS: ReadonlySet<string> = new Set([
+  'cp',
+  'mv',
+  'ln',
+  'install',
+]);
+
+/**
+ * True if a token names a location outside the current directory tree — an
+ * absolute path, a `~` expansion, or any `..` component. Deliberately crude and
+ * over-eager: it is only consulted to REFUSE, so a false positive costs one
+ * human prompt while a false negative would let `cp .env /tmp/x` through.
+ */
+function escapesWorkingTree(token: string): boolean {
+  if (token.startsWith('-')) return false;
+  if (token.startsWith('/') || token.startsWith('~')) return true;
+  return token === '..' || token.startsWith('../') || token.includes('/../') || token.endsWith('/..');
+}
+
+/**
+ * The name a hazard table should be consulted with, given the program token as
+ * written.
+ *
+ * Every table below is keyed by a BARE program name (`rm`, `zsh`, `sudo`), so
+ * matching the token verbatim let an absolute or relative path walk past all of
+ * them: `/bin/rm -rf ~`, `/bin/zsh -lc '…'` and `/usr/bin/sudo rm -rf /` were
+ * each auto-allowed because `/bin/rm` is not the string `rm`. Taking the
+ * basename closes that, and it is the whole fix — a path is not a different
+ * program, and `zsh` reached by any route runs code this classifier cannot see.
+ *
+ * Deliberately NOT resolved further: no symlink following, no `$PATH` lookup,
+ * no argv[0] rewriting. Those need a filesystem this pure function does not
+ * touch, and the tier is allow-unless-hazardous, so the honest statement is
+ * that this closes the literal-path bypass and nothing more.
+ *
+ * The prove-it-safe tiers need no equivalent: they are allowlists, so an
+ * unrecognized `/bin/cat` already fails closed there.
+ */
+function programName(token: string): string {
+  const slash = token.lastIndexOf('/');
+  return slash === -1 ? token : token.slice(slash + 1);
+}
+
+/** A `NAME=value` token: sets a variable, executes nothing. */
+const ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Tokens that stand in FRONT of the real program without being it.
+ *
+ * The hazard tables classify `tokens[0]`, so anything occupying that slot
+ * without being the command shadows the command entirely. Three shapes did:
+ *
+ *     FOO=1 sudo rm -rf /            assignment prefix
+ *     for i in 1; do rm -rf ~; done  the `do` segment's keyword
+ *     time rm -rf ~ / nice rm -rf ~  a wrapper that runs its argument
+ *
+ * Every one of those was auto-allowed, because `FOO=1`, `do` and `time` are in
+ * no table. Skipping past them puts the actual program back in the slot the
+ * tables read.
+ *
+ * `exec`, `source`, `nohup`, `xargs`, `env` and the shells are deliberately
+ * ABSENT: they are already CODE_EXECUTING_PROGRAMS, and skipping past one would
+ * turn a refusal into an inspection of its argument — the opposite of the point.
+ */
+const TRANSPARENT_PREFIX_TOKENS: ReadonlySet<string> = new Set([
+  'if', 'then', 'else', 'elif', 'fi',
+  'for', 'while', 'until', 'do', 'done',
+  'case', 'esac', 'select', 'function',
+  'time', 'command', 'builtin', 'nice',
+  '{', '}', '(', ')', '!',
+]);
+
+/**
+ * The program a segment actually runs, or `null` when it runs nothing (a bare
+ * assignment, a lone `done`).
+ *
+ * Returns `'-'`-leading tokens as-is so the caller can refuse them: landing on
+ * a flag means a prefix consumed an option this function does not model
+ * (`nice -n 5 rm …`), and an unreadable form is refused rather than parsed —
+ * the same discipline `git -C …` already gets.
+ */
+function resolveProgramToken(tokens: readonly string[]): string | null {
+  for (const token of tokens) {
+    if (ASSIGNMENT_PREFIX.test(token)) continue;
+    if (TRANSPARENT_PREFIX_TOKENS.has(token)) continue;
+    return token;
+  }
+  return null;
+}
+
+/** True if ONE segment trips a hazard table. */
+function isAutoModeHazardousSegment(segment: string): boolean {
+  const tokens = tokenizeSegment(segment);
+  if (tokens.length === 0) return true;
+  const programToken = resolveProgramToken(tokens);
+  // Nothing is executed (a bare `FOO=1`, a lone `done`) — benign.
+  if (programToken === null) return false;
+  // A prefix consumed an option this function does not model. Refuse.
+  if (programToken.startsWith('-')) return true;
+  // A VARIABLE decides what runs (`$X -rf ~`, `${CMD} …`, `"$TOOL" …`), so the
+  // token names nothing this classifier can look up. Refusing is the only
+  // readable answer: `X=rm; $X -rf ~` otherwise reaches no table at all.
+  if (programToken.includes('$')) return true;
+  const program = programName(programToken);
+  const args = tokens.slice(tokens.indexOf(programToken) + 1);
+
+  if (PRIVILEGE_ESCALATION_PROGRAMS.has(program)) return true;
+  // `env` is code-executing because `env FOO=1 cmd` RUNS cmd. With no operand
+  // it runs nothing — it prints the environment, and `env | grep …` is one of
+  // the most common probes an agent makes (2 of the 12 escalations on the 0.2.5
+  // release smoke). An operand is anything that is not a flag, so `env FOO=1 rm`
+  // and `env -i sh` both stay hazardous; `env -u FOO` does too, conservatively,
+  // since this does not model which flags take a value.
+  const isEnvPrinter = program === 'env' && args.every((token) => token.startsWith('-'));
+  if (!isEnvPrinter && CODE_EXECUTING_PROGRAMS.has(program)) return true;
+  if (DESTRUCTIVE_PROGRAMS.has(program)) return true;
+  if (REMOTE_TRANSPORT_PROGRAMS.has(program)) return true;
+
+  const inlineFlags = INLINE_CODE_FLAGS.get(program);
+  if (inlineFlags !== undefined && args.some((token) => inlineFlags.has(flagName(token)))) {
+    return true;
+  }
+
+  if (program === 'find' && args.some((token) => FIND_EXECUTING_FLAGS.has(token))) return true;
+
+  if (program === 'git') {
+    const sub = args[0];
+    // A leading global option (`git -C /elsewhere …`) is refused rather than
+    // parsed, exactly as the read-only tier refuses it — that is what keeps the
+    // tier from being pointed at another repository.
+    if (sub === undefined || sub.startsWith('-')) return true;
+    return AUTO_MODE_HAZARD_GIT_SUBCOMMANDS.has(sub);
+  }
+
+  if (PATH_ESCAPE_SENSITIVE_PROGRAMS.has(program) && args.some(escapesWorkingTree)) return true;
+
+  return false;
+}
+
+/**
+ * Redirections that can neither write a file nor read one: a discard
+ * (`2>/dev/null`, `>/dev/null`, `&>/dev/null`) or a descriptor duplication
+ * (`2>&1`). The `/dev/null` target must END the token, so `>/dev/nullx` and
+ * `>/dev/null/../etc/passwd` are NOT matched.
+ */
+const BENIGN_REDIRECT = /(?:&>>?|[0-9]*>>?)\s*(?:\/dev\/null|&[0-9])(?=\s|$)/g;
+
+/**
+ * The measured reason `auto` was still escalating roughly half of OMP's bash
+ * calls: `hasStructuralRefusal` refuses any `<`, `>` or `&`, and `2>/dev/null`
+ * is the single most common thing an agent appends to a probe. On the 0.2.5
+ * release smoke it accounted for 8 of the 12 escalations.
+ *
+ * Stripping only these two forms keeps the refusal's actual purpose intact —
+ * they name no file to write and open no file to read, so there is nothing the
+ * hazard tables failed to vet. Every other redirection still refuses, which is
+ * why the strip happens BEFORE {@link hasStructuralRefusal} rather than
+ * weakening it: `cat secrets > /tmp/exfil` and `echo hi > important.txt` are
+ * untouched, and so is the `&` that backgrounds.
+ */
+/**
+ * A redirect target this gate is willing to read as a PLAIN LOCAL PATH: a
+ * quoted or bare token of path characters, optionally carrying a variable
+ * expansion (`> "$OUT"`, `> "$SMOKE_DIR/x.json"` — an agent writing a computed
+ * path is ordinary, and a variable can only ever name a destination, never run
+ * anything).
+ *
+ * Deliberately EXCLUDES `(`, `)` and a backtick, so process substitution
+ * (`> >(sh)`, `< <(curl …)`) never matches and stays refused, and excludes `<`
+ * so a heredoc's `<<DELIM` never looks like a target.
+ */
+const PLAIN_REDIRECT_TARGET = /^(?:'[^']*'|"[^"`]*"|[A-Za-z0-9_./~@+%:${}-]+)$/;
+
+/**
+ * Redirect targets that are NOT files however plain they look.
+ *
+ * `/dev/tcp/host/port` and `/dev/udp/…` are bash's NETWORK redirects — a
+ * `cat < /dev/tcp/evil/80` opens a socket, which is the one thing a "this is
+ * just a file path" argument cannot cover. The substitution placeholder is
+ * refused for the same class of reason: a target decided by a command
+ * substitution is not a path this gate has read.
+ */
+function isRedirectTargetSafe(rawTarget: string): boolean {
+  const target = rawTarget.replace(/^["']|["']$/g, '');
+  if (target.includes(SUBSTITUTION_PLACEHOLDER)) return false;
+  if (/^\/dev\/(?:tcp|udp)(?:\/|$)/.test(target)) return false;
+  // Scoped to the working tree, via the same crude, over-eager test the
+  // path-sensitive programs use. The parity argument reaches "a file the agent
+  // may already write with the `write` tool"; it does NOT reach `> /etc/hosts`,
+  // and the fact that the `edit-tool` rung applies no path check of its own is
+  // a hole to close there rather than a licence to open a second one here.
+  //
+  // KNOWN LIMIT: a variable target (`> "$OUT"`) is unresolvable in a pure
+  // function, so it passes — the same statement already true of `cp "$X" "$Y"`
+  // under PATH_ESCAPE_SENSITIVE_PROGRAMS.
+  if (escapesWorkingTree(target)) return false;
+  return PLAIN_REDIRECT_TARGET.test(rawTarget);
+}
+
+/**
+ * A redirect operator plus its target, for the parity strip below.
+ * `<<` (heredoc) is excluded by requiring the `<` form to be a SINGLE `<`.
+ */
+const REDIRECT_WITH_TARGET =
+  /(?:&>>?|[0-9]*>>?|[0-9]*<(?!<))\s*('[^']*'|"[^"`]*"|\S+)(?=\s|$)/g;
+
+/**
+ * Strip the redirects `auto` has no reason to refuse.
+ *
+ * THE PARITY ARGUMENT (the defect this closes). In `auto`, the `write`/`edit`
+ * tools are auto-allowed by the `edit-tool` rung and `read` by
+ * `autoAllowTools` — so the agent may already write and read any local path
+ * without a human. Refusing `echo x > report.json` while allowing
+ * `write({path:'report.json'})` gates the CAPABILITY differently depending on
+ * which tool spells it, which is an inconsistency rather than a boundary. On
+ * the 2026-08-23 OMP smoke, redirects accounted for 8 of the 9 remaining bash
+ * escalations, every one of them a probe writing its own output file.
+ *
+ * What still refuses, and why the strip cannot launder it: only a redirect
+ * whose target reads as a plain local path is removed
+ * ({@link isRedirectTargetSafe}). Process substitution keeps its parentheses,
+ * a heredoc keeps its second `<`, a network redirect is rejected by target, and
+ * a bare `&` (backgrounding) is never a redirect at all — so each of those
+ * survives into {@link hasStructuralRefusal} and still reaches the human.
+ */
+function stripBenignRedirects(segment: string): string {
+  return segment
+    .replace(BENIGN_REDIRECT, ' ')
+    .replace(REDIRECT_WITH_TARGET, (whole, target: string) =>
+      isRedirectTargetSafe(target) ? ' ' : whole,
+    );
+}
+
+/**
+ * Stands in for a `$(...)` whose body has been lifted out and judged separately.
+ *
+ * Contains NO whitespace, so it stays ONE token through {@link tokenizeSegment}
+ * and cannot split `DIR="$(pwd)/x"` in two - which would strand the assignment
+ * and leave the placeholder sitting in program position. NUL cannot occur in a
+ * real command line, so a literal collision is impossible; were one contrived it
+ * could only force a refusal, never an allow.
+ */
+const SUBSTITUTION_PLACEHOLDER = '\u0000sub\u0000';
+
+/** Bounds the innermost-out rewrite below; a command this nested is refused. */
+const MAX_SUBSTITUTIONS = 32;
+
+/**
+ * Lift every `$(…)` body out innermost-first, leaving a placeholder behind.
+ *
+ * Returns `null` when the command cannot be read this way at all — a backtick
+ * (whose nesting this does not model) or an unbalanced/arithmetic `$((…))`
+ * form. `null` means refuse, which is the pre-existing behavior for all of them.
+ */
+function liftSubstitutions(command: string): { outer: string; bodies: string[] } | null {
+  if (command.includes('`')) return null;
+  const bodies: string[] = [];
+  let outer = command;
+  for (let i = 0; i < MAX_SUBSTITUTIONS && outer.includes('$('); i += 1) {
+    const match = /\$\(([^()]*)\)/.exec(outer);
+    if (match === null) return null; // `$((…))` or unbalanced — unreadable.
+    bodies.push(match[1]!);
+    outer = outer.slice(0, match.index) + SUBSTITUTION_PLACEHOLDER + outer.slice(match.index + match[0].length);
+  }
+  return outer.includes('$(') ? null : { outer, bodies };
+}
+
+/**
+ * The `auto-bash` rung: a bash command every segment of which is free of the
+ * hazard tables above.
+ *
+ * The raw-newline refusal is carried over from the prove-it-safe tier and stays
+ * absolute: a newline inside quotes survives the splitter, and under
+ * allow-unless-hazardous an unread line is a full bypass of every table above
+ * rather than merely a missed allow.
+ *
+ * {@link hasStructuralRefusal}'s two halves are now handled separately, because
+ * measurement showed they were refusing for very different reasons:
+ *
+ *  - REDIRECTION was refusing overwhelmingly on `2>/dev/null`, which vets
+ *    nothing. {@link stripBenignRedirects} removes exactly the discard and
+ *    duplication forms; every real redirection still refuses.
+ *  - COMMAND SUBSTITUTION was refused because it "hides a command no table can
+ *    see". That premise holds only while the command stays hidden — so instead
+ *    of refusing the shape, each `$(…)` body is lifted out and put through THIS
+ *    SAME function recursively. A body that clears every hazard table is not
+ *    hidden, and one that cannot be read (a backtick, `$((…))`) still refuses.
+ *
+ * The load-bearing guard on that second relaxation: a substitution in PROGRAM
+ * position still refuses unconditionally. `$(echo rm) -rf ~` runs whatever the
+ * substitution returns, so judging the body says nothing about what executes —
+ * only a substitution used as a VALUE is judged by its body.
+ */
+export function isAutoModeAllowedBashCommand(rawCommand: string): boolean {
+  const command = rawCommand.trim();
+  if (command.length === 0) return false;
+  if (/[\r\n]/.test(command)) return false;
+
+  const lifted = liftSubstitutions(command);
+  if (lifted === null) return false;
+
+  const segments = splitShellSegments(lifted.outer);
+  if (segments.length === 0) return false;
+
+  const segmentAllowed = (segment: string): boolean => {
+    const readable = stripBenignRedirects(segment);
+    if (hasStructuralRefusal(readable)) return false;
+    // A substitution that decides WHAT RUNS is never judged by its body.
+    const programToken = resolveProgramToken(tokenizeSegment(readable));
+    if (programToken !== null && programToken.includes(SUBSTITUTION_PLACEHOLDER)) return false;
+    return !isAutoModeHazardousSegment(readable);
+  };
+
+  if (!segments.every(segmentAllowed)) return false;
+  // Every lifted body must clear the same bar on its own.
+  return lifted.bodies.every((body) => isAutoModeAllowedBashCommand(body));
+}
+
+// ---------------------------------------------------------------------------
 // The decision
 // ---------------------------------------------------------------------------
 
@@ -716,9 +1491,17 @@ export type OmpGateAllowRule =
   | 'cyboflow-mcp'
   | 'dont-ask'
   | 'auto-allow-tool'
+  /** `hub` proven coordination-only by its arguments ({@link isCoordinationHubCall}). */
+  | 'hub-coordination'
   | 'edit-tool'
   | 'safe-bash'
-  | 'allow-rule';
+  | 'allow-rule'
+  /** `auto` mode's allow-unless-hazardous tool tier. */
+  | 'auto-tool'
+  /** `auto` mode's allow-unless-hazardous bash tier. */
+  | 'auto-bash'
+  /** OMP's `xd://mcp__*` dispatch wrapper, decided by its target ({@link xdMcpDispatchTarget}). */
+  | 'xd-mcp-dispatch';
 
 export type OmpGateDecision =
   | { kind: 'allow'; rule: OmpGateAllowRule }
@@ -762,18 +1545,89 @@ export function isCyboflowMcpTool(
  * would miss it. Object identity is tracked so a cyclic input (which JSON cannot
  * produce, but a foreign runtime could hand us) terminates instead of hanging
  * the handler inside OMP's 30s cap.
+ *
+ * `skipKeys` names the argument keys whose VALUE is authored file text rather
+ * than a target — see {@link FILE_BODY_KEYS_BY_TOOL}. It is matched at every
+ * depth (`ast_edit`'s live inside an `ops` array) and only ever suppresses the
+ * value: the key's siblings, including the tool's real target, still scan.
  */
-export function hasUriSchemeTarget(input: Record<string, unknown>): boolean {
-  return scanForUriScheme(input, new Set<object>());
+export function hasUriSchemeTarget(
+  input: Record<string, unknown>,
+  skipKeys?: ReadonlySet<string>,
+): boolean {
+  return scanForUriScheme(input, new Set<object>(), skipKeys);
 }
 
-function scanForUriScheme(value: unknown, seen: Set<object>): boolean {
+function scanForUriScheme(
+  value: unknown,
+  seen: Set<object>,
+  skipKeys: ReadonlySet<string> | undefined,
+): boolean {
   if (typeof value === 'string') return URI_SCHEME_TARGET.test(value);
   if (value === null || typeof value !== 'object') return false;
   if (seen.has(value)) return false;
   seen.add(value);
-  const members = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
-  return members.some((member) => scanForUriScheme(member, seen));
+  if (Array.isArray(value)) {
+    return value.some((member) => scanForUriScheme(member, seen, skipKeys));
+  }
+  return Object.entries(value as Record<string, unknown>).some(
+    ([key, member]) => skipKeys?.has(key) !== true && scanForUriScheme(member, seen, skipKeys),
+  );
+}
+
+/**
+ * OMP's internal tool-dispatch scheme.
+ *
+ * OMP does not call an MCP tool directly: it dispatches through a pseudo-path,
+ * so `mcp__fal_ai_search_models({query})` arrives at this gate as
+ * `write({ path: 'xd://mcp__fal_ai_search_models', content: '{"query":…}' })`
+ * and the real call follows a beat later under its own name.
+ */
+const XD_DISPATCH_PREFIX = 'xd://';
+
+/**
+ * An `xd://` target that is EXACTLY one MCP tool name — no slash, dot, query or
+ * fragment. A remainder of any other shape is not a shape this gate has
+ * verified, so it gets today's behaviour (the scheme scan disqualifies it and it
+ * reaches the human).
+ */
+const XD_MCP_TARGET = /^mcp__[A-Za-z0-9_]+$/;
+
+/**
+ * The MCP tool an `xd://` dispatch wrapper targets, or `null` when the call is
+ * not one.
+ *
+ * WHY THE WRAPPER IS NOT THE DECISION POINT (the defect this closes). Every
+ * auto-allow rung is narrowed by {@link hasUriSchemeTarget}, and `xd://` is a
+ * URI scheme, so before this existed EVERY MCP call cost the human TWO
+ * approvals: one for the wrapper (a `write` to an opaque URI, which is what the
+ * review card showed) and one for the real call. Measured live on 2026-08-23 in
+ * an `auto` session: 11 of 21 escalations were wrappers.
+ *
+ * Worse, the duplication defeated rule 3. A dispatch of cyboflow's OWN MCP tool
+ * escalated, because at the wrapper the tool name is `write`, not
+ * `mcp__cyboflow_*`. The same run's log carries both halves —
+ * `allowed \`mcp__cyboflow_list_workflows\` (cyboflow-mcp)` next to a human
+ * approval for the `write` that carried it.
+ *
+ * WHY ALLOWING THE WRAPPER COSTS NOTHING. The target is gated independently,
+ * under its true name, with its real arguments — that is what the log line
+ * above proves — so the wrapper decides nothing the target does not decide
+ * again with full fidelity: `disallowedTools`, rule 3, and
+ * {@link isAutoModeAllowedTool}'s blanket `mcp__*` refusal all still apply
+ * there. What changes is only that the human is asked ONCE, at the gate that
+ * can name the tool they are being asked about.
+ *
+ * SCOPED TO `mcp__` TARGETS, deliberately. Re-gating of the target is a
+ * property this gate has OBSERVED for the MCP path and for no other. An
+ * `xd://` dispatch of anything else keeps the unnarrowed behaviour, because
+ * "we have no reason to think it is re-gated" is not evidence that it is.
+ */
+function xdMcpDispatchTarget(input: Record<string, unknown>): string | null {
+  const target = input['path'];
+  if (typeof target !== 'string' || !target.startsWith(XD_DISPATCH_PREFIX)) return null;
+  const name = target.slice(XD_DISPATCH_PREFIX.length);
+  return XD_MCP_TARGET.test(name) ? name : null;
 }
 
 /**
@@ -786,9 +1640,14 @@ function scanForUriScheme(value: unknown, seen: Set<object>): boolean {
  *  3. cyboflow's own MCP tools, by EXACT name — always allowed (our tools, our
  *     server, reached through our own socket).
  *  4. `dontAsk` — allow (log-only), rules 1-2 having already applied.
- *  5. the mode-scoped allowlists — `autoAllowTools`, `editTools`, the
- *     argument-aware `safe-bash` rung ({@link isGateSafeBashCommand}), and
- *     `allowRules` — each narrowed by {@link hasUriSchemeTarget}.
+ *  4b. OMP's `xd://mcp__*` dispatch wrapper — decided by the tool it targets,
+ *     because the target is gated again under its own name
+ *     ({@link xdMcpDispatchTarget}).
+ *  5. the mode-scoped allowlists, each narrowed by {@link hasUriSchemeTarget}:
+ *     `auto`'s allow-unless-hazardous tier ({@link isAutoModeAllowedTool} /
+ *     {@link isAutoModeAllowedBashCommand}), then `autoAllowTools`, `editTools`,
+ *     the argument-aware `safe-bash` rung ({@link isGateSafeBashCommand}), and
+ *     `allowRules`.
  *  6. otherwise: ask the human.
  */
 export function decideToolCall(
@@ -828,15 +1687,41 @@ export function decideToolCall(
     return { kind: 'allow', rule: 'dont-ask' };
   }
 
+  // 4b. An `xd://mcp__*` dispatch wrapper is not a decision point — the tool it
+  //     targets is, and OMP gates that separately under its own name. Deciding
+  //     the wrapper by the target collapses the double-approval, and keeps a
+  //     BLOCK at the earliest gate so the model learns immediately instead of
+  //     after a human has already approved the wrapper.
+  //
+  //     The recursion terminates in one step: the target's input is `{}`, which
+  //     carries no `path`, so it cannot itself be a dispatch. `{}` is the honest
+  //     input, too — the wrapper's `content` is the target's arguments in
+  //     SERIALISED form, and a decision taken on a hand-parsed copy of them
+  //     could disagree with the one taken on the real call. Nothing is lost by
+  //     leaving them out: the only verdict consumed here is `block`, which no
+  //     argument can produce.
+  const dispatchTarget = xdMcpDispatchTarget(input);
+  if (dispatchTarget !== null) {
+    const targetDecision = decideToolCall({ toolName: dispatchTarget, input: {} }, config);
+    if (targetDecision.kind === 'block') return targetDecision;
+    return { kind: 'allow', rule: 'xd-mcp-dispatch' };
+  }
+
   // 5. Mode-scoped allowlists — every one of them NARROWED by the argument scan.
   //
   // The invariant, stated once and applied without carve-outs: NO auto-allow
-  // path passes a call whose arguments name a URI-scheme target. All three
+  // path passes a call whose arguments name a URI-scheme TARGET. All three
   // paths below decide on a tool NAME (or, for `allowRules`, on a name plus a
   // bash-command specifier), and a name cannot express that OMP's own `read` /
   // `grep` escalate themselves to remote exec-tier operations on an `ssh://`
   // path (read.ts:401, grep.ts:906). A scheme in the arguments therefore
   // disqualifies the shortcut and the call falls through to rule 6.
+  //
+  // TARGET is the load-bearing word, and it is not a carve-out: the scan skips
+  // the argument keys that carry AUTHORED FILE TEXT
+  // ({@link FILE_BODY_KEYS_BY_TOOL}), because a file's cargo is not its
+  // destination and no escalation follows from it. Every target key — `path`,
+  // `paths`, and anything a future OMP adds — still scans.
   //
   // This DOES reach `Bash(...)` allow rules whose command carries a URL — an
   // `auto`-mode rule like `Bash(curl https://api.example.com:*)` now asks the
@@ -848,11 +1733,18 @@ export function decideToolCall(
   // first, `dontAsk` still allows first (log-only is log-only), and our own MCP
   // tools are not narrowed — they are exact-name matched, served by cyboflow's
   // own server, and routinely carry URLs in finding bodies and artifact payloads.
-  const remoteTarget = hasUriSchemeTarget(input);
+  const remoteTarget = hasUriSchemeTarget(input, fileBodyKeysFor(toolName));
 
   if (!remoteTarget) {
     if (config.autoAllowTools.includes(toolName)) {
       return { kind: 'allow', rule: 'auto-allow-tool' };
+    }
+    // The argument-aware `hub` rung, at the same tier as the read-safe names
+    // above because a coordination op reaches less far than a file read does.
+    // Name matched EXACTLY, like the bash rung: an unfamiliar casing is a tool
+    // this gate has not verified.
+    if (toolName === OMP_HUB_TOOL_NAME && isCoordinationHubCall(input)) {
+      return { kind: 'allow', rule: 'hub-coordination' };
     }
     if (
       (config.permissionMode === 'acceptEdits' || config.permissionMode === 'auto') &&
@@ -866,7 +1758,7 @@ export function decideToolCall(
     // fail-closed direction for an auto-allow path.
     if (
       (config.permissionMode === 'acceptEdits' || config.permissionMode === 'auto') &&
-      toolName === 'bash' &&
+      toolName === OMP_BASH_TOOL_NAME &&
       typeof input['command'] === 'string' &&
       isGateSafeBashCommand(input['command'])
     ) {
@@ -874,6 +1766,38 @@ export function decideToolCall(
     }
     if (config.permissionMode === 'auto' && matchesAllowRules(toolName, input, config.allowRules)) {
       return { kind: 'allow', rule: 'allow-rule' };
+    }
+    // `auto`'s allow-unless-hazardous tier, LAST among the allow paths so the
+    // narrower rungs above keep their own rule labels — a call they already
+    // vouch for should be logged as `safe-bash` or `edit-tool`, not as the
+    // catch-all. What this adds is everything they cannot vouch for and that is
+    // not on a hazard table: the ordinary build command (`pnpm test`, `mkdir -p`,
+    // `node scripts/x.mjs`) and the ordinary OMP builtin. See the tier's doc block.
+    if (config.permissionMode === 'auto') {
+      // A tool carrying a `command` string RUNS something, so it is classified
+      // as a command, never allowed by name. Only OMP's exact canonical `bash`
+      // is classified: a differently-cased or unfamiliar runner (`Bash`,
+      // `shell`) is one this gate has not verified — it may not even read
+      // `command` the same way — so it falls through to the human, matching the
+      // `safe-bash` rung's own exact-name discipline.
+      const carriesCommand = typeof input['command'] === 'string';
+      // `hub` is argument-classified, never name-classified — and the rung that
+      // does it already ran above. Reaching here means the call was NOT
+      // coordination-only, i.e. it is `start`/`stop`/`restart`/`cancel` or a
+      // `send` that drives a process's stdin. Allowing that by name (which is
+      // what happened before this branch existed, since `hub` is not a hazard
+      // tool and carries no `command` key) would let `auto` launch an arbitrary
+      // `application` without a human ever seeing it.
+      if (toolName === OMP_HUB_TOOL_NAME) {
+        return { kind: 'ask' };
+      }
+      if (toolName === OMP_BASH_TOOL_NAME) {
+        if (carriesCommand && isAutoModeAllowedBashCommand(input['command'] as string)) {
+          return { kind: 'allow', rule: 'auto-bash' };
+        }
+      } else if (!carriesCommand && isAutoModeAllowedTool(toolName)) {
+        return { kind: 'allow', rule: 'auto-tool' };
+      }
     }
   }
 
@@ -1026,6 +1950,10 @@ export function requestSocketDecision(opts: OmpGateSocketOptions): Promise<OmpGa
           type: 'shell-approval-request',
           requestId,
           runId,
+          // Tells the server this is the OMP lane, where a socket that dies
+          // before a verdict is a BUDGET EXPIRY, not a dead requester — see
+          // `OmpGateApprovalRequest.substrate`.
+          substrate: 'omp',
           // Claude-cased on the wire; the local logs keep OMP's own name so a
           // stderr line still matches what the model asked for.
           toolName: canonicalToolNameForOrchestrator(toolName),
@@ -1183,7 +2111,13 @@ export function createToolCallHandler(
       toolInput: event.input,
       logger,
       ...(runtime.connect ? { connect: runtime.connect } : {}),
-      ...(runtime.budgetMs !== undefined ? { budgetMs: runtime.budgetMs } : {}),
+      // Precedence: an explicit test override, then the host-configured budget,
+      // then `HUMAN_DECISION_BUDGET_MS` inside requestSocketDecision.
+      ...(runtime.budgetMs !== undefined
+        ? { budgetMs: runtime.budgetMs }
+        : config.humanDecisionBudgetMs !== undefined
+          ? { budgetMs: config.humanDecisionBudgetMs }
+          : {}),
       inFlight: runtime.inFlight,
     });
 
@@ -1197,8 +2131,10 @@ export function createToolCallHandler(
         reason:
           `cyboflow surfaced \`${event.toolName}\` to the human for approval, but no decision ` +
           `arrived within ${Math.round(HUMAN_DECISION_BUDGET_MS / 1000)}s (OMP caps gate handlers ` +
-          'at 30s, so cyboflow cannot wait longer). The human can approve the request and ask you ' +
-          'to retry, or switch this session\'s permission mode.',
+          'at 30s, so cyboflow cannot wait longer). THE REQUEST IS STILL OPEN in the human\'s ' +
+          'review queue — it was not denied. Retrying this exact call is how you collect their ' +
+          'answer: the retry re-attaches to the same pending request, and once they decide it is ' +
+          'allowed through immediately. Do other work first if you have any, then retry.',
       };
     }
     return {
@@ -1243,7 +2179,11 @@ export function resolveGateRuntime(
  * file is not such an action.
  */
 export default function cyboflowOmpGate(pi: OmpExtensionApi): void {
-  const logger = stderrLogger;
+  // Stamped per LOAD, not per process: a second instance in the same pid means
+  // a second agent (a subagent's extension runner), and without the ordinal the
+  // two are unreadable in a shared stderr stream.
+  gateInstanceSeq += 1;
+  const logger = makeStderrLogger(`p${process.pid}#${gateInstanceSeq}`);
   const runtime = resolveGateRuntime(process.env, logger);
 
   pi.setLabel?.('cyboflow gate');

@@ -6,6 +6,7 @@
  * and drain behaviour.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { Orchestrator } from '../Orchestrator';
 import { RunQueueRegistry } from '../RunQueueRegistry';
 import type { DatabaseLike, PreparedStatement } from '../types';
@@ -175,5 +176,75 @@ describe('Orchestrator', () => {
     const messages = logger.calls.map((c) => c.message);
     expect(messages).toContain('orchestrator.stop.begin');
     expect(messages).toContain('orchestrator.stop.complete');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stuck-event bridge (StuckDetector 'runs:stuck' -> stuckEvents 'detected')
+// ---------------------------------------------------------------------------
+
+describe('Orchestrator stuck-event bridge', () => {
+  it('forwards a detector runs:stuck onto the injected sink as detected', async () => {
+    const sink = new EventEmitter();
+    const received: unknown[] = [];
+    sink.on('detected', (e: unknown) => received.push(e));
+
+    const orch = new Orchestrator({
+      db: makeFakeDb(),
+      logger: makeSpyLogger(),
+      runQueues: new RunQueueRegistry(),
+      stuckEvents: sink,
+    });
+    await orch.start();
+
+    // Reach the detector's own emitter the way the detector does.
+    const detectorEvents = (orch as unknown as { detectorEvents: EventEmitter }).detectorEvents;
+    const event = { runId: 'run-1', reason: { kind: 'orphan_pty' }, detectedAt: 1 };
+    detectorEvents.emit('runs:stuck', event);
+
+    expect(received).toEqual([event]);
+
+    await orch.stop();
+  });
+
+  it('detaches the bridge on stop so a restart does not double-forward', async () => {
+    const sink = new EventEmitter();
+    const received: unknown[] = [];
+    sink.on('detected', (e: unknown) => received.push(e));
+
+    const orch = new Orchestrator({
+      db: makeFakeDb(),
+      logger: makeSpyLogger(),
+      runQueues: new RunQueueRegistry(),
+      stuckEvents: sink,
+    });
+
+    await orch.start();
+    const firstEmitter = (orch as unknown as { detectorEvents: EventEmitter }).detectorEvents;
+    await orch.stop();
+
+    // The old emitter is detached: anything it emits now is ignored.
+    firstEmitter.emit('runs:stuck', { runId: 'stale', reason: { kind: 'orphan_pty' }, detectedAt: 1 });
+    expect(received).toHaveLength(0);
+
+    await orch.start();
+    const secondEmitter = (orch as unknown as { detectorEvents: EventEmitter }).detectorEvents;
+    secondEmitter.emit('runs:stuck', { runId: 'run-2', reason: { kind: 'orphan_pty' }, detectedAt: 2 });
+    expect(received).toHaveLength(1);
+
+    await orch.stop();
+  });
+
+  it('warns rather than throwing when no sink is injected', async () => {
+    const logger = makeSpyLogger();
+    const orch = new Orchestrator({
+      db: makeFakeDb(),
+      logger,
+      runQueues: new RunQueueRegistry(),
+    });
+
+    await orch.start();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('stuckEvents sink not provided'));
+    await orch.stop();
   });
 });

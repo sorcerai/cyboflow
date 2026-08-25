@@ -92,6 +92,7 @@ describe('ConfigManager.getVisualVerifyConfig', () => {
     expect(cfg.devServerPorts).toEqual([...DEFAULT_VERIFY_DEV_PORTS]);
     expect(cfg.simulatorDevices).toEqual([]);
     expect(cfg.agentSlots).toBe(2);
+    expect(cfg.autoBootstrapRunbook).toBe(false);
   });
 
   it('applies defaults per-member for a partial override (only set members replaced)', async () => {
@@ -110,6 +111,16 @@ describe('ConfigManager.getVisualVerifyConfig', () => {
     expect(cfg.devServerPorts).toEqual([...DEFAULT_VERIFY_DEV_PORTS]);
     expect(cfg.simulatorDevices).toEqual([]);
     expect(cfg.agentSlots).toBe(2);
+    // Enabling verification does NOT enable the bootstrap: they are separate
+    // decisions, and only the second one lets a run commit to the branch.
+    expect(cfg.autoBootstrapRunbook).toBe(false);
+  });
+
+  it('the runbook bootstrap is its own switch, opted into independently', async () => {
+    const mgr = new ConfigManager('/tmp/test-git-path');
+    await mgr.initialize();
+    await mgr.updateConfig({ visualVerify: { enabled: true, autoBootstrapRunbook: true } });
+    expect(mgr.getVisualVerifyConfig().autoBootstrapRunbook).toBe(true);
   });
 
   it('floors an empty devServerPorts array to the default pool', async () => {
@@ -146,6 +157,8 @@ describe('ConfigManager.getVisualVerifyConfig', () => {
       queuedAgeCeilingMs: 15 * 60 * 1000,
       // Not overridden above → floored to the default (§4 roster footnote 1).
       agentSlots: 2,
+      // Not overridden above → floored OFF (lane-runbook-bootstrap.md).
+      autoBootstrapRunbook: false,
     });
   });
 

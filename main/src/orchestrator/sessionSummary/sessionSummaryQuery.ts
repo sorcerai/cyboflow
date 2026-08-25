@@ -283,29 +283,62 @@ export function makeSessionSummarizer(
       let costUsd = 0;
       let resultErrorMessage: string | null = null;
 
-      for await (const msg of q) {
-        if (msg.type === 'assistant') {
-          const text = extractAssistantText(msg.message);
-          if (text.length > 0) assistantText = text;
-        } else if (msg.type === 'result') {
-          costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : 0;
-          if (msg.subtype !== 'success') {
-            resultErrorMessage = `session summary query returned a non-success result (${msg.subtype})`;
+      // The SDK surfaces a failed run by THROWING out of the iterator (it
+      // replaces the exit error with the error-result text, e.g. "Claude Code
+      // returned an error result: Reached maximum number of turns (1)"), so the
+      // `msg.subtype` branch below is not the only failure path — and an
+      // uncaught throw here would discard assistantText we may already hold in
+      // full. Capture it and decide after the loop.
+      let streamError: unknown = null;
+      try {
+        for await (const msg of q) {
+          if (msg.type === 'assistant') {
+            const text = extractAssistantText(msg.message);
+            if (text.length > 0) assistantText = text;
+          } else if (msg.type === 'result') {
+            costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : 0;
+            if (msg.subtype !== 'success') {
+              resultErrorMessage = `session summary query returned a non-success result (${msg.subtype})`;
+            }
           }
         }
+      } catch (err) {
+        streamError = err;
       }
 
-      if (didTimeOut()) {
-        throw new Error(`session summary query timed out after ${timeoutMs}ms`);
-      }
-      if (resultErrorMessage) {
-        throw new Error(resultErrorMessage);
+      const failure = streamError
+        ? streamError instanceof Error
+          ? streamError.message
+          : String(streamError)
+        : didTimeOut()
+          ? `session summary query timed out after ${timeoutMs}ms`
+          : resultErrorMessage;
+
+      if (failure && assistantText.length === 0) {
+        throw new Error(failure);
       }
       if (assistantText.length === 0) {
         throw new Error('session summary query produced no assistant text');
       }
 
-      const parsed = parseSummaryResponse(assistantText);
+      // Salvage: a run can end in an error (a turn-cap overrun, an abort) after
+      // the model has already emitted its complete answer. parseSummaryResponse
+      // is strict — it only returns for well-formed, fully-populated JSON — so
+      // clearing it means the response IS complete, whatever ended the stream.
+      // A truncated one fails to parse and we rethrow the original cause below,
+      // which is the right verdict.
+      let parsed: ParsedSummaryResponse;
+      try {
+        parsed = parseSummaryResponse(assistantText);
+      } catch (parseErr) {
+        if (failure) throw new Error(failure);
+        throw parseErr;
+      }
+      if (failure) {
+        logger?.warn('[sessionSummaryQuery] recovered a complete summary from a failed run', {
+          error: failure,
+        });
+      }
       return { summary: parsed.summary, historySentences: parsed.historySentences, costUsd };
     } catch (err) {
       const message = didTimeOut()

@@ -218,7 +218,12 @@ export class SessionManager extends EventEmitter {
       // file plugins inherited). The columns themselves are read directly off the
       // DB row at SDK spawn (claudeCodeManager), not via this runtime object.
       disabledMcpServers: parseStringArrayColumn(dbSession.disabled_mcp_servers_json),
-      enabledPlugins: parseStringArrayColumn(dbSession.enabled_plugins_json)
+      enabledPlugins: parseStringArrayColumn(dbSession.enabled_plugins_json),
+      // Idea-session home/lineage (migrations 111/112). Unlike design_idea_id
+      // (deliberately not mapped here), these back the idea-home concept and are
+      // read by the runtime, so they're allowlisted.
+      homeIdeaId: dbSession.home_idea_id ?? null,
+      originIdeaId: dbSession.origin_idea_id ?? null
     };
   }
 

@@ -122,6 +122,25 @@ untouched.
 Then add a `## Summary` section: the counts (fixed / deferred / invalid), the
 complete list of files you changed, and any test you added, updated, or saw fail.
 
+## Files the harness derived — never touch them
+
+A sprint or ship run can derive its own **verification runbook**
+(`.cyboflow/verify-runbook.json`), and sometimes one small configuration change
+that makes the project stand up for verification. When that happened, the step
+delegating to you names those files. Two of them are booby-trapped for a
+well-meant fix:
+
+- the runbook's proof is **content-addressed against the committed bytes**, so
+  ANY edit to it — including a correct one — invalidates the proof, and the next
+  verification silently skips instead of running;
+- the configuration change is what makes the project serve at all, so reverting
+  it un-proves the environment while the runbook goes on claiming otherwise.
+
+So: leave every named file exactly as it is, even if a finding appears to be
+about one, and even if it looks wrong to you. If you believe one is genuinely
+wrong, say so in your disposition and leave the file alone — a finding a human
+reads is worth far more here than a fix that silently disables verification.
+
 End with a single machine-readable line, as the LAST line:
 
 - `ADDRESSED: <n> fixed, <n> deferred, <n> invalid`

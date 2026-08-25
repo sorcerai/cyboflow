@@ -29,6 +29,10 @@
  *     Manual.
  *   - import crash recovery: a pass killed between the create and the link
  *     write adopts the half-imported idea instead of duplicating it.
+ *   - the cross-scope duplicate guard: an issue a SIBLING mapping on the same
+ *     tracker identity already links is skipped permanently (the cursor moves),
+ *     while another workspace claims nothing and a half-import of this
+ *     connection's own is still repaired ahead of the guard.
  *   - deletion sweep in both conflict modes, including the scope-exit case —
  *     an issue absent from the SCOPED id listing but still alive on the point
  *     lookup is out of scope, not deleted.
@@ -50,21 +54,23 @@ import { join } from 'node:path';
 import { DatabaseService } from '../../../database/database';
 import { TASK_ALL_CHANNEL, TaskChangeRouter, taskChangeEvents } from '../../../orchestrator/taskChangeRouter';
 import { dbAdapter } from '../../../orchestrator/__test_fixtures__/dbAdapter';
-import type { TaskChangedEvent } from '../../../../../shared/types/tasks';
+import type { EntityCategory, Priority, TaskChangedEvent } from '../../../../../shared/types/tasks';
 import type {
   TrackerIssue,
   TrackerSourceNarrow,
   TrackerSourceSelection,
+  TrackerGroupTree,
   TrackerSourceTree,
   TrackerState,
   TrackerWorkspaceIdentity,
 } from '../../../../../shared/types/trackerSync';
-import type { TrackerAdapter, TrackerAdapterCapabilities } from '../adapterTypes';
+import type { TrackerAdapter, TrackerAdapterCapabilities, TrackerFieldOptionsRaw} from '../adapterTypes';
 import type { TrackerConflictRow, TrackerConnectionRow, TrackerOutboxRow } from '../../../database/models';
 import {
   insertConnection,
   getConnection,
   getLinkByExternal,
+  upsertLink,
   enqueueOutbox,
   updateBaseline,
   updateConnectionSettings,
@@ -116,10 +122,18 @@ class FakeAdapter implements TrackerAdapter {
     nativeParentAutoClose: true,
     selfHostedBaseUrl: false,
     idempotentCreate: true,
+    contentWrite: { title: true, description: true, priority: true, category: false },
+    archive: 'trash',
   };
 
   issues: TrackerIssue[] = [];
   states: TrackerState[] = STATES;
+  /**
+   * What the pass seeds its priority/category mappings from. Defaults to
+   * Linear's fixed scale (this adapter's provider); a Dart-shaped test swaps in
+   * a live `/config` list.
+   */
+  fieldOptions: TrackerFieldOptionsRaw = { priorities: ['0', '1', '2', '3', '4'], categories: null };
   /** Overrides the deletion sweep's id set; null = derive it from `issues`. */
   remoteIds: string[] | null = null;
   /**
@@ -135,6 +149,9 @@ class FakeAdapter implements TrackerAdapter {
   async validateCredentials(): Promise<TrackerWorkspaceIdentity> {
     throw new Error('not used');
   }
+  async listGroups(): Promise<TrackerGroupTree> {
+    return { sections: [] };
+  }
   async listContainers(): Promise<TrackerSourceTree> {
     throw new Error('not used');
   }
@@ -143,6 +160,9 @@ class FakeAdapter implements TrackerAdapter {
   }
   async listStates(): Promise<TrackerState[]> {
     return this.states;
+  }
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    return this.fieldOptions;
   }
   async listIssues(_selection: TrackerSourceSelection, sinceIso?: string): Promise<TrackerIssue[]> {
     this.sinceCalls.push(sinceIso);
@@ -161,6 +181,12 @@ class FakeAdapter implements TrackerAdapter {
     throw new Error('not used');
   }
   async updateIssueState(): Promise<void> {
+    throw new Error('not used');
+  }
+  async updateIssueContent(): Promise<TrackerIssue | null> {
+    throw new Error('not used');
+  }
+  async archiveIssue(): Promise<void> {
     throw new Error('not used');
   }
 }
@@ -226,6 +252,11 @@ function makeIssue(overrides: Partial<TrackerIssue> = {}): TrackerIssue {
     parentExternalId: null,
     updatedAt: '2026-07-30T10:00:00.000Z',
     archivedAt: null,
+    // Linear's '3' (Medium) — the token the default mapping round-trips with
+    // the P2 that every entity this suite creates carries, so an issue nobody
+    // overrode never produces a priority diff.
+    priority: '3',
+    category: null,
     recoveryClientKey: null,
     ...overrides,
   };
@@ -273,6 +304,11 @@ function makeConnection(overrides: Partial<NewConnectionRow> = {}): TrackerConne
     status_sync_mode: 'auto',
     pull_mode: 'auto',
     push_mode: 'auto',
+    push_target: 1,
+    content_sync_mode: 'off',
+    archive_sync_mode: 'off',
+    priority_mapping_json: '{}',
+    category_mapping_json: '{}',
     mirror_subissues: 1,
     conflict_mode: 'auto',
     cursor_updated_at: null,
@@ -324,6 +360,23 @@ function baselineOf(externalId: string): TrackerBaseline {
 // ---------------------------------------------------------------------------
 
 describe('runInboundSync — fresh import', () => {
+  it("treats an outbound-only 'indev' mapping exactly like don't-import", async () => {
+    // 'indev' pins the WRITE-BACK state; it must never act as an inbound
+    // target, because position 7 is orchestrator-derived and a tracker actor
+    // writing it is rejected as 'forbidden_stage'. Importing it would either
+    // throw or land a stage the boot self-heal reverts on the next pass.
+    const connection = makeConnection({
+      state_mapping_json: JSON.stringify({ 'st-backlog': 'indev' }),
+    });
+    adapter.issues = [makeIssue()];
+
+    const report = await runInboundSync(deps, connection);
+
+    expect(report.imported).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(ideas()).toHaveLength(0);
+  });
+
   it('imports an orphaned issue as an idea with a provenance footer, link, baseline and cursor', async () => {
     const connection = makeConnection();
     const issue = makeIssue();
@@ -355,6 +408,11 @@ describe('runInboundSync — fresh import', () => {
       description: 'Two-way sync with Linear.',
       stateId: 'st-backlog',
       updatedAt: '2026-07-30T10:00:00.000Z',
+      // Emitted from the very first snapshot, including as null: a baseline
+      // that omitted them would read as "never synced" and make the next pass
+      // take the backfill arm instead of merging.
+      priority: '3',
+      category: null,
     });
 
     const after = reload();
@@ -604,6 +662,94 @@ describe('runInboundSync — a half-import is repaired regardless of current eli
 });
 
 // ---------------------------------------------------------------------------
+// Cross-scope duplicate imports
+//
+// Multi-project mapping mints N sibling connections on one tracker identity,
+// and their scopes overlap by construction (a Linear team group and a project
+// group beneath it), so the SAME issue is fetched by two connections. To the
+// second one it looks unlinked — the link is the sibling's — and importing it
+// would mint a second idea for one remote issue.
+// ---------------------------------------------------------------------------
+
+describe('runInboundSync — an issue a sibling mapping already owns', () => {
+  /**
+   * A second mapping of the same workspace onto ANOTHER cyboflow project,
+   * already holding a link for `externalId` — the shape the wizard produces
+   * when two overlapping groups are mapped in one pass.
+   */
+  function seedSiblingMapping(
+    externalId: string,
+    overrides: Partial<NewConnectionRow> = {},
+  ): TrackerConnectionRow {
+    raw.prepare('INSERT INTO projects (id, name, path) VALUES (2, ?, ?)').run('Proj 2', '/tmp/p2');
+    const sibling = makeConnection({
+      id: 'conn-sibling',
+      project_id: 2,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+      ...overrides,
+    });
+    upsertLink(raw, {
+      connection_id: sibling.id,
+      entity_type: 'idea',
+      entity_id: 'ide_sibling',
+      provider: 'linear',
+      external_id: externalId,
+    });
+    return sibling;
+  }
+
+  it('skips it, counts it as cross-scope, and still advances the cursor', async () => {
+    const connection = makeConnection();
+    seedSiblingMapping('ext-1');
+    adapter.issues = [makeIssue()];
+
+    const report = await runInboundSync(deps, connection);
+
+    expect(report.imported).toBe(0);
+    expect(report.crossScopeSkips).toBe(1);
+    // The reason breakdown of a permanent skip, so it counts as skipped too.
+    expect(report.skipped).toBe(1);
+    expect(ideas()).toHaveLength(0);
+    expect(getLinkByExternal(raw, 'conn-1', 'ext-1')).toBeNull();
+    // PERMANENT — the issue belongs to the sibling, so nothing is re-offered.
+    expect(reload().cursor_external_id).toBe('ext-1');
+  });
+
+  it('imports normally when the other connection is on a DIFFERENT workspace', async () => {
+    const connection = makeConnection();
+    seedSiblingMapping('ext-1', { workspace_id: 'ws-2' });
+    adapter.issues = [makeIssue()];
+
+    const report = await runInboundSync(deps, connection);
+
+    expect(report.imported).toBe(1);
+    expect(report.crossScopeSkips).toBe(0);
+    expect(getLinkByExternal(raw, 'conn-1', 'ext-1')).not.toBeNull();
+  });
+
+  it('still repairs THIS connection’s half-import — the guard sits behind the adoption', async () => {
+    // Precedence, deliberately: the local idea already exists, and the link is
+    // the only thing that stops it being an orphan forever. A guard that ran
+    // first would strand it the moment a sibling claimed the issue.
+    const connection = makeConnection();
+    const crashing = new CrashingRouter(router);
+    const crashDeps: InboundSyncDeps = { ...deps, router: crashing };
+    adapter.issues = [makeIssue()];
+    crashing.crashAfterCreate = true;
+    await expect(runInboundSync(crashDeps, connection)).rejects.toThrow('simulated crash');
+    crashing.crashAfterCreate = false;
+    const orphanId = ideas()[0].id;
+
+    seedSiblingMapping('ext-1');
+    const report = await runInboundSync(crashDeps, reload());
+
+    expect(report.crossScopeSkips).toBe(0);
+    expect(getLinkByExternal(raw, 'conn-1', 'ext-1')?.entity_id).toBe(orphanId);
+    expect(ideas()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Overlap-window dedup
 // ---------------------------------------------------------------------------
 
@@ -688,6 +834,8 @@ describe('runInboundSync — three-way merge', () => {
       description: 'Linear AND Plane.',
       stateId: 'st-backlog',
       updatedAt: '2026-07-30T11:00:00.000Z',
+      priority: '3',
+      category: null,
     });
   });
 
@@ -931,6 +1079,460 @@ describe('runInboundSync — three-way merge', () => {
     expect(report.conflictsOpened).toBe(0);
     expect(report.updated).toBe(0);
     expect(baselineOf('ext-1').title).toBe('Agreed title');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two MAPPED fields
+//
+// Priority and category do NOT diff on their literal values: the local scale is
+// seven levels and every provider offers four or five, so the merge converts
+// the LOCAL side out through the effective mapping and compares in PROVIDER
+// space (invariant 2). These cases pin that, the never-synced backfill arm, and
+// the unmappable-token report.
+// ---------------------------------------------------------------------------
+
+describe('runInboundSync — priority merge', () => {
+  /** Import `issue`, then hand back the created idea id. */
+  async function importOnce(connection: TrackerConnectionRow, issue: TrackerIssue): Promise<string> {
+    adapter.issues = [issue];
+    await runInboundSync(deps, connection);
+    return ideas()[0].id;
+  }
+
+  /** The linked entity's stored priority/category. */
+  function entityFields(id: string): { priority: string; category: string } {
+    return raw.prepare('SELECT priority, category FROM ideas WHERE id = ?').get(id) as {
+      priority: string;
+      category: string;
+    };
+  }
+
+  /** Everything entity_events recorded for one entity, newest last. */
+  function events(id: string): Array<{ actor: string; changes_json: string | null }> {
+    return raw
+      .prepare('SELECT actor, changes_json FROM entity_events WHERE entity_id = ? ORDER BY seq ASC')
+      .all(id) as Array<{ actor: string; changes_json: string | null }>;
+  }
+
+  /** Set a local value the way a USER would — through the chokepoint, as 'user'. */
+  async function setLocal(id: string, fields: { priority?: Priority; category?: EntityCategory }): Promise<void> {
+    await router.applyChange(1, { actor: 'user', entityType: 'idea', taskId: id, fields });
+  }
+
+  it('carries the remote priority onto the IMPORTED idea', async () => {
+    // Without this the idea takes the table default (P2) while its baseline
+    // records the remote's real token — a gap that never closes, because the
+    // next pass reads it as "the user re-prioritized locally" and (once
+    // outbound content write-back exists) demotes the tracker to match.
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue({ priority: '1' }));
+
+    expect(entityFields(ideaId).priority).toBe('P0');
+    expect(baselineOf('ext-1').priority).toBe('1');
+    // …and the very next pass sees a settled entity, not a local change.
+    adapter.issues = [makeIssue({ priority: '1', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+    expect(report.updated).toBe(0);
+    expect(report.conflictsOpened).toBe(0);
+  });
+
+  it('leaves the local default in place when the remote value has no mapping', async () => {
+    // No prior expectation to violate, so this is silent rather than reported —
+    // unlike a remote value that CHANGED out from under a mapping.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Blocker' }));
+
+    expect(entityFields(ideaId).priority).toBe('P2');
+  });
+
+  it('applies a remote-only priority change through the mapping, as the PROVIDER', async () => {
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue());
+    expect(entityFields(ideaId).priority).toBe('P2');
+
+    // Linear '1' is Urgent.
+    adapter.issues = [makeIssue({ priority: '1', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.updated).toBe(1);
+    expect(report.conflictsOpened).toBe(0);
+    expect(entityFields(ideaId).priority).toBe('P0');
+    // The baseline stores the PROVIDER-RAW token, never the local level.
+    expect(baselineOf('ext-1').priority).toBe('1');
+    // actor = the provider, so writeBack's listener skips its own inbound value.
+    const last = events(ideaId).at(-1);
+    expect(last?.actor).toBe('linear');
+    expect(last?.changes_json).toContain('P0');
+  });
+
+  it('does NOT demote a P3 when the remote sits on the rung P3 shares with P2', async () => {
+    // THE FLAP CASE (invariant 2). P2 and P3 both mean Linear '3'. A merge that
+    // compared in LOCAL space would map '3' back to P2 and quietly overwrite the
+    // user's P3 — on this pass, and on every pass after it.
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue({ priority: '2' }));
+    await setLocal(ideaId, { priority: 'P3' });
+
+    adapter.issues = [makeIssue({ priority: '3', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    // The remote MOVED (2 -> 3), and the two sides now agree in provider space.
+    expect(report.conflictsOpened).toBe(0);
+    expect(report.autoResolved).toBe(0);
+    expect(entityFields(ideaId).priority).toBe('P3');
+
+    // And it stays P3 on a second pass, which is the part that matters.
+    adapter.issues = [makeIssue({ priority: '3', updatedAt: '2026-07-30T12:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+    expect(entityFields(ideaId).priority).toBe('P3');
+  });
+
+  it('opens ONE conflict, in provider space, when both sides moved', async () => {
+    const connection = makeConnection({ conflict_mode: 'manual' });
+    const ideaId = await importOnce(connection, makeIssue());
+    await setLocal(ideaId, { priority: 'P0' });
+
+    adapter.issues = [makeIssue({ priority: '2', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.conflictsOpened).toBe(1);
+    const [row] = conflicts();
+    expect(row.field).toBe('priority');
+    // BOTH sides as provider tokens: the local P0 converted out, not 'P0'.
+    expect(row.local_value).toBe('1');
+    expect(row.remote_value).toBe('2');
+    // The pass's own resolution of the remote token, recorded so a later ruling
+    // need not rebuild the mapping from a live probe.
+    expect(JSON.parse(row.payload_json ?? '{}')).toMatchObject({ remoteLocal: 'P1' });
+    // Manual mode parks the item: nothing applied, baseline untouched.
+    expect(entityFields(ideaId).priority).toBe('P0');
+    expect(baselineOf('ext-1').priority).toBe('3');
+  });
+
+  it('gives AUTO mode to the tracker and files the audit finding', async () => {
+    const review = new FakeReviewRouter();
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue());
+    await setLocal(ideaId, { priority: 'P0' });
+
+    adapter.issues = [makeIssue({ priority: '2', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync({ ...deps, reviewRouter: review }, reload());
+
+    expect(report.autoResolved).toBe(1);
+    expect(report.conflictsOpened).toBe(0);
+    expect(entityFields(ideaId).priority).toBe('P1');
+    expect(review.created).toHaveLength(1);
+    expect(review.created[0].body).toContain('priority');
+  });
+
+  it('leaves a LOCAL-only priority change alone — outbound owns pushing it', async () => {
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue());
+    await setLocal(ideaId, { priority: 'P0' });
+
+    adapter.issues = [makeIssue({ title: 'Retitled', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+
+    expect(entityFields(ideaId).priority).toBe('P0');
+    expect(conflicts()).toHaveLength(0);
+  });
+
+  it('round-trips a CLEARED Dart priority to P6 and back to no value', async () => {
+    // Dart omits a null field entirely, so unset arrives as null — and P6 is
+    // the local level that maps OUT to nothing, which is what closes the loop.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium' }));
+    expect(entityFields(ideaId).priority).toBe('P2');
+
+    adapter.issues = [makeIssue({ priority: null, updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+
+    expect(entityFields(ideaId).priority).toBe('P6');
+    expect(baselineOf('ext-1').priority).toBeNull();
+  });
+
+  it("matches Dart's Title-case reads against its lowercase /config tokens", async () => {
+    // MEASURED: /config lists 'critical', every task read returns 'Critical'.
+    // A case-sensitive compare would report a change on every single pass.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [makeIssue({ priority: 'MEDIUM', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.updated).toBe(0);
+    expect(report.conflictsOpened).toBe(0);
+    expect(entityFields(ideaId).priority).toBe('P2');
+  });
+});
+
+describe('runInboundSync — a remote value the mapping cannot express', () => {
+  async function importOnce(connection: TrackerConnectionRow, issue: TrackerIssue): Promise<string> {
+    adapter.issues = [issue];
+    await runInboundSync(deps, connection);
+    return ideas()[0].id;
+  }
+
+  function priorityOf(id: string): string {
+    return (raw.prepare('SELECT priority FROM ideas WHERE id = ?').get(id) as { priority: string })
+      .priority;
+  }
+
+  it('applies nothing, opens no conflict, and REPORTS it', async () => {
+    // A bespoke workspace priority, or one the workspace renamed. Guessing a
+    // level would apply a priority the user never chose; opening a conflict
+    // would offer a "take theirs" button that could not do anything.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [makeIssue({ priority: 'Blocker', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.unmappedFieldValues).toBe(1);
+    expect(report.conflictsOpened).toBe(0);
+    expect(report.autoResolved).toBe(0);
+    expect(priorityOf(ideaId)).toBe('P2');
+  });
+
+  it('PINS the baseline half so the warning re-derives instead of going quiet', async () => {
+    // If the snapshot advanced onto the unmapped token, the next pass would see
+    // no delta and stop reporting — a one-line warning about a renamed tracker
+    // value would scroll away after a single pass and never return.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [makeIssue({ priority: 'Blocker', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+    expect(baselineOf('ext-1').priority).toBe('Medium');
+
+    adapter.issues = [makeIssue({ priority: 'Blocker', updatedAt: '2026-07-30T12:00:00.000Z' })];
+    const second = await runInboundSync(deps, reload());
+    expect(second.unmappedFieldValues).toBe(1);
+  });
+
+  it('still advances the CURSOR — the condition is not one time resolves', async () => {
+    // Unlike a held direction, an unmapped value is not waiting on anything, so
+    // pinning the fetch window on it would stall every issue behind it forever.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [makeIssue({ priority: 'Blocker', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+
+    expect(reload().cursor_updated_at).toBe('2026-07-30T11:00:00.000Z');
+  });
+
+  it('lets the OTHER fields of the same issue merge normally', async () => {
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({ provider: 'dart' });
+    await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [
+      makeIssue({ priority: 'Blocker', title: 'Retitled', updatedAt: '2026-07-30T11:00:00.000Z' }),
+    ];
+    await runInboundSync(deps, reload());
+
+    expect(ideas()[0].title).toBe('Retitled');
+    expect(baselineOf('ext-1').title).toBe('Retitled');
+  });
+
+  it('REPORTS a persisted mapping entry the workspace renamed away', async () => {
+    // The outbound half of the same rename, and it reaches the user through the
+    // same ⚠ line: the wizard persisted the whole seeded table, so 'critical'
+    // is in the overlay even though the seed just dropped it. Restoring it
+    // verbatim would queue a write Dart 400s on and the outbox calls terminal.
+    adapter.fieldOptions = { priorities: ['high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({
+      provider: 'dart',
+      priority_mapping_json: JSON.stringify({
+        toProvider: { P0: 'critical', P1: 'high', P2: 'medium', P4: 'low', P6: null },
+      }),
+    });
+    await importOnce(connection, makeIssue({ priority: 'Medium' }));
+
+    adapter.issues = [makeIssue({ priority: 'Medium', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    // Counted once per pass, and again on the NEXT pass — a stale mapping stays
+    // reported until the user confirms it, exactly like an unmapped read.
+    expect(report.unmappedFieldValues).toBe(1);
+    adapter.issues = [makeIssue({ priority: 'Medium', updatedAt: '2026-07-30T12:00:00.000Z' })];
+    expect((await runInboundSync(deps, reload())).unmappedFieldValues).toBe(1);
+  });
+
+  it('imports an UNSET remote priority as P6 even when P0 is mapped to nothing', async () => {
+    // The regression: "— Not sent" on P0 used to make Dart's absent priority
+    // resolve to the first level with no outbound token, importing every
+    // unprioritized issue as CRITICAL.
+    adapter.fieldOptions = { priorities: ['critical', 'high', 'medium', 'low'], categories: [] };
+    const connection = makeConnection({
+      provider: 'dart',
+      priority_mapping_json: JSON.stringify({ toProvider: { P0: null } }),
+    });
+    const ideaId = await importOnce(connection, makeIssue({ priority: null }));
+
+    expect(priorityOf(ideaId)).toBe('P6');
+  });
+});
+
+describe('runInboundSync — the never-synced backfill arm', () => {
+  async function importOnce(connection: TrackerConnectionRow, issue: TrackerIssue): Promise<string> {
+    adapter.issues = [issue];
+    await runInboundSync(deps, connection);
+    return ideas()[0].id;
+  }
+
+  /**
+   * Rewrite the link's baseline to the shape a pre-feature build left behind:
+   * the content/state keys present, the two mapped fields ABSENT. This is the
+   * state every existing link is in the first time this code runs.
+   */
+  function stripMappedKeys(externalId: string): void {
+    const link = getLinkByExternal(raw, 'conn-1', externalId);
+    if (link === null || link.baseline_json === null) throw new Error('no link');
+    const blob = JSON.parse(link.baseline_json) as Record<string, unknown>;
+    delete blob.priority;
+    delete blob.category;
+    updateBaseline(raw, link.id, JSON.stringify(blob));
+  }
+
+  it('does nothing on the first pass — no diff, no conflict, no apply', async () => {
+    // Falling through to the ordinary diff here would open a conflict (or
+    // silently overwrite the local priority) on EVERY linked entity at once,
+    // the first time a build carrying this code ran a pass.
+    const connection = makeConnection({ conflict_mode: 'manual' });
+    const ideaId = await importOnce(connection, makeIssue());
+    await router.applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { priority: 'P0' },
+    });
+    stripMappedKeys('ext-1');
+
+    // Both sides differ from each other AND from the (absent) baseline.
+    adapter.issues = [makeIssue({ priority: '2', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.conflictsOpened).toBe(0);
+    expect(report.autoResolved).toBe(0);
+    expect(report.unmappedFieldValues).toBe(0);
+    expect(
+      (raw.prepare('SELECT priority FROM ideas WHERE id = ?').get(ideaId) as { priority: string })
+        .priority,
+    ).toBe('P0');
+  });
+
+  it('HEALS the baseline in that same pass, so merging starts from the next change', async () => {
+    const connection = makeConnection();
+    await importOnce(connection, makeIssue());
+    stripMappedKeys('ext-1');
+    expect(baselineOf('ext-1').priority).toBeUndefined();
+
+    adapter.issues = [makeIssue({ priority: '2', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+    expect(baselineOf('ext-1').priority).toBe('2');
+
+    // The NEXT remote move is an ordinary remote-only change and applies.
+    adapter.issues = [makeIssue({ priority: '1', updatedAt: '2026-07-30T12:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+    expect(
+      (raw.prepare('SELECT priority FROM ideas ORDER BY rowid ASC').get() as { priority: string })
+        .priority,
+    ).toBe('P0');
+  });
+});
+
+describe('runInboundSync — category merge (Dart only)', () => {
+  const DART_TYPES = ['Feature', 'Bug', 'Chore', 'Task'];
+
+  async function importOnce(connection: TrackerConnectionRow, issue: TrackerIssue): Promise<string> {
+    adapter.issues = [issue];
+    await runInboundSync(deps, connection);
+    return ideas()[0].id;
+  }
+
+  function categoryOf(id: string): string {
+    return (raw.prepare('SELECT category FROM ideas WHERE id = ?').get(id) as { category: string })
+      .category;
+  }
+
+  it('applies a remote-only type change on Dart', async () => {
+    adapter.fieldOptions = { priorities: ['medium'], categories: DART_TYPES };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium', category: 'Feature' }));
+    expect(categoryOf(ideaId)).toBe('feature');
+
+    adapter.issues = [
+      makeIssue({ priority: 'Medium', category: 'Bug', updatedAt: '2026-07-30T11:00:00.000Z' }),
+    ];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.updated).toBe(1);
+    expect(categoryOf(ideaId)).toBe('bug');
+    expect(baselineOf('ext-1').category).toBe('Bug');
+  });
+
+  it('reports a Dart type the mapping does not name, rather than guessing', async () => {
+    adapter.fieldOptions = { priorities: ['medium'], categories: DART_TYPES };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium', category: 'Bug' }));
+
+    adapter.issues = [
+      makeIssue({ priority: 'Medium', category: 'Milestone', updatedAt: '2026-07-30T11:00:00.000Z' }),
+    ];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.unmappedFieldValues).toBe(1);
+    expect(categoryOf(ideaId)).toBe('bug');
+  });
+
+  it('stands the whole arm down on a provider with no type field', async () => {
+    // Linear sends a structural null because it models no issue type at all.
+    // Diffing a local 'bug' against that would read the absence of the CONCEPT
+    // as "the tracker cleared this entity's category".
+    const connection = makeConnection();
+    const ideaId = await importOnce(connection, makeIssue());
+    await router.applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { category: 'bug' },
+    });
+
+    adapter.issues = [makeIssue({ title: 'Retitled', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.conflictsOpened).toBe(0);
+    expect(report.autoResolved).toBe(0);
+    expect(report.unmappedFieldValues).toBe(0);
+    expect(categoryOf(ideaId)).toBe('bug');
+  });
+
+  it('maps nothing on a Dart workspace whose types are not categories', async () => {
+    // The real probe workspace: Task / Subtask / Project / Milestone. Nothing
+    // matches, so the arm has no vocabulary and reports rather than inventing.
+    adapter.fieldOptions = {
+      priorities: ['medium'],
+      categories: ['Task', 'Subtask', 'Project', 'Milestone'],
+    };
+    const connection = makeConnection({ provider: 'dart' });
+    const ideaId = await importOnce(connection, makeIssue({ priority: 'Medium', category: 'Task' }));
+
+    adapter.issues = [
+      makeIssue({ priority: 'Medium', category: 'Subtask', updatedAt: '2026-07-30T11:00:00.000Z' }),
+    ];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.unmappedFieldValues).toBe(1);
+    expect(categoryOf(ideaId)).toBe('feature');
   });
 });
 
@@ -1235,7 +1837,7 @@ describe('runDeletionSweep', () => {
 
     const sweep = await runDeletionSweep(deps, reload());
 
-    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 0 });
+    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 0, entityLocked: 0 });
     expect(ideas()[0].archived_at).toBeNull();
   });
 
@@ -1250,7 +1852,7 @@ describe('runDeletionSweep', () => {
 
     const sweep = await runDeletionSweep(deps, reload());
 
-    expect(sweep).toEqual({ sweepArchived: 1, conflictsOpened: 0, outOfScope: 0 });
+    expect(sweep).toEqual({ sweepArchived: 1, conflictsOpened: 0, outOfScope: 0, entityLocked: 0 });
     expect(ideas()[0].archived_at).not.toBeNull();
     expect(getLinkByExternal(raw, 'conn-1', 'ext-1')?.orphaned_at).not.toBeNull();
     expect(JSON.parse(conflicts()[0].payload_json ?? '{}')).toMatchObject({
@@ -1279,7 +1881,7 @@ describe('runDeletionSweep — an issue that left the configured scope', () => {
 
     const sweep = await runDeletionSweep(deps, reload());
 
-    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 1 });
+    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 1, entityLocked: 0 });
     expect(ideas()[0].archived_at).toBeNull();
     expect(getLinkByExternal(raw, 'conn-1', 'ext-1')?.orphaned_at).toBeNull();
     expect(conflicts()).toHaveLength(0);
@@ -1297,7 +1899,7 @@ describe('runDeletionSweep — an issue that left the configured scope', () => {
 
     const sweep = await runDeletionSweep(deps, reload());
 
-    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 1 });
+    expect(sweep).toEqual({ sweepArchived: 0, conflictsOpened: 0, outOfScope: 1, entityLocked: 0 });
     expect(conflicts()).toHaveLength(0);
     expect(ideas()[0].archived_at).toBeNull();
     expect(getLinkByExternal(raw, 'conn-1', 'ext-1')?.orphaned_at).toBeNull();
@@ -1317,7 +1919,7 @@ describe('runDeletionSweep — an issue that left the configured scope', () => {
 
     const sweep = await runDeletionSweep(deps, reload());
 
-    expect(sweep).toEqual({ sweepArchived: 1, conflictsOpened: 0, outOfScope: 1 });
+    expect(sweep).toEqual({ sweepArchived: 1, conflictsOpened: 0, outOfScope: 1, entityLocked: 0 });
     const moved = getLinkByExternal(raw, 'conn-1', 'ext-1');
     const deleted = getLinkByExternal(raw, 'conn-1', 'ext-2');
     expect(moved?.orphaned_at).toBeNull();
@@ -1955,6 +2557,42 @@ describe('runInboundSync — an open conflict must not swallow a pending stage c
     expect(second.stageDeferred).toBe(0);
     expect(reload().cursor_updated_at).toBe('2026-07-30T12:00:00.000Z');
   });
+
+  it('HOLDS the cursor for a remote content change no open conflict records', async () => {
+    // The hazard the content arm closes: an item parked by a TITLE conflict
+    // whose remote DESCRIPTION also moved. Resolving the title advances only
+    // the title half of the baseline, so nothing would ever re-derive the
+    // description — and once the cursor passes the issue, only another remote
+    // edit would ever fetch it again.
+    const connection = makeConnection({ conflict_mode: 'manual' });
+    const ideaId = await importOnce(connection);
+
+    await router.applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { title: 'Local title' },
+    });
+    adapter.issues = [makeIssue({ title: 'Remote title', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await runInboundSync(deps, reload());
+    expect(conflicts().map((row) => row.field)).toEqual(['title']);
+    const parkedAt = reload().cursor_updated_at;
+
+    adapter.issues = [
+      makeIssue({
+        title: 'Remote title',
+        description: 'A body change nobody recorded',
+        updatedAt: '2026-07-30T12:00:00.000Z',
+      }),
+    ];
+    const second = await runInboundSync(deps, reload());
+
+    expect(second.contentDeferred).toBe(1);
+    expect(second.stageDeferred).toBe(0);
+    // The cursor stays put, so the description is re-offered until the title
+    // conflict is answered and the merge can apply the whole item.
+    expect(reload().cursor_updated_at).toBe(parkedAt);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2056,5 +2694,159 @@ describe('runInboundSync — importNewIssues: false (import direction held)', ()
     expect(held.importDeferred).toBe(0);
     expect(held.skipped).toBe(1);
     expect(reload().cursor_external_id).toBe('ext-1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A locked local entity defers ONE item — it must never wedge the pass
+// ---------------------------------------------------------------------------
+
+/**
+ * TaskChangeRouter refuses a stage move (and an archive) on an entity that has
+ * a non-terminal run, for every actor but the orchestrator. A tracker actor is
+ * not the orchestrator, so a remote status change on anything currently in a
+ * live session draws 'active_runs' — the ORDINARY case, not an exotic one.
+ *
+ * These tests pin the blast radius. The rejection must defer that one item and
+ * let the rest of the batch through; before the fix it propagated out of the
+ * pass, pinned the cursor on the failing issue, and skipped every issue behind
+ * it AND the deletion sweep — so a single live run stopped the connection's
+ * whole inbound flow for as long as it ran.
+ *
+ * The run is REAL (a `workflow_runs` row), not a throwing router double, so the
+ * production guard is what these exercise.
+ */
+function seedLiveRun(taskId: string, runId = 'run-live'): void {
+  raw
+    .prepare(`INSERT OR IGNORE INTO workflows (id, project_id, name, spec_json) VALUES ('wf-1', 1, 'sprint', '{}')`)
+    .run();
+  raw
+    .prepare(
+      `INSERT INTO workflow_runs (id, workflow_id, project_id, status, permission_mode_snapshot, task_id)
+       VALUES (?, 'wf-1', 1, 'running', 'default', ?)`,
+    )
+    .run(runId, taskId);
+}
+
+describe('runInboundSync — a locked local entity', () => {
+  it('defers the refused stage move instead of failing the pass', async () => {
+    const connection = makeConnection();
+    adapter.issues = [makeIssue()];
+    await runInboundSync(deps, connection);
+    const idea = ideas()[0];
+    const stageBefore = idea.stage_id;
+    seedLiveRun(idea.id);
+
+    // The remote moves to Done, which maps to the Done stage — a move the live
+    // run forbids.
+    adapter.issues = [makeIssue({ stateId: 'st-done', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.entityLocked).toBe(1);
+    expect(ideas()[0].stage_id).toBe(stageBefore);
+    // Pinned on BOTH halves: the cursor holds at the FIRST pass's high-water
+    // mark so the issue is re-fetched, and the baseline's state half stays put
+    // so the delta is still there to re-apply.
+    expect(reload().cursor_updated_at).toBe('2026-07-30T10:00:00.000Z');
+    expect(baselineOf('ext-1').stateId).toBe('st-backlog');
+  });
+
+  it('re-applies the deferred move once the run reaches a terminal status', async () => {
+    const connection = makeConnection();
+    adapter.issues = [makeIssue()];
+    await runInboundSync(deps, connection);
+    seedLiveRun(ideas()[0].id);
+
+    adapter.issues = [makeIssue({ stateId: 'st-done', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    expect((await runInboundSync(deps, reload())).entityLocked).toBe(1);
+
+    raw.prepare(`UPDATE workflow_runs SET status = 'completed' WHERE id = 'run-live'`).run();
+    const after = await runInboundSync(deps, reload());
+
+    expect(after.entityLocked).toBe(0);
+    expect(ideas()[0].stage_id).not.toBe('stage-board-1-default-1');
+    expect(baselineOf('ext-1').stateId).toBe('st-done');
+    expect(reload().cursor_external_id).toBe('ext-1');
+  });
+
+  it('still applies the CONTENT half of a refused merge', async () => {
+    const connection = makeConnection();
+    adapter.issues = [makeIssue()];
+    await runInboundSync(deps, connection);
+    seedLiveRun(ideas()[0].id);
+
+    adapter.issues = [
+      makeIssue({
+        title: 'Renamed remotely',
+        stateId: 'st-done',
+        updatedAt: '2026-07-30T11:00:00.000Z',
+      }),
+    ];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.entityLocked).toBe(1);
+    // The title landed even though the stage did not — re-running the whole
+    // item next pass would re-file its auto-resolution findings.
+    expect(ideas()[0].title).toBe('Renamed remotely');
+    expect(baselineOf('ext-1').title).toBe('Renamed remotely');
+    expect(baselineOf('ext-1').stateId).toBe('st-backlog');
+  });
+
+  it('keeps applying the issues BEHIND the locked one', async () => {
+    const connection = makeConnection();
+    adapter.issues = [makeIssue(), makeIssue({ externalId: 'ext-2', identifier: 'CORE-143' })];
+    await runInboundSync(deps, connection);
+    const locked = ideas().find((i) => i.title === 'Ship the tracker sync');
+    seedLiveRun(locked?.id ?? '');
+
+    adapter.issues = [
+      makeIssue({ stateId: 'st-done', updatedAt: '2026-07-30T11:00:00.000Z' }),
+      makeIssue({
+        externalId: 'ext-2',
+        identifier: 'CORE-143',
+        title: 'Second issue, renamed',
+        updatedAt: '2026-07-30T11:01:00.000Z',
+      }),
+    ];
+    const report = await runInboundSync(deps, reload());
+
+    expect(report.entityLocked).toBe(1);
+    expect(ideas().some((i) => i.title === 'Second issue, renamed')).toBe(true);
+  });
+
+  it('rethrows a rejection that is NOT about the entity being busy', async () => {
+    const connection = makeConnection();
+    adapter.issues = [makeIssue()];
+    await runInboundSync(deps, connection);
+
+    // A router that fails for an unpredicted reason is a bug, not a deferral.
+    const exploding: EntityWriteRouter = {
+      applyChange: async () => {
+        throw new Error('boom');
+      },
+    };
+    adapter.issues = [makeIssue({ title: 'Renamed', updatedAt: '2026-07-30T11:00:00.000Z' })];
+
+    await expect(runInboundSync({ ...deps, router: exploding }, reload())).rejects.toThrow('boom');
+  });
+});
+
+describe('runDeletionSweep — a locked local entity', () => {
+  it('skips the locked link and sweeps the rest', async () => {
+    const connection = makeConnection({ conflict_mode: 'auto' });
+    adapter.issues = [makeIssue(), makeIssue({ externalId: 'ext-2', identifier: 'CORE-143' })];
+    await runInboundSync(deps, connection);
+    const locked = ideas().find((i) => i.title === 'Ship the tracker sync');
+    seedLiveRun(locked?.id ?? '');
+
+    // Both issues are gone remotely; only the unlocked one can be archived.
+    adapter.remoteIds = [];
+    const sweep = await runDeletionSweep(deps, reload());
+
+    expect(sweep.entityLocked).toBe(1);
+    expect(sweep.sweepArchived).toBe(1);
+    // Untouched: still active, no conflict row, so the next sweep retries it.
+    expect(getLinkByExternal(raw, 'conn-1', 'ext-1')?.orphaned_at).toBeNull();
+    expect(conflicts()).toHaveLength(1);
   });
 });

@@ -39,7 +39,7 @@ describe('built-in workflow bundles', () => {
     assertAgentShape(bundle.agents);
   });
 
-  it('sprint ships its 9 heavy-phase subagents in order (gate stays inline)', () => {
+  it('sprint ships its 10 heavy-phase subagents in order (gate stays inline)', () => {
     const bundle = resolveWorkflowBundle(path.join(workflowsDir, 'sprint.md'));
     // The human-review gate runs inline in the orchestrator — not delegated — so the
     // bundle ships no commands, only subagents.
@@ -49,6 +49,10 @@ describe('built-in workflow bundles', () => {
       'code-review',
       'dependency-analyzer',
       'implement',
+      // Deployed by the CONTROLLER at the enqueue seam, not bound to a step
+      // (docs/proposals/lane-runbook-bootstrap.md §8) — bundled like any other
+      // agent so its prompt and model stay overridable per project/workflow.
+      'runbook-bootstrap',
       'sprint-review',
       'sprint-verify',
       'task-verify',
@@ -58,7 +62,7 @@ describe('built-in workflow bundles', () => {
     assertAgentShape(bundle.agents);
   });
 
-  it('ship ships its 16 heavy-phase subagents in order (gates stay inline)', () => {
+  it('ship ships its 17 heavy-phase subagents in order (gates stay inline)', () => {
     const bundle = resolveWorkflowBundle(path.join(workflowsDir, 'ship.md'));
     // Human gates (approve-idea / approve-design / approve-plan / human-review) run
     // inline in the orchestrator — they are NOT delegated, so the bundle ships no
@@ -75,6 +79,8 @@ describe('built-in workflow bundles', () => {
       'epics',
       'implement',
       'research',
+      // Controller-deployed; see the sprint list above.
+      'runbook-bootstrap',
       'sprint-review',
       'sprint-verify',
       'task-verify',

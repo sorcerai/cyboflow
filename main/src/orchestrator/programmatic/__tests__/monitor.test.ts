@@ -546,6 +546,29 @@ describe('parseConverseOutput', () => {
     });
   });
 
+  it('parses a valid rewind_lane_to_step action', () => {
+    expect(
+      parseConverseOutput({
+        reply: 'sending that lane back.',
+        action: { kind: 'rewind_lane_to_step', taskRef: 'TASK-003', stepId: 'implement' },
+      }),
+    ).toEqual({
+      reply: 'sending that lane back.',
+      action: { kind: 'rewind_lane_to_step', taskRef: 'TASK-003', stepId: 'implement' },
+    });
+  });
+
+  it('drops rewind_lane_to_step when EITHER taskRef or stepId is missing/blank', () => {
+    // Unlike steer_step's optional lane narrowing, a lane rewind without a lane is
+    // meaningless — so a missing taskRef drops the whole action.
+    const drop = (action: unknown): unknown => parseConverseOutput({ reply: 'ok', action });
+    expect(drop({ kind: 'rewind_lane_to_step', stepId: 'implement' })).toEqual({ reply: 'ok' });
+    expect(drop({ kind: 'rewind_lane_to_step', taskRef: 'TASK-003' })).toEqual({ reply: 'ok' });
+    expect(drop({ kind: 'rewind_lane_to_step', taskRef: '  ', stepId: 'implement' })).toEqual({ reply: 'ok' });
+    expect(drop({ kind: 'rewind_lane_to_step', taskRef: 'TASK-003', stepId: '  ' })).toEqual({ reply: 'ok' });
+    expect(drop({ kind: 'rewind_lane_to_step', taskRef: 7, stepId: 'implement' })).toEqual({ reply: 'ok' });
+  });
+
   it('drops rewind_to_step when stepId is missing/blank/non-string', () => {
     expect(parseConverseOutput({ reply: 'ok', action: { kind: 'rewind_to_step' } })).toEqual({ reply: 'ok' });
     expect(parseConverseOutput({ reply: 'ok', action: { kind: 'rewind_to_step', stepId: '   ' } })).toEqual({ reply: 'ok' });
@@ -611,7 +634,7 @@ describe('parseConverseOutput', () => {
 });
 
 describe('MONITOR_CONVERSE_SCHEMA', () => {
-  it('requires reply, makes action optional, and enforces the kind enum (11 actions + 2 control signals)', () => {
+  it('requires reply, makes action optional, and enforces the kind enum (12 actions + 2 control signals)', () => {
     expect(MONITOR_CONVERSE_SCHEMA.required).toEqual(['reply']);
     expect(MONITOR_CONVERSE_SCHEMA.additionalProperties).toBe(false);
     const props = MONITOR_CONVERSE_SCHEMA.properties as Record<string, Record<string, unknown>>;
@@ -628,6 +651,7 @@ describe('MONITOR_CONVERSE_SCHEMA', () => {
       'unskip_step',
       'steer_step',
       'rewind_to_step',
+      'rewind_lane_to_step',
       'resolve_review_item',
       'file_note',
       'confirm',
@@ -682,7 +706,7 @@ describe('buildActionAnswerPrompt', () => {
     expect(p).toContain('switched to this one');
   });
 
-  it('describes all 11 action kinds, grouped by task edits / step control / review queue', () => {
+  it('describes all 12 action kinds, grouped by task edits / step control / review queue', () => {
     const history: MonitorHistory = { conversation: [], steps: [] };
     const p = buildActionAnswerPrompt(ctx, 'what can you do?', history);
     for (const kind of [
@@ -695,6 +719,7 @@ describe('buildActionAnswerPrompt', () => {
       'unskip_step',
       'steer_step',
       'rewind_to_step',
+      'rewind_lane_to_step',
       'resolve_review_item',
       'file_note',
     ]) {
@@ -705,7 +730,7 @@ describe('buildActionAnswerPrompt', () => {
     expect(p).toContain('NEXT wave');
     // Step control: upcoming/not-reached framing (still true for skip_step/unskip_step).
     expect(p).toContain("HASN'T reached yet");
-    // Return-shape contract lists all 11 kinds and defers to per-kind fields.
+    // Return-shape contract lists all 12 kinds and defers to per-kind fields.
     expect(p).toContain('fields relevant to the chosen');
   });
 
@@ -718,7 +743,21 @@ describe('buildActionAnswerPrompt', () => {
     expect(p).toContain('the host safely stops current work first');
     expect(p).toContain('prefer "retry_step" for simply re-running a failed step');
     // It follows the same staged-confirm contract as the other steering kinds.
-    expect(p).toContain('"rewind_to_step" follows the same staged-confirm contract');
+    expect(p).toContain('"rewind_to_step" and "rewind_lane_to_step" follow the same staged-confirm contract');
+  });
+
+  it('describes rewind_lane_to_step as a per-LANE rewind, preferred over the whole-run one', () => {
+    const history: MonitorHistory = { conversation: [], steps: [] };
+    const p = buildActionAnswerPrompt(ctx, 'TASK-003 is stuck, send it back to implement', history);
+    expect(p).toContain('"rewind_lane_to_step"');
+    expect(p).toContain("rewind ONE sprint task's lane to an earlier step");
+    expect(p).toContain('leaving the run and every other lane running');
+    // It takes an INNER lane step, not a phase step from the timeline.
+    expect(p).toContain('INNER lane step');
+    // The lane-liveness precondition is stated, so the monitor can pre-empt a refusal.
+    expect(p).toContain('must be RUNNING right now');
+    // And it is explicitly preferred over the whole-run rewind for a one-task problem.
+    expect(p).toContain('Prefer it over "rewind_to_step"');
   });
 
   it('describes steer_step live-delivery to a currently-running step, with optional taskRef narrowing', () => {
@@ -894,7 +933,7 @@ function collectInjected(): { injectEvent: (event: unknown) => void; injected: A
 
 /**
  * Build a fully-populated fake `MonitorActions` bag (a no-op `vi.fn()` per
- * method), with any subset overridden. All 11 methods are required members of
+ * method), with any subset overridden. All 12 methods are required members of
  * the interface, so every test constructing a bag needs the full shape.
  */
 function makeActions(overrides: Partial<MonitorActions> = {}): MonitorActions {
@@ -908,6 +947,7 @@ function makeActions(overrides: Partial<MonitorActions> = {}): MonitorActions {
     unskipStep: vi.fn<MonitorActions['unskipStep']>(),
     steerStep: vi.fn<MonitorActions['steerStep']>(),
     rewindToStep: vi.fn<MonitorActions['rewindToStep']>(),
+    rewindLaneToStep: vi.fn<MonitorActions['rewindLaneToStep']>(),
     resolveReviewItem: vi.fn<MonitorActions['resolveReviewItem']>(),
     fileNote: vi.fn<MonitorActions['fileNote']>(),
     ...overrides,
@@ -1218,6 +1258,14 @@ describe('DefaultMonitorSession.converse — expanded actuation (9 steering acti
       expectedInput: { stepId: 'analyze' },
       stageText:
         'Ready to rewind the run to step analyze — current work will be stopped and every step from there on re-runs.',
+    },
+    {
+      name: 'rewind_lane_to_step',
+      action: { kind: 'rewind_lane_to_step', taskRef: 'TASK-003', stepId: 'implement' },
+      method: 'rewindLaneToStep' as const,
+      expectedInput: { taskRef: 'TASK-003', stepId: 'implement' },
+      stageText:
+        "Ready to rewind TASK-003's lane to step implement — that lane's current agent will be stopped and it re-runs from there. Other lanes and the run keep going.",
     },
     {
       name: 'resolve_review_item',

@@ -33,6 +33,7 @@
 import type {
   TrackerProvider,
   TrackerWorkspaceIdentity,
+  TrackerGroupTree,
   TrackerSourceTree,
   TrackerSourceNarrow,
   TrackerSourceSelection,
@@ -46,6 +47,8 @@ import type {
   TrackerAdapterCapabilities,
   FetchLike,
   IssueDraft,
+  IssueContentPatch,
+  TrackerFieldOptionsRaw,
 } from './adapterTypes';
 import {
   TrackerApiError,
@@ -53,11 +56,20 @@ import {
   TRACKER_REQUEST_TIMEOUT_MS,
   describeTransportFailure,
 } from './errors';
+import { PROVIDER_ARCHIVE_CAPABILITY } from './providerCapabilities';
+import { RECOVERY_MARKER_PREFIX } from './recoveryMarker';
 
 const PROVIDER: TrackerProvider = 'plane';
 const DEFAULT_BASE_URL = 'https://api.plane.so';
 /** Cloud API and cloud app UI live on separate hosts; self-hosted shares one. */
 const CLOUD_APP_ORIGIN = 'https://app.plane.so';
+
+/**
+ * Plane's priority enum as RAW tokens, in the provider's own order. `'none'` is
+ * a rung of the enum (the column is NOT NULL), not the absence of one — see
+ * {@link PlaneAdapter.listFieldOptions}.
+ */
+const PLANE_PRIORITY_TOKENS: readonly string[] = ['urgent', 'high', 'medium', 'low', 'none'];
 
 const CAPABILITIES: TrackerAdapterCapabilities = {
   nativeParentAutoClose: false,
@@ -67,6 +79,19 @@ const CAPABILITIES: TrackerAdapterCapabilities = {
   // every create stamps into the description — see SYNC_MARKER_PREFIX and
   // {@link PlaneAdapter.findIssueByClientKey}.
   idempotentCreate: false,
+  // Plane has no issue-type field at all (category is Dart-only, per the
+  // locked scope decision — no label emulation in v1).
+  contentWrite: { title: true, description: true, priority: true, category: false },
+  // UNPROBED: Phase 0's P1 could not run (the stored token was invalid, 403
+  // "Given API token is not valid"), and Plane's public v1 API documents no
+  // archive endpoint at all — so this ships as 'none' per the pre-agreed
+  // fallback rather than guessing at an unverified PATCH. Revisit if Plane
+  // ships one, or once P1 re-runs against a live workspace with a fresh
+  // token. `archiveIssue` below throws accordingly — it must be unreachable,
+  // since the outbound archive trigger gates every enqueue on this capability
+  // — reading it from the SHARED table, so the trigger (which has no adapter
+  // in hand) and this adapter can never disagree.
+  archive: PROVIDER_ARCHIVE_CAPABILITY.plane,
 };
 
 /**
@@ -81,8 +106,15 @@ const CAPABILITIES: TrackerAdapterCapabilities = {
  * — but the key it carries is surfaced first, on `TrackerIssue.recoveryClientKey`
  * ({@link readRecoveryClientKey}), because the inbound pass needs it to
  * recognize a lost create's child before importing anything.
+ *
+ * The literal itself lives in {@link import('./recoveryMarker')}, which the
+ * OUTBOUND CONTENT WRITE also composes from when it re-appends this marker to a
+ * body write-back (invariant 4 of docs/proposals/tracker-field-writeback.md).
+ * It appends the marker as a trailing MARKDOWN paragraph, which
+ * {@link toDescriptionHtml}'s blank-line split then renders as exactly the
+ * `<p>` {@link toCreateDescriptionHtml} emits — same shape, one definition.
  */
-const SYNC_MARKER_PREFIX = 'cyboflow-sync:';
+const SYNC_MARKER_PREFIX = RECOVERY_MARKER_PREFIX;
 
 /** `cyboflow-sync: <uuid>` — the exact shape createSubIssue emits (client keys are UUIDs). */
 const SYNC_MARKER_RE =
@@ -178,6 +210,13 @@ interface PlaneIssueWire {
   parent?: string | null;
   updated_at: string;
   archived_at?: string | null;
+  /**
+   * Plane's lowercase priority enum. The column is NOT NULL server-side and
+   * `'none'` is its unset token, so a null here means the field was not
+   * selected rather than "no priority" — {@link PlaneAdapter.mapIssue} passes
+   * whatever arrives through RAW, inventing nothing.
+   */
+  priority?: string | null;
 }
 
 /** Link record returned by the cycle-issues / module-issues endpoints. */
@@ -254,6 +293,33 @@ export class PlaneAdapter implements TrackerAdapter {
     };
   }
 
+  /**
+   * The Map step's groups: one per Plane project, which is already the level
+   * this adapter containers at — so a group's selection is the whole-project
+   * one `listContainers` + the 'all' narrow would have produced, and
+   * `stateScopeKey` is the project id because Plane states are per-project.
+   */
+  async listGroups(): Promise<TrackerGroupTree> {
+    const projects = await this.paginateAll<PlaneProjectWire>(
+      `/workspaces/${this.workspaceSlug}/projects/`
+    );
+    return {
+      sections: [
+        {
+          label: 'Projects',
+          groups: projects.map((project) => ({
+            id: project.id,
+            name: project.name,
+            key: project.identifier ?? null,
+            sourceLabel: `${project.name} · whole project`,
+            selection: { containerId: project.id, narrowId: 'all', narrowKind: 'all' as const },
+            stateScopeKey: project.id,
+          })),
+        },
+      ],
+    };
+  }
+
   async listContainers(): Promise<TrackerSourceTree> {
     const projects = await this.paginateAll<PlaneProjectWire>(
       `/workspaces/${this.workspaceSlug}/projects/`
@@ -305,6 +371,17 @@ export class PlaneAdapter implements TrackerAdapter {
       color: state.color ?? null,
       group: normalizeStateGroup(state.group),
     }));
+  }
+
+  /**
+   * Plane's priority enum is FIXED by the API (a project owner configures
+   * states, never priorities), so this is stated rather than fetched. The tokens
+   * are the exact lowercase spellings Plane accepts and returns.
+   *
+   * `categories: null` — Plane models no issue type.
+   */
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    return { priorities: [...PLANE_PRIORITY_TOKENS], categories: null };
   }
 
   async listIssues(
@@ -401,6 +478,9 @@ export class PlaneAdapter implements TrackerAdapter {
     if (draft.stateId !== undefined) {
       body.state = draft.stateId;
     }
+    if (draft.priority !== undefined) {
+      body.priority = draft.priority;
+    }
     const raw = await this.requestWorkItem<PlaneIssueWire>(
       'POST',
       (segment) => `/workspaces/${this.workspaceSlug}/projects/${projectId}/${segment}/`,
@@ -420,6 +500,73 @@ export class PlaneAdapter implements TrackerAdapter {
   }
 
   /**
+   * `PATCH` with only the keys `patch` actually carries (checked via
+   * `!== undefined`, per `IssueContentPatch`'s contract). `description` goes
+   * through the SAME markdown→html conversion `createIssue` uses
+   * ({@link toDescriptionHtml}) — with NO separate marker-wrapping step: the
+   * caller already composed the full body, marker included where one is
+   * needed, so this sends exactly what it converts, unlike
+   * {@link toCreateDescriptionHtml} which appends one unconditionally. `null`
+   * clears the description to Plane's own empty-body shape ({@link
+   * EMPTY_PARAGRAPH}), matching how an empty draft body is represented on
+   * create.
+   *
+   * Returns the PATCH response mapped through the same {@link mapIssue} path
+   * every other read uses — the echo-suppression baseline's stamp source
+   * (invariant 1); Plane's stamp-from-response is what keeps the
+   * plaintext-ified html round trip (this API does not preserve markdown
+   * verbatim) from generating phantom edits on the next inbound pass.
+   *
+   * UNVERIFIED AGAINST A LIVE WORKSPACE: Phase 0's P2/P3 probes could not run
+   * (the stored token was invalid — see `CAPABILITIES.archive`'s note), so
+   * this is implemented from Plane's documented lowercase priority enum and
+   * the existing create-path `description_html` precedent. Re-run P2/P3
+   * before any Plane live smoke once a fresh token is connected.
+   */
+  async updateIssueContent(externalId: string, patch: IssueContentPatch): Promise<TrackerIssue | null> {
+    const { projectId, issueId } = splitExternalId(externalId);
+    const body: Record<string, unknown> = {};
+    if (patch.title !== undefined) {
+      body.name = patch.title;
+    }
+    if (patch.description !== undefined) {
+      body.description_html =
+        patch.description === null ? EMPTY_PARAGRAPH : toDescriptionHtml(patch.description);
+    }
+    if (patch.priority !== undefined) {
+      body.priority = patch.priority;
+    }
+    const raw = await this.requestWorkItem<PlaneIssueWire>(
+      'PATCH',
+      (segment) => `/workspaces/${this.workspaceSlug}/projects/${projectId}/${segment}/${issueId}/`,
+      body
+    );
+    const identifier = await this.getProjectIdentifier(projectId);
+    return this.mapIssue(projectId, identifier, raw);
+  }
+
+  /**
+   * UNSUPPORTED — throws unconditionally. `capabilities.archive === 'none'`:
+   * Plane's public v1 API documents no archive endpoint, and Phase 0's P1
+   * probe (which would have tested `PATCH {archived_at}`) could not run
+   * against a live workspace (stored token invalid). This method must be
+   * unreachable in practice — the caller (Phase 5) gates every
+   * `archive_issue` enqueue on the capability, so a call reaching here would
+   * itself be the bug. Plane's `DELETE` (hard delete) is never called from
+   * any path in this adapter, archive included — see the locked scope
+   * decision that outbound archive is never a hard delete.
+   */
+  async archiveIssue(_externalId: string): Promise<void> {
+    throw new TrackerApiError(
+      PROVIDER,
+      'Plane archive is unsupported: no verified archive endpoint exists in the public v1 API ' +
+        '(Phase 0 probe P1 could not run — the stored token was invalid). The caller must gate on ' +
+        "capabilities.archive === 'none' before ever calling this.",
+      null
+    );
+  }
+
+  /**
    * Ambiguous-create recovery (see the outbox worker): the issue in
    * `scope.containerId` that carries `clientKey` in its SYNC_MARKER_PREFIX
    * paragraph, or null when none carries it — which, because every create sends
@@ -435,9 +582,27 @@ export class PlaneAdapter implements TrackerAdapter {
    * Not part of `TrackerAdapter`: the marker is stripped from every description
    * this adapter returns, so the match cannot be performed by the sync core
    * over a mapped `TrackerIssue` — it has to read the raw payload here.
+   *
+   * `scope.updatedAfterIso` is a COST bound on the scan, applied CLIENT-SIDE:
+   * the project listing is one paginated walk either way, but a candidate older
+   * than the floor is skipped before the per-candidate detail re-fetch below,
+   * which is where the GETs actually accumulate. Deliberately not pushed onto
+   * the request as a Plane filter — this adapter's list params are the ones its
+   * live API was verified against, and a filter Plane silently ignored would
+   * cost nothing, while one it honoured differently than assumed would hide a
+   * landed create and duplicate it.
    */
   async findIssueByClientKey(
-    scope: { containerId: string | null; parentExternalId: string | null },
+    scope: {
+      containerId: string | null;
+      parentExternalId: string | null;
+      /**
+       * A floor on the candidates' `updated_at`: a work item this create
+       * produced cannot have been touched before the create was enqueued.
+       * Optional — omitting it scans every candidate.
+       */
+      updatedAfterIso?: string | null;
+    },
     clientKey: string
   ): Promise<TrackerIssue | null> {
     // Project-scoped by construction: a Plane sub-issue always lives in its
@@ -460,8 +625,13 @@ export class PlaneAdapter implements TrackerAdapter {
       { expand: 'assignees' }
     );
     const marker = `${SYNC_MARKER_PREFIX} ${clientKey}`;
+    const floorMs =
+      typeof scope.updatedAfterIso === 'string' ? Date.parse(scope.updatedAfterIso) : Number.NaN;
     for (const candidate of raw) {
       if (parentIssueId !== null && candidate.parent !== parentIssueId) continue;
+      // An unparseable floor (or none) leaves every candidate in the scan — the
+      // bound may only ever skip work, never decide the answer.
+      if (!Number.isNaN(floorMs) && Date.parse(candidate.updated_at) < floorMs) continue;
       // Documented choice: Plane's list payload does not reliably carry any
       // description field, and the marker lives only in the description — so a
       // candidate that arrived without one is re-fetched from the detail
@@ -564,6 +734,13 @@ export class PlaneAdapter implements TrackerAdapter {
       parentExternalId: raw.parent ? composeId(projectId, raw.parent) : null,
       updatedAt: raw.updated_at,
       archivedAt: raw.archived_at ?? null,
+      // Passed through exactly as Plane spelled it (see PlaneIssueWire.priority):
+      // 'none' is a real rung of the enum, not an absence, so it must reach the
+      // mapping as a token rather than being collapsed to null here.
+      priority: raw.priority ?? null,
+      // ALWAYS null for Plane: it models no issue TYPE, and label emulation is
+      // out of scope, so there is nothing a category could be read from.
+      category: null,
       // Read BEFORE mapDescription strips it — every path that maps a wire
       // issue (list, detail, create response, client-key recovery) goes through
       // here, so a marker-bearing issue surfaces its key no matter how it was

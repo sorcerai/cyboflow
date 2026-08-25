@@ -70,7 +70,9 @@ export interface TelemetryEventMap {
   };
   workflow_run_reopened: { via: 'composer' | 'boot_recovery' };
   session_created: { kind: 'quick' | 'flow_hosted'; substrate?: CliSubstrate };
-  session_resolved: { action: 'merge' | 'pr' | 'dismiss'; had_conflicts?: boolean };
+  /** 'complete' = the work landed outside our merge path and the human said so
+   *  (Mark complete), which is a delivery, not a dismissal. */
+  session_resolved: { action: 'merge' | 'pr' | 'dismiss' | 'complete'; had_conflicts?: boolean };
 
   // ── Tier 2 — human-in-the-loop + feature breadth ────────────────────────────
   review_item_resolved: {

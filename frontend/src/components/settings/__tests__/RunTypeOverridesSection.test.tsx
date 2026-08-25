@@ -90,11 +90,22 @@ function workflowsForProject(entries: WorkflowFixtureEntry[], projectId: number)
 // `config:*` IPC fake (real configStore, fake transport).
 // ---------------------------------------------------------------------------
 
+/**
+ * The OMP flavor probe the runtime picker reads (`useOmpAvailability`). Hoisted
+ * so the `vi.mock` factory can close over it and a test can swap the answer;
+ * `beforeEach` resets it to the local-OMP flavor (Aria off), which is what a
+ * default install reports.
+ */
+const { ompAvailabilityMock } = vi.hoisted(() => ({ ompAvailabilityMock: vi.fn() }));
+
 vi.mock('../../../trpc/client', () => ({
   trpc: {
     cyboflow: {
       workflows: {
         list: { query: vi.fn() },
+      },
+      omp: {
+        availability: { query: () => ompAvailabilityMock() },
       },
     },
   },
@@ -153,6 +164,15 @@ vi.mock('../../../stores/codexModelCatalogStore', () => ({
     loading: false,
     error: null,
   }),
+}));
+
+const OMP_MODEL_OPTIONS = [
+  { id: 'anthropic/claude-opus-4-5', label: 'Claude Opus 4.5', ompProvider: 'anthropic' },
+  { id: 'openrouter/meta-llama-4', label: 'Llama 4', ompProvider: 'openrouter' },
+];
+
+vi.mock('../../../stores/ompModelCatalogStore', () => ({
+  useOmpModelCatalog: () => ({ options: OMP_MODEL_OPTIONS, loading: false, error: null }),
 }));
 
 vi.mock('../../../utils/api', () => ({
@@ -236,6 +256,9 @@ beforeEach(() => {
   workflowsListQuery.mockReset();
   projectsGetAll.mockReset();
   forcedApplyError = null;
+  // Default install: OMP runs locally, no remote fleet.
+  ompAvailabilityMock.mockReset();
+  ompAvailabilityMock.mockResolvedValue({ launchable: false, ariaMode: false });
   useConfigStore.setState({ config: null, error: null, isLoading: false });
   useWorkflowsStore.setState({ projectFilter: null, workflows: [] });
 });
@@ -501,7 +524,7 @@ describe('RunTypeOverridesSection — detail screen', () => {
       'from defaults · Interactive terminal',
     );
     expect(within(card).getByTestId('run-type-field-agentRuntime')).toHaveTextContent(
-      'from defaults · Claude interactive',
+      'from defaults · Claude Interactive (CLI)',
     );
 
     fireEvent.click(within(card).getByRole('switch'));
@@ -567,6 +590,37 @@ describe('RunTypeOverridesSection — detail screen', () => {
     expect(within(card).getByTestId('run-type-changed-permissionMode')).toHaveTextContent(
       'overridden · default is Ask before edits',
     );
+  });
+
+  /**
+   * Regression: the model baseline is the always-Claude floor, which OMP
+   * legitimately refuses (absence there means "OMP picks"). Seeding that
+   * refusal made the card UNOPENABLE, because `cardIsOn` is derived from "some
+   * field is non-null" — the switch flipped straight back off and the model
+   * control could never be reached at all under an OMP runtime.
+   */
+  it('opens the model card under an OMP runtime, seeding a model OMP can launch', async () => {
+    await openDetail('Quick session', { defaultAgentRuntime: 'omp-sdk' });
+
+    const card = await screen.findByTestId('knob-card-model');
+    const toggle = within(card).getByRole('switch');
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+    // The seed comes from the offered list, so it is launchable by construction
+    // — never the Claude floor the baseline actually held.
+    expect(within(card).getByLabelText('Model')).toHaveValue('anthropic/claude-opus-4-5');
+  });
+
+  it('still seeds the model card from the baseline under a Claude runtime', async () => {
+    await openDetail('Quick session');
+
+    const card = await screen.findByTestId('knob-card-model');
+    fireEvent.click(within(card).getByRole('switch'));
+
+    expect(within(card).getByLabelText('Model')).toHaveValue('opus');
   });
 
   // AC 2 — Save goes through applyRunTypeDefault, never API.config.update or the parent form.
@@ -929,22 +983,72 @@ describe('RunTypeOverridesSection — detail screen', () => {
 
     const card = screen.getByTestId('knob-card-runtime');
     fireEvent.click(within(card).getByRole('switch'));
-    // The session-scope set: every selectableInPickers runtime, which post-merge
-    // includes the fleet supervisor. A fleet choice with the bridge down fails
-    // closed at launch — the settings screen is not availability-aware, by the
-    // same convention the other provider toggles follow here.
+    // The session-scope set for the LOCAL OMP flavor (Aria off, the default):
+    // every selectableInPickers runtime except the remote fleet supervisor. The
+    // two OMP flavors are alternatives, so `omp-fleet` is absent here — see the
+    // Aria-mode test below for the other half.
     expect(
       within(within(card).getByLabelText('Agent runtime')).getAllByRole('option').map((o) => o.textContent),
     ).toEqual([
       'Follow defaults',
       'Claude SDK',
-      'Claude interactive',
+      'Claude Interactive (CLI)',
       'Codex SDK',
-      'Codex terminal',
+      'Codex (CLI)',
       'OMP',
-      'OMP terminal',
-      'OMP fleet',
+      'OMP (CLI)',
     ]);
+
+    // The stored value is untouched by the flavor filter: nothing was saved
+    // here, so the control still reads "Follow defaults" for the pick above.
+  });
+
+  // Aria mode is the ONE switch that decides which OMP this install runs, and it
+  // has to reach every surface that names a runtime — otherwise Settings offers
+  // a flavor the launch picker refuses.
+  it('swaps the local OMP runtimes for the fleet supervisor under Aria mode', async () => {
+    // ariaMode is the user's SETTING, so it rides the config store; the query
+    // only supplies `launchable` (whether a bridge is actually reachable).
+    ompAvailabilityMock.mockResolvedValue({ launchable: true, ariaMode: true });
+    await openDetail('Quick session', { ariaMode: true });
+
+    const card = screen.getByTestId('knob-card-runtime');
+    fireEvent.click(within(card).getByRole('switch'));
+
+    await waitFor(() =>
+      expect(
+        within(within(card).getByLabelText('Agent runtime')).getAllByRole('option').map((o) => o.textContent),
+      ).toEqual([
+        'Follow defaults',
+        'Claude SDK',
+        'Claude Interactive (CLI)',
+        'Codex SDK',
+        'Codex (CLI)',
+        'OMP fleet',
+      ]),
+    );
+  });
+
+  // Flipping the toggle changes what you can PICK, never what is already
+  // stored. A <select> whose list omits its own value renders blank and would
+  // rewrite the stored override on the next save of any other field.
+  it('keeps a stored runtime the flavor would hide in its own dropdown', async () => {
+    ompAvailabilityMock.mockResolvedValue({ launchable: true, ariaMode: true });
+    await openDetail('Quick session', {
+      ariaMode: true,
+      runTypeDefaults: { quick: { agentRuntime: 'omp-sdk' } },
+    });
+
+    const card = screen.getByTestId('knob-card-runtime');
+    await waitFor(() => {
+      const labels = within(within(card).getByLabelText('Agent runtime'))
+        .getAllByRole('option')
+        .map((o) => o.textContent);
+      // Both the flavor's runtime AND the stored one the flavor hides.
+      expect(labels).toContain('OMP fleet');
+      expect(labels).toContain('OMP');
+    });
+    expect(within(card).getByLabelText('Agent runtime')).toHaveValue('omp-sdk');
   });
 
   it('omits the session-only PTY runtimes on a workflow screen (the LAUNCHABLE set)', async () => {
@@ -952,11 +1056,11 @@ describe('RunTypeOverridesSection — detail screen', () => {
 
     const card = screen.getByTestId('knob-card-runtime');
     fireEvent.click(within(card).getByRole('switch'));
-    // 'OMP' is present, 'OMP terminal' is not: a workflow screen offers every
+    // 'OMP' is present, 'OMP (CLI)' is not: a workflow screen offers every
     // STRUCTURED runtime and no terminal one, which is the launchable set.
     expect(
       within(within(card).getByLabelText('Agent runtime')).getAllByRole('option').map((o) => o.textContent),
-    ).toEqual(['Follow defaults', 'Claude SDK', 'Claude interactive', 'Codex SDK', 'OMP']);
+    ).toEqual(['Follow defaults', 'Claude SDK', 'Claude Interactive (CLI)', 'Codex SDK', 'OMP']);
   });
 
   // AC 5 + AC 6 — a stale key is not just VISIBLE, it is operable: being able to

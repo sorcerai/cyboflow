@@ -3,26 +3,28 @@
  * workflow-scoped agent-config feature).
  *
  * Renders WorkflowEditorCanvas directly (no reducer/store needed — the canvas
- * is a pure presentational component over `definition` + `agentModelPins`),
+ * is a pure presentational component over `definition` + `agentRunTargets`),
  * mirroring the plain-render setup in WorkflowCanvasEdges.test.tsx.
  *
  * Behaviors verified:
  *   (a) A workflow `agentConfigs[agentKey].model` override wins and is styled
  *       distinctly (var(--color-status-info), NOT the loop row's error red).
- *   (b) Absent an override, the agent's Agents-pane `agentModelPins` entry is
+ *   (b) Absent an override, the agent's Agents-pane `agentRunTargets` entry is
  *       shown with normal <b> styling.
  *   (c) Absent both, the literal "run model" renders in tertiary + italic.
  *   (d) The human-gate step renders no model row at all.
  *   (e) A step whose agent carries a workflow `custom` copy gets the asterisk
  *       marker; agents without one do not.
  *   (f) Fan-out inner cards apply the identical precedence + marker rules.
+ *   (h) A NON-CLAUDE pin/override (runtime + providerModel, no Claude alias) is
+ *       shown as that provider's model — not the "run model" inherit sentinel.
  */
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { WorkflowEditorCanvas } from '../WorkflowEditorCanvas';
 import type { WorkflowDefinition } from '../../../../../shared/types/workflows';
-import { AGENT_MODEL_LABELS, type AgentModelAlias } from '../../../../../shared/types/agents';
+import { AGENT_MODEL_LABELS, type AgentRunTarget } from '../../../../../shared/types/agents';
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -89,9 +91,12 @@ const DEFINITION: WorkflowDefinition = {
   ],
 };
 
-const AGENT_MODEL_PINS: Record<string, AgentModelAlias | null> = {
-  'sprint-review': 'haiku',
-  'write-tests': 'sonnet',
+/** Agents-pane pins, as the full run target (runtime + Claude alias + provider model). */
+const AGENT_RUN_TARGETS: Record<string, AgentRunTarget> = {
+  'sprint-review': { runtime: null, model: 'haiku', providerModel: null },
+  'write-tests': { runtime: null, model: 'sonnet', providerModel: null },
+  // (h) pinned to a non-Claude runtime with no Claude alias at all.
+  context: { runtime: 'codex-sdk', model: null, providerModel: 'gpt-5.6-luna' },
 };
 
 function renderCanvas() {
@@ -101,7 +106,7 @@ function renderCanvas() {
       selectedStepId={null}
       selectedFanOutInner={null}
       dispatch={vi.fn()}
-      agentModelPins={AGENT_MODEL_PINS}
+      agentRunTargets={AGENT_RUN_TARGETS}
     />,
   );
 }
@@ -127,9 +132,47 @@ describe('WorkflowEditorCanvas — model meta row (outer step card)', () => {
 
   it('(c) renders the literal "run model" (tertiary + italic) when neither is set', () => {
     renderCanvas();
-    const el = screen.getByTestId('editor-step-model-context-step');
+    // 'code-review' carries a workflow `custom` copy but pins no model/runtime, and
+    // has no Agents-pane pin — the one genuinely-inherits case.
+    const el = screen.getByTestId('editor-step-model-code-review-step');
     expect(el).toHaveTextContent('run model');
     expect(el).toHaveStyle({ color: 'var(--color-text-tertiary)', fontStyle: 'italic' });
+  });
+
+  it('(h) shows a non-Claude PIN as that provider\'s model, not "run model"', () => {
+    renderCanvas();
+    const el = screen.getByTestId('editor-step-model-context-step');
+    expect(el).toHaveTextContent('gpt-5.6-luna');
+    expect(el).not.toHaveStyle({ color: 'var(--color-status-info)' });
+  });
+
+  it('(h) shows a non-Claude agentConfigs OVERRIDE as an override', () => {
+    const def: WorkflowDefinition = {
+      id: 'codex-flow',
+      // Only runtime + providerModel — no Claude `model` alias, which is exactly
+      // what the old model-alias-only row rendered as "run model".
+      agentConfigs: { implement: { runtime: 'codex-sdk', providerModel: 'gpt-5.6-luna' } },
+      phases: [
+        {
+          id: 'exec',
+          label: 'Execute',
+          color: '#c96442',
+          steps: [{ id: 'impl', name: 'Implement', agent: 'implement', mcps: [], retries: 0 }],
+        },
+      ],
+    };
+    render(
+      <WorkflowEditorCanvas
+        definition={def}
+        selectedStepId={null}
+        selectedFanOutInner={null}
+        dispatch={vi.fn()}
+        agentRunTargets={{}}
+      />,
+    );
+    const el = screen.getByTestId('editor-step-model-impl');
+    expect(el).toHaveTextContent('gpt-5.6-luna');
+    expect(el).toHaveStyle({ color: 'var(--color-status-info)' });
   });
 
   it('(d) skips the model row entirely for the human-gate step', () => {
@@ -196,7 +239,7 @@ describe('WorkflowEditorCanvas — model meta row (fan-out inner cards)', () => 
         selectedStepId={null}
         selectedFanOutInner={null}
         dispatch={vi.fn()}
-        agentModelPins={{}}
+        agentRunTargets={{}}
       />,
     );
 

@@ -74,7 +74,7 @@ vi.mock('../../../../orchestrator/permissionRules', async (orig) => {
   const actual = await orig<typeof import('../../../../orchestrator/permissionRules')>();
   return {
     ...actual,
-    loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [] })),
+    loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [], ask: [] })),
   };
 });
 
@@ -420,7 +420,7 @@ describe('ClaudeCodeManager dynamic PreToolUse hook — live per-call mode', () 
   it('honors the user/project allowlist (auto-allow without the router) in default mode', async () => {
     // composeHookOptions loads the rules ONCE at spawn; mockReturnValueOnce applies
     // to exactly that call, then reverts to the empty-rules factory default.
-    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [] });
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [], ask: [] });
     seedRunSession(db, 'run-al', 'sess-al', 'default');
     const hook = await installedHook({ runId: 'run-al', sessionId: 'sess-al' });
 

@@ -80,6 +80,16 @@
  *     their factory functions run").
  *
  * (f) THE 30-SECOND HANDLER CAP — LOAD-BEARING, SEE ompGateExtension.ts
+ *     SUPERSEDED IN PART by omp 17.3.5, which made the cap the setting
+ *     `extensionHandlers.toolCallTimeoutMs` (changelog: "Made extension
+ *     tool-call timeouts configurable and paused them during user dialogs").
+ *     Read at `runner.ts` as
+ *     `O99(settings?.get('extensionHandlers.toolCallTimeoutMs') ?? 30000)`,
+ *     where the validator accepts ANY positive finite number — there is no
+ *     upper clamp — and falls back to 30000 for anything else. The paragraph
+ *     below is still exactly right for 17.3.4 and earlier, which is why
+ *     cyboflow gates the raise on the version
+ *     (`supportsConfigurableHandlerTimeout`) rather than assuming it.
  *     `extensibility/extensions/runner.ts:84` `EXTENSION_HANDLER_TIMEOUT_MS = 30_000`,
  *     applied at `runner.ts:1237` and enforced by `raceHandlerWithTimeout`
  *     (`runner.ts:192-227`). The only mutator is `testSetExtensionHandlerTimeoutMs`
@@ -217,6 +227,22 @@ export interface OmpGateConfig {
    * fall through to the human gate like any other undecidable tool.
    */
   cyboflowMcpToolNames?: string[];
+  /**
+   * How long the gate may block waiting for a human verdict, in ms.
+   *
+   * Present only when the host has RAISED OMP's own extension-handler cap for
+   * this spawn (`ompHandlerTimeoutOverlay.ts`); the two numbers are computed
+   * together so the gate always gives up before OMP does and the model sees
+   * cyboflow's reason rather than OMP's generic timeout text.
+   *
+   * Optional, and the fallback matters: absent, malformed, or non-positive
+   * means the gate keeps its built-in ~25s budget, which is the only correct
+   * behavior against an OMP that still hard-caps handlers at 30s. A config
+   * that claims a longer budget than the runtime allows would lose the gate's
+   * own error text and strand the socket, so this field is trusted ONLY as
+   * written by a host that also wrote the matching overlay.
+   */
+  humanDecisionBudgetMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +262,17 @@ export interface OmpGateApprovalRequest {
   runId: string;
   toolName: string;
   toolInput: Record<string, unknown>;
+  /**
+   * Which substrate is asking. Present ONLY on this lane; the interactive-Claude
+   * hook omits it and keeps the original semantics.
+   *
+   * The server branches the SOCKET-DIED disposition on it. For the interactive
+   * hook a dead socket means the subprocess died and nothing will ever read the
+   * verdict, so the approval is settled. For this gate it means OMP's 30s
+   * extension-handler cap forced us to stop waiting — the human has simply not
+   * answered yet — so the approval stays pending and a retry re-attaches to it.
+   */
+  substrate?: 'omp';
 }
 
 /**

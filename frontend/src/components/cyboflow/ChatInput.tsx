@@ -111,7 +111,7 @@ function reopenReasonMessage(reason: string): string {
     case 'not_failed':
       return 'This run is no longer in a failed state.';
     case 'interactive_unsupported':
-      return 'Interactive (PTY) runs cannot be reopened — only SDK runs resume.';
+      return 'Interactive (CLI) runs cannot be reopened — only SDK runs resume.';
     case 'execute_failed':
       return 'The agent could not be re-driven — check the run logs.';
     default:

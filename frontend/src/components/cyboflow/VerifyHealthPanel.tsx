@@ -46,6 +46,7 @@ import {
   probeStatus,
   probeStatusClass,
   projectSetupLine,
+  setupIsLaneDerived,
   setupStatusFor,
 } from './verifyHealthModel';
 
@@ -129,7 +130,11 @@ export function VerifyProjectSetupList({
     >
       {projects.map((project) => {
         const status = setupStatusFor(rows, project.id);
-        const line = projectSetupLine(status);
+        // Migration-105 provenance (lane-runbook-bootstrap): a project whose
+        // verification a RUN configured, rather than a human at a gate, says so
+        // here. Both are proven the same way; this is the only durable record of
+        // which happened, and someone deciding whether to trust it needs it.
+        const line = projectSetupLine(status, setupIsLaneDerived(rows, project.id));
         return (
           <div
             key={project.id}

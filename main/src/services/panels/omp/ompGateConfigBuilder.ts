@@ -39,6 +39,29 @@ import type { OmpGateConfig } from './gate/ompGateTypes';
  *   ast_grep  ↔ Grep-class     (`tools/ast-grep.ts:151`)
  *   todo      ↔ TodoWrite      (`tools/todo.ts:797`)
  *
+ * Plus two of OMP's HIDDEN tools (`HIDDEN_TOOL_NAMES = ['yield','goal','think']`,
+ * `tools/builtin-names.ts`), which have no Claude counterpart because Claude has
+ * no equivalent concept. Neither reaches outside the model's own turn:
+ *
+ *   yield     the agent's RETURN VALUE — "submit data or error", how a task
+ *             reports success or failure (`tools/yield.ts`). Pure control flow.
+ *   think     "private scratchpad; not shown to user" (`tools/think.ts`).
+ *
+ * `goal` is the third hidden tool and is deliberately NOT here: it sets a
+ * persistent autonomous objective for the session, which is precisely the kind
+ * of self-direction a human gate exists to show someone.
+ *
+ * WHAT IS NOT HERE, AND WHY — these two were proposed for this list and both
+ * would have been holes:
+ *
+ *   eval  executes Python/JavaScript/Ruby/Julia in a persistent backend
+ *         (`tools/eval.ts`). Arbitrary code execution, not coordination. It is
+ *         already named in the gate's own `AUTO_MODE_HAZARD_TOOLS`.
+ *   hub   is coordination AND process control behind one name: `op:'start'`
+ *         runs an arbitrary `application`, and `op:'send'` with `name` types
+ *         into a live process's stdin. It is classified BY ARGUMENT in the
+ *         gate (`isCoordinationHubCall`), which a name list cannot express.
+ *
  * Everything else OMP happens to tier `read` is deliberately absent, because
  * cyboflow's set is about "touches nothing outside this repo", not about OMP's
  * tier: `web_search` reaches the network; `memory_edit`/`retain` mutate OMP's
@@ -54,7 +77,15 @@ import type { OmpGateConfig } from './gate/ompGateTypes';
  * reaches the human even though `read` is named here. Do not "fix" that by
  * splitting this list — the argument is what decides, and only the gate sees it.
  */
-export const OMP_AUTO_ALLOW_TOOLS: readonly string[] = ['read', 'glob', 'grep', 'ast_grep', 'todo'];
+export const OMP_AUTO_ALLOW_TOOLS: readonly string[] = [
+  'read',
+  'glob',
+  'grep',
+  'ast_grep',
+  'todo',
+  'yield',
+  'think',
+];
 
 /**
  * OMP's file-mutating built-ins — the `acceptEdits`/`auto` allowance, mirroring
@@ -109,6 +140,7 @@ export const CYBOFLOW_MCP_TOOL_NAMES: readonly string[] = [
   'cyboflow_get_task',
   'cyboflow_get_verifications',
   'cyboflow_get_workflow',
+  'cyboflow_history',
   'cyboflow_list_pending_approvals',
   'cyboflow_list_run_findings',
   'cyboflow_list_tasks',
@@ -128,6 +160,7 @@ export const CYBOFLOW_MCP_TOOL_NAMES: readonly string[] = [
   'cyboflow_resolve_finding',
   'cyboflow_run_eval',
   'cyboflow_set_baseline_rotation',
+  'cyboflow_set_idea_component',
   'cyboflow_set_task_stage',
   'cyboflow_set_variant_status',
   'cyboflow_submit_checkpoint',
@@ -232,25 +265,66 @@ export interface OmpGateConfigInput {
    * undecidable and reach the human, which is exactly the desired outcome.
    */
   cyboflowMcpAvailable: boolean;
+  /**
+   * The human-decision budget to hand the gate, in ms. Pass this ONLY when the
+   * spawn also carries the matching `PI_CONFIG_FILES` overlay that raises OMP's
+   * own extension-handler cap — the two are halves of one change, and a budget
+   * without the overlay makes the gate outlive the runtime that hosts it.
+   * Omitted for an OMP older than
+   * `OMP_CONFIGURABLE_HANDLER_TIMEOUT_VERSION`, which ignores the setting.
+   */
+  humanDecisionBudgetMs?: number;
 }
 
 /**
  * Build the gate config for one spawn.
  *
- * `denyTaskTool` is unconditionally true: OMP's docs say subagents run
- * forced-yolo and whether the gate's `tool_call` handler is even installed
- * inside one is unverified, so subagent dispatch stays denied in EVERY mode
- * (the gate applies that before the `dontAsk` short-circuit —
- * `ompGateExtension.ts:460-469`).
+ * `denyTaskTool` is FALSE, and the premise that once made it true has been
+ * measured rather than assumed.
  *
- * TASK ISOLATION IS UNREACHABLE, BY THIS. The proposal's §6 item 8 planned a
- * `task.isolation.mode: none` config overlay for lane spawns, because OMP's
- * subagent overlay/rcopy isolation is untested inside a cyboflow git worktree.
- * That setting only ever applies once a `task` call is ALLOWED — and this deny
- * is unconditional, in every mode, for every spawn this manager makes. So v1
- * ships no overlay: it would be dead configuration whose presence implies a
- * subagent path that cannot happen. Whoever lifts `denyTaskTool` has to decide
- * the isolation mode in the same change, or lane spawns get OMP's default.
+ * IT WAS TRUE ON AN ASSUMPTION, NOT A CITATION — and the distinction is the
+ * whole reason this changed. The original comment read "OMP's docs say subagents
+ * run forced-yolo". That sentence has no source, which stands out in a file
+ * where every other external claim cites a line (`runner.ts:1235-1270`,
+ * `wrapper.ts:201-235`, `read.ts:401`). The proposal it derives from says
+ * something weaker and different: §2 fact 5 records that OMP's GLOBAL
+ * `tools.approvalMode` defaults to `yolo` — a session-wide setting cyboflow
+ * already overrides with `--approval-mode always-ask` — and the risk table
+ * records hook scope inside subagents as "unknown", not as documented-yolo.
+ * omp v17.3.5's own surfaces tie `yolo` only to that global setting, whose
+ * description reads "'Yolo' auto-approves all tiers; user policy may still
+ * prompt or block". Two true facts got welded into a third that nobody checked.
+ *
+ * Being empirical, it was testable. Probed live against omp v17.3.5 on
+ * 2026-08-23, in an `auto` session, with `task` allowed:
+ *
+ *   23:00:48.748  allowed `task` (auto-tool)     <- parent dispatches
+ *   23:00:54.039  allowed `bash` (allow-rule)    <- THE SUBAGENT's call, GATED
+ *   23:00:59.922  parent's next tool call (`hub`)
+ *
+ * The parent's own transcript shows NO tool call between its `task` at
+ * 23:00:48.752 and its `hub` at 23:00:59.922, so the gated `bash` at 23:00:54
+ * was the subagent's; the file it wrote landed carrying the expected marker. The
+ * handler fires inside a `task` subagent. The premise does not hold.
+ *
+ * TASK ISOLATION, decided in the same change as the old note required. §6 item 8
+ * planned a `task.isolation.mode: none` overlay because OMP's subagent
+ * overlay/rcopy isolation was untested inside a cyboflow git worktree. The same
+ * probe answered it: a subagent told to write a RELATIVE path put the file in
+ * the session's own worktree, visible to the parent — OMP's default already
+ * behaves as `none` here. No overlay is configured, because configuring one
+ * would pin a behaviour we are not otherwise exercising.
+ *
+ * THE RESIDUAL RISK, stated without the embellishment the old note carried: this
+ * relies on gating and isolation behaviour of an external binary that nothing
+ * here pins or asserts, and OMP ships fast. It is NOT "the docs say otherwise" —
+ * no such doc has been found. A version tripwire is the obvious follow-up, and
+ * pinning isolation explicitly needs OMP's real config key.
+ *
+ * THE FAIL-CLOSED DEFAULTS ARE UNCHANGED. `MOST_RESTRICTIVE_GATE_CONFIG` and
+ * `parseGateConfig` both still default `denyTaskTool` to TRUE, so a missing or
+ * malformed config still denies subagent dispatch. Only this builder — which
+ * runs when the config IS well-formed — now allows it.
  *
  * The merged rules' DENY half is intentionally not forwarded: the gate has no
  * deny-rule grammar, and a denied call that is merely absent from `allowRules`
@@ -266,7 +340,13 @@ export function buildOmpGateConfig(input: OmpGateConfigInput): OmpGateConfig {
     autoAllowTools: [...OMP_AUTO_ALLOW_TOOLS],
     editTools: [...OMP_EDIT_TOOLS],
     allowRules: [...(input.allowRules ?? [])],
-    denyTaskTool: true,
+    denyTaskTool: false,
     cyboflowMcpToolNames: input.cyboflowMcpAvailable ? cyboflowOmpMcpToolNames() : [],
+    // Omitted rather than defaulted: absence is what tells the gate to keep its
+    // own ~25s budget, and an explicit number here is a claim that OMP was
+    // configured to allow it.
+    ...(input.humanDecisionBudgetMs !== undefined
+      ? { humanDecisionBudgetMs: input.humanDecisionBudgetMs }
+      : {}),
   };
 }

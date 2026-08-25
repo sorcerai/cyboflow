@@ -43,10 +43,19 @@ export interface WorkflowBundleFile {
 export interface WorkflowBundle {
   commands: WorkflowBundleFile[];
   agents: WorkflowBundleFile[];
+  /**
+   * Dynamic-workflow stage scripts (`.claude/workflows/cyboflow-<name>.js`).
+   *
+   * Unlike commands/agents these are NOT read from app assets — they are
+   * RENDERED per run from the fan-out spec (`fanOutStageScript.ts`) and attached
+   * by the install seam, so `resolveWorkflowBundle` always leaves this empty.
+   * Present on the type so the writer has one uniform bundle to place + reconcile.
+   */
+  scripts: WorkflowBundleFile[];
 }
 
 /** An empty bundle — the fail-soft result when no sibling bundle dir exists. */
-const EMPTY_BUNDLE: WorkflowBundle = { commands: [], agents: [] };
+const EMPTY_BUNDLE: WorkflowBundle = { commands: [], agents: [], scripts: [] };
 
 /**
  * Resolve the command + agent bundle co-located with a workflow's prose `.md`.
@@ -67,6 +76,8 @@ export function resolveWorkflowBundle(workflowPath: string | null | undefined): 
   return {
     commands: readBundleDir(join(bundleRoot, 'commands')),
     agents: readBundleDir(join(bundleRoot, 'agents')),
+    // Rendered per run by the install seam, never read from assets — see the type.
+    scripts: [],
   };
 }
 

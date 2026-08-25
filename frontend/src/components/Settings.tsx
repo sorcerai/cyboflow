@@ -10,6 +10,11 @@ import type { AgentRuntime } from '../../../shared/types/agentRuntime';
 import type { AssistantContextRetention } from '../../../shared/types/agentThread';
 import type { ExecutionModel } from '../../../shared/types/executionModel';
 import type { CliSubstrate } from '../../../shared/types/substrate';
+import {
+  clampSprintMaxTasks,
+  resolveSprintMaxTasks,
+  SPRINT_BATCH_MAX_TASKS_DEFAULTS,
+} from '../../../shared/types/sprintBatch';
 import type { PermissionMode } from '../../../shared/types/workflows';
 import type { QuickSessionWorktreeMode } from '../../../shared/types/worktreeMode';
 import { useConfigStore } from '../stores/configStore';
@@ -55,6 +60,12 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
   // DEV-ONLY: forces the next AskUserQuestion gate to fail so the durable recovery
   // gate can be exercised live. Hidden in the stable DMG; inert in packaged builds.
   const [forceAskUserQuestionGateFailure, setForceAskUserQuestionGateFailure] = useState(false);
+  // Aria mode: supervise a REMOTE OMP fleet instead of running OMP locally.
+  // Enforced per command (OmpSupervisedAdapter holds the principal THUNK), so a
+  // change lands on the next call — no relaunch. Pickers read the flavor from
+  // the config store (useOmpAvailability), so they swap on save without a
+  // remount either.
+  const [ariaMode, setAriaMode] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   // demoMode is read once at app startup, so the saved value only takes effect
   // after a relaunch — track the loaded value to detect a toggle on save.
@@ -130,9 +141,19 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
   // Layered visual verification master switch (default OFF). MVP exposes only the
   // master toggle; advanced numeric fields stay config-only for now.
   const [visualVerifyEnabled, setVisualVerifyEnabled] = useState(false);
+  const [autoBootstrapRunbook, setAutoBootstrapRunbook] = useState(false);
   // Auto-surface idle PTY quick sessions into the human review queue (default ON).
   // A blocking human_task is minted for an interactive quick session that finished
   // a turn and has sat unviewed longer than idleReviewThresholdMinutes.
+  // Sprint task-selection cap, per substrate. `number | ''` so clearing the field
+  // renders empty (never value={NaN}); the save path floors an empty/invalid entry
+  // back to the built-in default and clamps the rest.
+  const [sprintMaxTasksSdk, setSprintMaxTasksSdk] = useState<number | ''>(
+    SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk,
+  );
+  const [sprintMaxTasksInteractive, setSprintMaxTasksInteractive] = useState<number | ''>(
+    SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+  );
   const [idleReviewEnabled, setIdleReviewEnabled] = useState(true);
   // number | '' so clearing the field shows empty (never value={NaN}); the save
   // path floors a non-finite/empty value back to 5.
@@ -189,6 +210,7 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
       setClaudeExecutablePath(data.claudeExecutablePath || '');
       setDevMode(data.devMode || false);
       setForceAskUserQuestionGateFailure(data.forceAskUserQuestionGateFailure ?? false);
+      setAriaMode(data.ariaMode ?? false);
       setDemoMode(data.demoMode || false);
       setInitialDemoMode(data.demoMode || false);
       setEnableCyboflowFooter(data.enableCyboflowFooter !== false); // Default to true
@@ -206,12 +228,17 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
       setQuickSessionWorktreeMode(data.quickSessionWorktreeMode ?? 'worktree');
       setQuickSessionDefaultSubstrate(data.quickSessionDefaultSubstrate ?? 'interactive');
       setCodeReviewEvalEnabled(data.codeReviewEvalEnabled ?? true);
+      // Show the effective cap: an absent/invalid override renders as the built-in
+      // default, which is exactly what a launch would use.
+      setSprintMaxTasksSdk(resolveSprintMaxTasks(data.sprintMaxTasks, 'sdk'));
+      setSprintMaxTasksInteractive(resolveSprintMaxTasks(data.sprintMaxTasks, 'interactive'));
       setComputeCostFromRates(data.computeCostFromRates ?? false);
       setAutoGradeVariantRuns(data.autoGradeVariantRuns ?? true);
       setErrorReportingEnabled(data.telemetry?.errorReportingEnabled ?? true);
       setUsageMetricsEnabled(data.telemetry?.usageMetricsEnabled ?? true);
       setArtifactCommitDir(data.artifactCommitDir ?? '');
       setVisualVerifyEnabled(data.visualVerify?.enabled ?? false);
+      setAutoBootstrapRunbook(data.visualVerify?.autoBootstrapRunbook ?? false);
       setIdleReviewEnabled(data.idleSessionReview?.enabled ?? true);
       setIdleReviewThresholdMinutes(data.idleSessionReview?.thresholdMinutes ?? 5);
 
@@ -256,6 +283,9 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
         claudeExecutablePath,
         devMode,
         forceAskUserQuestionGateFailure,
+        // Explicit boolean, never undefined — updateConfig merges partials, so
+        // an undefined value would fail to overwrite a stored `true`.
+        ariaMode,
         demoMode,
         enableCyboflowFooter,
         // Empty ('App default') → undefined so getAssistantModel() floors to
@@ -288,6 +318,15 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
         quickSessionWorktreeMode,
         quickSessionDefaultSubstrate,
         codeReviewEvalEnabled,
+        // Sprint task-selection cap. An empty/NaN field falls back to the built-in
+        // default for that substrate and every value is clamped, so a typo cannot
+        // persist a 0 (which would make every sprint launch impossible) or a
+        // 10_000. The IPC handler re-clamps — this is the friendly half.
+        sprintMaxTasks: {
+          sdk: clampSprintMaxTasks(sprintMaxTasksSdk) ?? SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk,
+          interactive:
+            clampSprintMaxTasks(sprintMaxTasksInteractive) ?? SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+        },
         computeCostFromRates,
         autoGradeVariantRuns,
         // Empty field → undefined → the getter floors to the default (config.json
@@ -295,7 +334,11 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
         artifactCommitDir: artifactCommitDir.trim() ? artifactCommitDir.trim() : undefined,
         // Preserve any advanced visualVerify fields the user set in config.json
         // (the UI exposes only the master switch); overwrite just `enabled`.
-        visualVerify: { ..._config?.visualVerify, enabled: visualVerifyEnabled },
+        visualVerify: {
+          ..._config?.visualVerify,
+          enabled: visualVerifyEnabled,
+          autoBootstrapRunbook,
+        },
         // Idle-session auto-review. A non-positive/NaN threshold floors to 5 on
         // the main side too, but clamp here so the persisted value stays sane.
         idleSessionReview: {
@@ -621,6 +664,29 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
               </SettingsSection>
 
               <SettingsSection
+                title="OMP Runtime"
+                description="Choose how this machine runs OMP"
+                icon={<FileText className="w-4 h-4" />}
+              >
+                <Checkbox
+                  label="Aria mode"
+                  checked={ariaMode}
+                  onChange={(e) => setAriaMode(e.target.checked)}
+                />
+                <p className="text-xs text-text-tertiary mt-1">
+                  Supervise a remote OMP fleet over the Prime bridge instead of running OMP locally.
+                  On, the runtime picker offers <strong>OMP fleet</strong>; off, it offers <strong>OMP</strong> and{' '}
+                  <strong>OMP (CLI)</strong>. The two are alternatives, so only one appears at a time.
+                </p>
+                <p className="text-xs text-text-tertiary mt-1">
+                  Turning this on also authorizes Cyboflow to spawn and stop remote workers on your behalf.
+                  It needs the OMP provider enabled in Integrations and a configured bridge
+                  (<code>OMP_BRIDGE_TOKEN_FILE</code> and <code>OMP_BRIDGE_SESSION_ID</code>); without those,
+                  OMP fleet stays hidden. Changes take effect right away — no restart needed.
+                </p>
+              </SettingsSection>
+
+              <SettingsSection
                 title="Additional PATH Directories"
                 description="Add custom directories to the PATH environment variable"
                 icon={<FileText className="w-4 h-4" />}
@@ -703,6 +769,8 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
               onArtifactCommitDirChange={setArtifactCommitDir}
               visualVerifyEnabled={visualVerifyEnabled}
               onVisualVerifyEnabledChange={setVisualVerifyEnabled}
+              autoBootstrapRunbook={autoBootstrapRunbook}
+              onAutoBootstrapRunbookChange={setAutoBootstrapRunbook}
               idleReviewEnabled={idleReviewEnabled}
               onIdleReviewEnabledChange={setIdleReviewEnabled}
               idleReviewThresholdMinutes={idleReviewThresholdMinutes}
@@ -725,6 +793,10 @@ export function Settings({ isOpen, onClose, initialTab }: SettingsProps) {
               onQuickSessionWorktreeModeChange={setQuickSessionWorktreeMode}
               quickSessionDefaultSubstrate={quickSessionDefaultSubstrate}
               onQuickSessionDefaultSubstrateChange={setQuickSessionDefaultSubstrate}
+              sprintMaxTasksSdk={sprintMaxTasksSdk}
+              onSprintMaxTasksSdkChange={setSprintMaxTasksSdk}
+              sprintMaxTasksInteractive={sprintMaxTasksInteractive}
+              onSprintMaxTasksInteractiveChange={setSprintMaxTasksInteractive}
               codeReviewEvalEnabled={codeReviewEvalEnabled}
               onCodeReviewEvalEnabledChange={setCodeReviewEvalEnabled}
               autoGradeVariantRuns={autoGradeVariantRuns}

@@ -58,6 +58,31 @@ interface PendingApprovalCardProps {
 // Internal subcomponent — shared card chrome
 // ---------------------------------------------------------------------------
 
+/**
+ * The sentinel workflow every quick chat session shares. It is a routing
+ * detail, not a name, and showing it to a human tells them nothing.
+ */
+const QUICK_SESSION_WORKFLOW = '__quick__';
+
+/**
+ * The best available answer to "who is asking", in order of usefulness:
+ * the session's own name, else a real workflow name, else nothing.
+ *
+ * Returns '' rather than a placeholder when neither exists — an empty span is
+ * quieter than "Unknown", and the tool name beside it already carries the
+ * information the human acts on.
+ */
+export function resolveRequesterLabel(approval: {
+  sessionName: string | null;
+  workflowName: string;
+}): string {
+  if (approval.sessionName !== null && approval.sessionName.trim().length > 0) {
+    return approval.sessionName;
+  }
+  return approval.workflowName === QUICK_SESSION_WORKFLOW ? '' : approval.workflowName;
+}
+
+
 interface CardChromeProps {
   /** The approval whose metadata drives the card. */
   representative: Approval;
@@ -110,6 +135,7 @@ function CardChrome({
   const stuckClass = isStuck ? ' border-status-error' : '';
 
   const truncated = truncatePayload(representative.payloadPreview);
+  const requesterLabel = resolveRequesterLabel(representative);
 
   function handleCancelAndRestart(): void {
     setCancelBusy(true);
@@ -124,12 +150,51 @@ function CardChrome({
       className={`px-4 py-3 border-b border-border-primary hover:bg-surface-hover cursor-default${focusClass}${stuckClass}`}
     >
       <div className="flex items-baseline gap-2 flex-wrap">
-        <span className="text-xs text-text-muted">{representative.workflowName}</span>
+        {/*
+          WHO IS ASKING. `workflowName` is the sentinel `__quick__` for every
+          chat session, so on its own it identifies nothing — a live smoke ended
+          with a queue of cards that all read `__quick__` and were mutually
+          indistinguishable. The session name is the part a human recognizes, so
+          it leads and the workflow name is dropped when it is the sentinel.
+
+          The provider badge separates a Claude ask from an OMP one, which
+          matters because they behave differently under the same card (an OMP
+          ask can go un-awaited; a Claude one cannot). It is NOT full
+          attribution: it cannot tell an OMP parent from its own subagent,
+          because OMP's tool_call event carries no agent identity to forward.
+        */}
+        <span className="text-xs text-text-muted">{requesterLabel}</span>
+        {representative.agentProvider !== null && (
+          <span
+            className="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase tracking-wide bg-surface-secondary text-text-muted"
+            title={`Asked by a ${representative.agentProvider} agent`}
+          >
+            {representative.agentProvider}
+          </span>
+        )}
         <span className="text-sm font-semibold text-text-primary">{label}</span>
         {isStuck && <StuckBadge reason={stuckReasonLabel} detectedAt={detectedAt} />}
         {isBlocking && (
           <span className="ml-1 text-xs font-medium text-status-error">
             blocked {formatAge(representative.createdAt)}
+          </span>
+        )}
+        {/*
+          A standing ask: the omp-sdk gate stopped waiting (OMP kills an
+          extension handler at 30s) and the agent moved on, but the question is
+          still live — answering it authorizes the call if the agent asks again,
+          this turn or a later one. Said out loud because an unlabeled card with
+          no "blocked" badge reads as an oversight, and because the useful action
+          here is not urgent, just useful. Mutually exclusive with the blocked
+          badge by construction: partitionBlockingItems never marks an
+          un-awaited item blocking.
+        */}
+        {representative.awaited === false && (
+          <span
+            className="ml-1 text-xs font-medium text-text-muted"
+            title="The agent stopped waiting for this one. Answer it anyway — the decision is honored if it asks again."
+          >
+            no agent waiting
           </span>
         )}
         <span className="ml-auto text-xs text-text-muted">{formatAge(representative.createdAt)}</span>

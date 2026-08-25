@@ -86,6 +86,7 @@ function variantRow(over: Partial<WorkflowVariantRow> = {}): WorkflowVariantRow 
     agent_runtime: null,
     weight: 1,
     status: 'draft',
+    archived_at: null,
     created_at: '2026-07-14T00:00:00.000Z',
     updated_at: '2026-07-14T00:00:00.000Z',
     ...over,

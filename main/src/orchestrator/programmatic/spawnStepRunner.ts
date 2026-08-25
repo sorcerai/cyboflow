@@ -183,6 +183,14 @@ export interface SpawnStepRunnerOptions {
    * (already normalized `providerModel ?? codexModel` by the caller);
    * `codexModel` mirrors it for a not-yet-migrated reader.
    */
+  /**
+   * Repo paths this run's RUNBOOK BOOTSTRAP wrote
+   * (docs/proposals/lane-runbook-bootstrap.md §11). Re-resolved PER STEP, like
+   * every other thunk here, because the bootstrap fires mid-run — a value
+   * captured at construction would be empty for the run that actually needs it.
+   * Only the address-review step renders it.
+   */
+  bootstrapProtectedPaths?: () => readonly string[];
   resolveStepAgent?: (agentKey: string) =>
     | {
         runtime?: WorkflowAgentRuntime;
@@ -223,6 +231,10 @@ export class SpawnStepRunner implements StepRunner {
     // Re-read the project brief per step — undefined until the brief artifact
     // is reported, then every later step turn carries the grounding section.
     const projectBrief = this.opts.projectBrief?.();
+    // Re-resolve the bootstrap's written paths per step: the bootstrap fires
+    // mid-run at a lane's visual-verify, so a value read at construction would be
+    // empty on exactly the run that needs the denylist.
+    const bootstrapProtectedPaths = this.opts.bootstrapProtectedPaths?.();
     // Re-resolve this step's agent RUNTIME per step (Codex-per-step mixing) —
     // never captured at construction, mirroring the resolvers above — so a
     // workflow-scoped agent config edited mid-run is honored on this step's next
@@ -277,6 +289,9 @@ export class SpawnStepRunner implements StepRunner {
       ...(approveIdeasDecisions ? { approveIdeasDecisions } : {}),
       ...(projectBrief ? { projectBrief } : {}),
       ...(userGuidance ? { userGuidance } : {}),
+      ...(bootstrapProtectedPaths && bootstrapProtectedPaths.length > 0
+        ? { bootstrapProtectedPaths }
+        : {}),
       // Per-attempt visual-verification threading (verification-agent redesign
       // §5.3): a task-verify contract re-run and a visual-FAIL implement
       // re-delegate carry their defect / report on the ctx; forward verbatim so

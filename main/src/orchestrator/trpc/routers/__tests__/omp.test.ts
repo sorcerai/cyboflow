@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { appRouter } from '../../router';
 import { createContext } from '../../context';
 import type { OmpControlPlaneAdapter, RegistrySnapshot, WorkerEntry } from '../../../../../../shared/types/omp';
+import { OMP_SUPERVISE_CAPABILITY } from '../../../../../../shared/types/ompCommand';
 
 const SENTINEL = 'SENTINEL_SECRET_DO_NOT_CROSS_IPC';
 
@@ -88,5 +89,52 @@ describe('cyboflow.omp.fleetSnapshot redaction', () => {
     const caller = appRouter.createCaller(createContext({}));
     const res = await caller.cyboflow.omp.fleetSnapshot();
     expect(res).toMatchObject({ ok: false, error: 'unavailable' });
+  });
+});
+
+/**
+ * cyboflow.omp.availability — what the picker may offer.
+ *
+ * Two independent axes, and the router must not collapse them: `launchable`
+ * asks whether a remote worker can be spawned RIGHT NOW (boot-built manager +
+ * supervise capability), `ariaMode` says which OMP flavor this install runs.
+ * A toggle flipped without a relaunch is exactly the state where they disagree.
+ */
+describe('cyboflow.omp.availability', () => {
+  const supervising = {
+    userId: 'local',
+    capabilities: new Set([OMP_SUPERVISE_CAPABILITY]),
+  };
+  const unprivileged = { userId: 'local', capabilities: new Set<string>() };
+
+  async function query(deps: Parameters<typeof createContext>[0]) {
+    return appRouter.createCaller(createContext(deps)).cyboflow.omp.availability();
+  }
+
+  it('reports launchable only when the manager exists AND the principal supervises', async () => {
+    expect(
+      await query({ principal: supervising, ompFleetLaunchable: () => true, ompAriaMode: () => true }),
+    ).toEqual({ launchable: true, ariaMode: true });
+
+    // Manager absent (Aria mode on, but the app has not relaunched yet).
+    expect(
+      await query({ principal: supervising, ompFleetLaunchable: () => false, ompAriaMode: () => true }),
+    ).toEqual({ launchable: false, ariaMode: true });
+
+    // Capability revoked while a manager from an earlier boot still exists.
+    expect(
+      await query({ principal: unprivileged, ompFleetLaunchable: () => true, ompAriaMode: () => true }),
+    ).toEqual({ launchable: false, ariaMode: true });
+  });
+
+  it('reports ariaMode independently of launchability', async () => {
+    // A local-OMP install: not a fleet, and that is not a failure.
+    expect(
+      await query({ principal: unprivileged, ompFleetLaunchable: () => false, ompAriaMode: () => false }),
+    ).toEqual({ launchable: false, ariaMode: false });
+  });
+
+  it('floors both to false when nothing is wired (fail closed)', async () => {
+    expect(await query({})).toEqual({ launchable: false, ariaMode: false });
   });
 });

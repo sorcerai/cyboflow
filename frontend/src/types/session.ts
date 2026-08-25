@@ -175,6 +175,20 @@ export interface Session {
    * this field. undefined/null → not a design session (or link broken).
    */
   design_idea_id?: string | null;
+  /**
+   * Idea this session is the persistent home for (sessions.home_idea_id,
+   * migration 113; idea sessions feature). At most one live session per idea
+   * holds this. undefined/null → not an idea-home session. Mirror of
+   * main/src/types/session.ts Session.
+   */
+  homeIdeaId?: string | null;
+  /**
+   * Idea whose launch minted this session (sessions.origin_idea_id, migration
+   * 112; sidebar nesting lineage). Many sessions may share the same origin —
+   * it is lineage, not a claim. undefined/null → no recorded launch origin.
+   * Mirror of main/src/types/session.ts Session.
+   */
+  originIdeaId?: string | null;
 }
 
 export interface GitStatus {
@@ -336,6 +350,15 @@ import type { Folder } from './folder';
 export type FolderWithProjectId = Folder;
 
 export type ContextMenuPayload = Session | Folder;
+
+/**
+ * `sessions:open-idea-session` wire types (the backlog idea card's "Open").
+ * RE-EXPORTED, never re-declared: the single declaration lives in
+ * shared/types/ideaSession.ts so main and the renderer cannot drift a field
+ * apart (docs/CODE-PATTERNS.md → "IPC / type-parity rules"). Surfaced here so
+ * renderer code can keep importing session IPC shapes from one place.
+ */
+export type { OpenIdeaSessionRequest, OpenIdeaSessionResponse } from '../../../shared/types/ideaSession';
 
 // Attachment types for Claude Code config
 export interface AttachedImage {

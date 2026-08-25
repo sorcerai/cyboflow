@@ -31,6 +31,7 @@ const BUNDLE: WorkflowBundle = {
     { name: 'tasks', content: '---\ndescription: tasks\n---\nTasks phase.' },
   ],
   agents: [{ name: 'researcher', content: '---\nname: researcher\ndescription: r\n---\nResearch.' }],
+  scripts: [],
 };
 
 describe('WorkflowBundleWriter', () => {
@@ -77,7 +78,7 @@ describe('WorkflowBundleWriter', () => {
     expect(fs.existsSync(path.join(commandsDir(worktree), 'cyboflow-tasks.md'))).toBe(true);
 
     // Re-write a SMALLER bundle (tasks dropped).
-    writer.write(worktree, { commands: [BUNDLE.commands[0]], agents: [] });
+    writer.write(worktree, { commands: [BUNDLE.commands[0]], agents: [], scripts: [] });
 
     expect(fs.existsSync(path.join(commandsDir(worktree), 'cyboflow-context.md'))).toBe(true);
     expect(fs.existsSync(path.join(commandsDir(worktree), 'cyboflow-tasks.md'))).toBe(false);
@@ -99,12 +100,86 @@ describe('WorkflowBundleWriter', () => {
   });
 
   it('(e) an empty bundle writes nothing and returns null', () => {
-    const result = new WorkflowBundleWriter().write(worktree, { commands: [], agents: [] });
+    const result = new WorkflowBundleWriter().write(worktree, { commands: [], agents: [], scripts: [] });
     expect(result).toBeNull();
     expect(fs.existsSync(path.join(worktree, '.claude'))).toBe(false);
   });
 
   it('remove is a no-op when the worktree has no .claude dir', () => {
     expect(() => new WorkflowBundleWriter().remove(worktree)).not.toThrow();
+  });
+
+  // -------------------------------------------------------------------------
+  // Dynamic-workflow stage scripts (.claude/workflows/cyboflow-*.js)
+  // -------------------------------------------------------------------------
+
+  const workflowsDir = (wt: string) => path.join(wt, '.claude', 'workflows');
+
+  it('writes stage scripts as cyboflow-<name>.js', () => {
+    const result = new WorkflowBundleWriter().write(worktree, {
+      commands: [],
+      agents: [],
+      scripts: [{ name: 'sprint-execute-implement', content: 'export const meta = {}\n' }],
+    });
+
+    const target = path.join(workflowsDir(worktree), 'cyboflow-sprint-execute-implement.js');
+    expect(fs.existsSync(target)).toBe(true);
+    expect(result?.scriptPaths).toEqual([target]);
+  });
+
+  it('remove strips generated .js but preserves a user script and a user .md in the same dir', () => {
+    const writer = new WorkflowBundleWriter();
+    writer.write(worktree, {
+      commands: [],
+      agents: [],
+      scripts: [{ name: 'gen', content: 'export const meta = {}\n' }],
+    });
+
+    const userJs = path.join(workflowsDir(worktree), 'mine.js');
+    const userMd = path.join(workflowsDir(worktree), 'cyboflow-notes.md');
+    fs.writeFileSync(userJs, 'user script');
+    fs.writeFileSync(userMd, 'user notes');
+
+    writer.remove(worktree);
+
+    expect(fs.existsSync(path.join(workflowsDir(worktree), 'cyboflow-gen.js'))).toBe(false);
+    expect(fs.readFileSync(userJs, 'utf8')).toBe('user script');
+    // Extension-scoped: the .md remove pass targets commands/agents dirs, so a
+    // cyboflow-*.md sitting in the workflows dir is not ours to delete.
+    expect(fs.readFileSync(userMd, 'utf8')).toBe('user notes');
+  });
+
+  it('an empty bundle still clears a previously-written script (no stale resolution)', () => {
+    const writer = new WorkflowBundleWriter();
+    writer.write(worktree, {
+      commands: [],
+      agents: [],
+      scripts: [{ name: 'stale', content: 'export const meta = {}\n' }],
+    });
+    expect(fs.existsSync(path.join(workflowsDir(worktree), 'cyboflow-stale.js'))).toBe(true);
+
+    // Dispatch switched off -> empty bundle. The prior set MUST be reconciled
+    // away; otherwise the CLI keeps resolving the stale script by name.
+    const result = writer.write(worktree, { commands: [], agents: [], scripts: [] });
+
+    expect(result).toBeNull();
+    expect(fs.existsSync(path.join(workflowsDir(worktree), 'cyboflow-stale.js'))).toBe(false);
+  });
+
+  it('refuses a logical name that would escape its target directory', () => {
+    const writer = new WorkflowBundleWriter();
+    writer.write(worktree, {
+      commands: [],
+      agents: [],
+      scripts: [
+        { name: '../../escaped', content: 'nope' },
+        { name: 'ok', content: 'export const meta = {}\n' },
+      ],
+    });
+
+    expect(fs.existsSync(path.join(worktree, '.claude', 'workflows', 'cyboflow-ok.js'))).toBe(true);
+    // Nothing landed above the workflows dir.
+    expect(fs.existsSync(path.join(worktree, 'cyboflow-../../escaped.js'))).toBe(false);
+    expect(fs.readdirSync(worktree).filter((e) => e.endsWith('.js'))).toEqual([]);
   });
 });

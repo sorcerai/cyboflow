@@ -21,6 +21,17 @@
  *                             'idea-spec' via `tasks.get`); the renderer extracts
  *                             the '## Architecture design' section from its body
  *                             with the SHARED extractArchDesignSection.
+ *   - 'idea-summary'       -> the ledger HUB, in two shapes. SINGLE idea: BOTH
+ *                             the originating idea (`tasks.get`) AND the idea
+ *                             component ledger's merged hybrid view
+ *                             (`cyboflow.ideaComponents.get`, migration 101) —
+ *                             sourceRef-keyed like idea-spec/arch-design, but
+ *                             needs a SECOND fetch, so it gets its own block.
+ *                             COMBINED multi-idea batch (payload_json.combined):
+ *                             RUN-scoped instead — `tasks.runDecomposition` for
+ *                             the batch's ideas, zipped against ONE batched
+ *                             `ideaComponents.getMany`, resolving to kind
+ *                             'idea-summaries'.
  *   - 'screenshots'        -> no entity source yet; the parsed `payload_json`
  *                             (`{ fileNames?: string[] }`) is surfaced as-is.
  *   - 'ui-prototype' / 'generic' (canvas) -> the parsed `payload_json`
@@ -47,7 +58,7 @@
  */
 import { useEffect, useState } from 'react';
 import { trpc } from '../trpc/client';
-import { isCanvasArtifact } from '../../../shared/types/artifacts';
+import { isCanvasArtifact, isCombinedBatchArtifact } from '../../../shared/types/artifacts';
 import type {
   Artifact,
   EvalReportPayload,
@@ -56,6 +67,7 @@ import type {
   ScreenshotsArtifactPayload,
 } from '../../../shared/types/artifacts';
 import type { BacklogTaskItem } from '../../../shared/types/tasks';
+import type { IdeaComponentState } from '../../../shared/types/ideaComponents';
 
 /**
  * Parsed `payload_json` shape for the canvas (ui-prototype / generic) embed.
@@ -111,6 +123,17 @@ export type EvalReportArtifactPayload = EvalReportPayload;
 export type ProjectBriefPayload = RecommendationsArtifactPayload;
 
 /**
+ * One row of the COMBINED multi-idea idea-summary tab: an idea the run owns,
+ * paired with its merged component-ledger snapshot. Positionally zipped from
+ * `tasks.runDecomposition` + `ideaComponents.getMany` (which echoes one entry
+ * per requested id, in order), so the two halves can never come apart.
+ */
+export interface IdeaSummaryEntry {
+  idea: BacklogTaskItem;
+  components: IdeaComponentState[];
+}
+
+/**
  * Discriminated content union the renderer switches on. `kind` mirrors the
  * resolved data source, NOT the atype 1:1 (idea-spec + decomposed-stories both
  * resolve from the entity model but produce different shapes).
@@ -119,6 +142,8 @@ export type ArtifactContent =
   | { kind: 'idea'; idea: BacklogTaskItem }
   | { kind: 'stories'; ideas: BacklogTaskItem[] }
   | { kind: 'arch'; idea: BacklogTaskItem }
+  | { kind: 'idea-summary'; idea: BacklogTaskItem; components: IdeaComponentState[] }
+  | { kind: 'idea-summaries'; entries: IdeaSummaryEntry[] }
   | { kind: 'screenshots'; payload: ScreenshotsPayload }
   | { kind: 'recommendations'; payload: RecommendationsPayload }
   | { kind: 'eval-report'; payload: EvalReportArtifactPayload }
@@ -222,8 +247,7 @@ export function useArtifactData(artifact: Artifact, projectId: number | null): A
     // rolled-up "Idea specs" tab) takes the SAME run-scoped path: same query,
     // same live subscription, resolving to kind 'stories' with the batch's
     // ideas. Its sourceRef is only an identity anchor, not the data source.
-    const isCombinedIdeaSpec =
-      atype === 'idea-spec' && parsePayload(payloadJson)['combined'] === true;
+    const isCombinedIdeaSpec = atype === 'idea-spec' && isCombinedBatchArtifact(payloadJson);
     if (atype === 'decomposed-stories' || isCombinedIdeaSpec) {
       let cancelled = false;
       // Monotonic fetch id — a slow earlier (re-)fetch must never clobber a newer.
@@ -283,6 +307,182 @@ export function useArtifactData(artifact: Artifact, projectId: number | null): A
       };
     }
 
+    // COMBINED idea-summary (payload_json.combined) — the multi-idea batch's one
+    // rolled-up "Idea summaries" tab. RUN-scoped like the combined idea-spec: it
+    // re-derives the batch's ideas from `tasks.runDecomposition({ runId })` and
+    // their ledgers from ONE batched `ideaComponents.getMany`, so its sourceRef
+    // (the first owned idea) is an identity anchor only, never the data source.
+    //
+    // Archived ideas are dropped here rather than in the renderer — unlike the
+    // combined idea-spec, whose two halves are one array, this path zips ideas
+    // against ledger rows, so filtering AFTER the getMany call would leave the
+    // two lists misaligned. Filter first, then request exactly the ids kept.
+    //
+    // Stays live on BOTH channels, each unfiltered: a task change anywhere in
+    // the project can add/remove an idea from the run's owned set (which is not
+    // cheaply knowable here — same reason decomposed-stories re-fetches broadly),
+    // and a ledger write to ANY of the batch's ideas changes a rendered cell.
+    if (atype === 'idea-summary' && isCombinedBatchArtifact(payloadJson)) {
+      let cancelled = false;
+      // Monotonic fetch id — a slow earlier (re-)fetch must never clobber a newer.
+      let latestFetchId = 0;
+
+      const resolveSummaries = (silent: boolean): void => {
+        if (!silent) setState({ loading: true, error: null, data: null });
+        const fetchId = ++latestFetchId;
+        trpc.cyboflow.tasks.runDecomposition
+          .query({ runId })
+          .then((ideas) => {
+            if (cancelled || fetchId !== latestFetchId) return null;
+            const active = ideas.filter((i) => i.archived_at === null);
+            if (active.length === 0) return { active, states: [] };
+            return trpc.cyboflow.ideaComponents.getMany
+              .query({ ideaIds: active.map((i) => i.id) })
+              .then((states) => ({ active, states }));
+          })
+          .then(
+            (resolved) => {
+              if (cancelled || fetchId !== latestFetchId || resolved === null) return;
+              const entries: IdeaSummaryEntry[] = resolved.active.map((idea, i) => ({
+                idea,
+                components: resolved.states[i]?.states ?? [],
+              }));
+              setState({ loading: false, error: null, data: { kind: 'idea-summaries', entries } });
+            },
+            (err: unknown) => {
+              if (cancelled || fetchId !== latestFetchId) return;
+              const message = err instanceof Error ? err.message : 'Failed to load artifact content.';
+              if (silent) {
+                console.warn('[useArtifactData] live refresh failed:', err);
+                setState((prev) => (prev.loading ? { loading: false, error: message, data: null } : prev));
+                return;
+              }
+              setState({ loading: false, error: message, data: null });
+            },
+          );
+      };
+
+      resolveSummaries(false);
+
+      // Without a projectId we cannot scope the live channels, so the tab is one-shot.
+      if (projectId === null) {
+        return () => {
+          cancelled = true;
+        };
+      }
+
+      const batchTaskSub = trpc.cyboflow.tasks.onTaskChanged.subscribe(
+        { projectId },
+        {
+          onData: () => {
+            resolveSummaries(true);
+          },
+          onError: (err: unknown) => console.warn('[useArtifactData] onTaskChanged error:', err),
+        },
+      );
+      const batchComponentsSub = trpc.cyboflow.ideaComponents.onComponentsChanged.subscribe(
+        { projectId },
+        {
+          onData: () => {
+            resolveSummaries(true);
+          },
+          onError: (err: unknown) => console.warn('[useArtifactData] onComponentsChanged error:', err),
+        },
+      );
+
+      return () => {
+        cancelled = true;
+        batchTaskSub.unsubscribe();
+        batchComponentsSub.unsubscribe();
+      };
+    }
+
+    // idea-summary (SINGLE idea) — the per-idea HUB. It IS sourceRef-keyed (the idea), like
+    // idea-spec/arch-design, but needs TWO fetches — the idea itself AND the
+    // ledger's merged hybrid view (`cyboflow.ideaComponents.get`, migration
+    // 098) — so it gets its own block rather than reusing the toContent
+    // ternary below. Stays live on BOTH channels: an entity write to this
+    // idea/its descendants (onTaskChanged) refreshes the idea half; a ledger
+    // write to this idea specifically (onComponentsChanged) refreshes the
+    // component half. Either trigger re-fetches BOTH halves together (silent).
+    if (atype === 'idea-summary') {
+      if (!sourceRef) {
+        setState({ loading: false, error: 'No source entity linked to this artifact.', data: null });
+        return;
+      }
+
+      let cancelled = false;
+      // Monotonic fetch id — a slow earlier (re-)fetch must never clobber a newer.
+      let latestFetchId = 0;
+
+      const resolveSummary = (silent: boolean): void => {
+        if (!silent) setState({ loading: true, error: null, data: null });
+        const fetchId = ++latestFetchId;
+        Promise.all([
+          trpc.cyboflow.tasks.get.query({ taskId: sourceRef }),
+          trpc.cyboflow.ideaComponents.get.query({ ideaId: sourceRef }),
+        ]).then(
+          ([idea, components]) => {
+            if (cancelled || fetchId !== latestFetchId) return;
+            if (!idea) {
+              setState({ loading: false, error: 'Source entity not found.', data: null });
+              return;
+            }
+            setState({ loading: false, error: null, data: { kind: 'idea-summary', idea, components } });
+          },
+          (err: unknown) => {
+            if (cancelled || fetchId !== latestFetchId) return;
+            const message = err instanceof Error ? err.message : 'Failed to load artifact content.';
+            if (silent) {
+              console.warn('[useArtifactData] live refresh failed:', err);
+              setState((prev) => (prev.loading ? { loading: false, error: message, data: null } : prev));
+              return;
+            }
+            setState({ loading: false, error: message, data: null });
+          },
+        );
+      };
+
+      resolveSummary(false);
+
+      // Without a projectId we cannot scope the live channels, so the tab is
+      // one-shot.
+      if (projectId === null) {
+        return () => {
+          cancelled = true;
+        };
+      }
+
+      const taskSub = trpc.cyboflow.tasks.onTaskChanged.subscribe(
+        { projectId },
+        {
+          onData: (event) => {
+            if (event.task.id === sourceRef || event.task.originating_idea_id === sourceRef) {
+              resolveSummary(true);
+            }
+          },
+          onError: (err: unknown) => console.warn('[useArtifactData] onTaskChanged error:', err),
+        },
+      );
+      const componentsSub = trpc.cyboflow.ideaComponents.onComponentsChanged.subscribe(
+        { projectId },
+        {
+          onData: (event) => {
+            if (event.ideaId === sourceRef) {
+              resolveSummary(true);
+            }
+          },
+          onError: (err: unknown) => console.warn('[useArtifactData] onComponentsChanged error:', err),
+        },
+      );
+
+      return () => {
+        cancelled = true;
+        taskSub.unsubscribe();
+        componentsSub.unsubscribe();
+      };
+    }
+
     // Templated entity-backed types (idea-spec / arch-design) re-derive from the
     // live entity model via sourceRef (the originating idea id).
     if (!sourceRef) {
@@ -303,8 +503,8 @@ export function useArtifactData(artifact: Artifact, projectId: number | null): A
     // failure, keep the last-good data instead of blanking the tab. The initial
     // load (silent=false) shows the loading state and surfaces errors.
     //
-    // idea-spec / arch-design fetch the bare idea body (decomposed-stories is
-    // handled in its own run-scoped block above).
+    // idea-spec / arch-design fetch the bare idea body (decomposed-stories and
+    // idea-summary are each handled in their own block above).
     const resolve = (silent: boolean): void => {
       if (!silent) setState({ loading: true, error: null, data: null });
       const fetchId = ++latestFetchId;

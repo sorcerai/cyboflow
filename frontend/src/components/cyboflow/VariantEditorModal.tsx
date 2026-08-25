@@ -31,10 +31,11 @@ import { useOmpModelCatalog } from '../../stores/ompModelCatalogStore';
 import { normalizeAgentModelSelection } from '../../../../shared/types/agentModels';
 import type { WorkflowDefinition } from '../../../../shared/types/workflows';
 import type { WorkflowVariantAgentOverrides } from '../../../../shared/types/experiments';
-import type { AgentEntry, AgentModelAlias } from '../../../../shared/types/agents';
+import type { AgentEntry, AgentRunTarget } from '../../../../shared/types/agents';
 import type { AgentProvider, WorkflowAgentRuntime } from '../../../../shared/types/agentRuntime';
 import {
   AGENT_PROVIDER_LABELS,
+  AGENT_RUNTIME_LABELS,
   isRuntimeProviderEnabled,
   WORKFLOW_LAUNCHABLE_RUNTIMES,
 } from '../../../../shared/types/agentRuntime';
@@ -77,12 +78,16 @@ function parseAgentOverrides(json: string | null): WorkflowVariantAgentOverrides
 /** Sentinel for the "Inherit" (null) option of the model / execution-model selects. */
 const INHERIT = '';
 
-/** Runtime-pin labels for the variant picker (kept verbatim from the old inline options). */
+/**
+ * Runtime-pin labels for the variant picker. Projected from the shared
+ * {@link AGENT_RUNTIME_LABELS} — every workflow-launchable runtime is also a
+ * session runtime, so this is a narrowing, not a second wording to keep in sync.
+ */
 const VARIANT_RUNTIME_LABELS: Record<WorkflowAgentRuntime, string> = {
-  'claude-sdk': 'Claude SDK',
-  'claude-interactive': 'Claude interactive (PTY)',
-  'codex-sdk': 'Codex SDK',
-  'omp-sdk': 'OMP',
+  'claude-sdk': AGENT_RUNTIME_LABELS['claude-sdk'],
+  'claude-interactive': AGENT_RUNTIME_LABELS['claude-interactive'],
+  'codex-sdk': AGENT_RUNTIME_LABELS['codex-sdk'],
+  'omp-sdk': AGENT_RUNTIME_LABELS['omp-sdk'],
 };
 
 export function VariantEditorModal({
@@ -122,8 +127,17 @@ export function VariantEditorModal({
     () => agentEntries.filter((e) => e.isCustom).map((e) => e.agentKey),
     [agentEntries],
   );
-  const agentModelPins = useMemo<Record<string, AgentModelAlias | null>>(
-    () => Object.fromEntries(agentEntries.map((e) => [e.agentKey, e.model])),
+  // The canvas step cards fold runtime + model + providerModel into ONE run-target
+  // label, so they need all three — a model-alias-only map rendered a non-Claude
+  // pinned agent as "run model".
+  const agentRunTargets = useMemo<Record<string, AgentRunTarget>>(
+    () =>
+      Object.fromEntries(
+        agentEntries.map((e) => [
+          e.agentKey,
+          { runtime: e.runtime, model: e.model, providerModel: e.providerModel },
+        ]),
+      ),
     [agentEntries],
   );
 
@@ -337,7 +351,10 @@ export function VariantEditorModal({
               className="rounded-badge border border-border-primary bg-bg-primary px-1.5 py-px text-[9px] font-semibold uppercase tracking-[0.08em] text-text-tertiary"
               data-testid="variant-editor-draft-chip"
             >
-              Draft
+              {/* status='draft' means "never added to rotation", NOT "unsaved" —
+                  saving here never changes the status. Worded to match
+                  VariantManagerSection's STATUS_LABEL. */}
+              Not in rotation
             </span>
           )}
           <div className="flex-1" />
@@ -431,7 +448,7 @@ export function VariantEditorModal({
             selectedStepId={state.selectedStepId}
             selectedFanOutInner={state.selectedFanOutInner}
             dispatch={dispatch}
-            agentModelPins={agentModelPins}
+            agentRunTargets={agentRunTargets}
           />
           <WorkflowStepInspector
             definition={state.definition}

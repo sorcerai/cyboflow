@@ -45,6 +45,33 @@ export function isExternallyOpenable(targetUrl: string): boolean {
   return /^https?:\/\//i.test(targetUrl);
 }
 
+/**
+ * Scheme allowlist for `shell.openExternal` on RENDERER-SUPPLIED urls — the
+ * `openExternal` IPC channel and the main window's `setWindowOpenHandler`.
+ *
+ * `shell.openExternal` hands the string to the OS launcher, so it is not a
+ * "browser" call: `file:` opens local documents in their registered app,
+ * platform schemes (`x-apple.systempreferences:`, `ms-settings:`) drive system
+ * UI, and an arbitrary custom scheme reaches whatever app claimed it. Both
+ * call sites take their url straight from the renderer, so anything a renderer
+ * XSS can put in a link would otherwise become an OS-level launch.
+ *
+ * Deliberately WIDER than {@link isExternallyOpenable} by exactly `mailto:`:
+ * that one governs a HOSTILE artifact/prototype frame, where a mail composer is
+ * not something a mockup should be able to pop; this one governs the app's own
+ * chrome, where "email support" is a real link. Keep them separate — widening
+ * `isExternallyOpenable` would widen the hostile-frame rule too.
+ */
+export function isSafeExternalOpenTarget(targetUrl: string): boolean {
+  let protocol: string;
+  try {
+    protocol = new URL(targetUrl).protocol;
+  } catch {
+    return false;
+  }
+  return protocol === 'https:' || protocol === 'http:' || protocol === 'mailto:';
+}
+
 // ===========================================================================
 // Scripted-frame navigation guard (Design Mode v1 — design-mode.md "Frame
 // navigation — no external open for scripted frames").

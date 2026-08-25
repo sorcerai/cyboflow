@@ -461,7 +461,7 @@ export function WorkflowPicker({ projectId, onWorkflowStarted, forceNewSession =
       try {
         const workflowRuntime = workflowRuntimeForLaunch(agentRuntime);
         if (workflowRuntime === null) {
-          throw new Error('Codex PTY is only available for quick sessions.');
+          throw new Error('Codex (CLI) is only available for quick sessions.');
         }
         const launchSubstrate = substrateForRuntime(workflowRuntime);
         // Ensure the run executes INSIDE a session (active one if selected, else
@@ -531,7 +531,7 @@ export function WorkflowPicker({ projectId, onWorkflowStarted, forceNewSession =
       try {
         const workflowRuntime = workflowRuntimeForLaunch(agentRuntime);
         if (workflowRuntime === null) {
-          throw new Error('Codex PTY is only available for quick sessions.');
+          throw new Error('Codex (CLI) is only available for quick sessions.');
         }
         const launchSubstrate = substrateForRuntime(workflowRuntime);
         const sessionId = await ensureSessionForLaunch(projectId, {

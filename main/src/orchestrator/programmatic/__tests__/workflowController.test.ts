@@ -2279,6 +2279,298 @@ describe('WorkflowController', () => {
         expect(logs.some((l) => l.level === 'error')).toBe(false);
       });
     });
+
+    // ── Operator LANE REWIND (RunDirectives.laneRewinds) ──────────────────────
+    //    The monitor's `rewind_lane_to_step` pulls ONE lane back to an earlier
+    //    inner step while the fan-out stays live. Consulted at three points in the
+    //    lane loop (idle / mid-agent-turn / parked at the visual merge gate).
+    describe('operator lane rewind', () => {
+      const chain = (): WorkflowStep =>
+        step({
+          id: 'execute',
+          agent: 'orchestrate',
+          fanOut: {
+            over: 'tasks',
+            inner: [
+              { id: 'implement', agent: 'implement' },
+              { id: 'code-review', agent: 'code-review', loopback: 'implement' },
+              { id: 'task-verify', agent: 'task-verify', loopback: 'implement' },
+            ],
+          },
+        });
+
+      it('mid-agent-turn: a killed step whose lane has a pending rewind re-drives instead of failing the lane', async () => {
+        // The production handler kills the lane's spawn to force a stuck step to
+        // return; the spawn rejection reaches the controller as a plain `failed`
+        // result (the RUN signal never fired). The pending request is what keeps
+        // that operator-induced failure from consuming a loopback attempt.
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const calls: string[] = [];
+        let killed = false;
+        const runner: StepRunner = {
+          async runStep(s) {
+            calls.push(s.id);
+            if (s.id === 'task-verify' && !killed) {
+              killed = true;
+              directives.laneRewinds.set('t1', 'implement');
+              return { status: 'failed', error: 'process killed' };
+            }
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        // The lane re-ran the whole chain from 'implement' rather than failing.
+        expect(calls).toEqual([
+          'implement', 'code-review', 'task-verify', // killed here
+          'implement', 'code-review', 'task-verify',
+        ]);
+        const laneWrites = driver.lanes.filter((l) => l.itemId === 't1');
+        expect(laneWrites[laneWrites.length - 1].status).toBe('integrated');
+        expect(laneWrites.some((l) => l.status === 'failed')).toBe(false);
+        // No attempt bump: an operator rewind must not burn the lane's automatic
+        // loopback budget (unlike a code-review / task-verify loopback, which does).
+        expect(laneWrites.every((l) => l.attempt === undefined)).toBe(true);
+        // The request was consumed exactly once.
+        expect(directives.laneRewinds.size).toBe(0);
+      });
+
+      it('re-drives a lane whose step SUCCEEDED when a rewind landed during that turn', async () => {
+        // A lane that is not stuck but whose output the operator rejects: the
+        // request lands mid-turn and the (clean) result is discarded.
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const calls: string[] = [];
+        let rewound = false;
+        const runner: StepRunner = {
+          async runStep(s) {
+            calls.push(s.id);
+            if (s.id === 'code-review' && !rewound) {
+              rewound = true;
+              directives.laneRewinds.set('t1', 'implement');
+            }
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        expect(calls).toEqual(['implement', 'code-review', 'implement', 'code-review', 'task-verify']);
+      });
+
+      it('idle consult: a rewind requested before the lane starts is consumed at its first inner step', async () => {
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        directives.laneRewinds.set('t1', 'implement'); // target === the lane's entry step
+        const runner = makeRunner();
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        // Consumed at the loop head, so the chain runs exactly once (no re-entry loop).
+        expect(runner.calls.map((c) => c.id)).toEqual(['implement', 'code-review', 'task-verify']);
+        expect(directives.laneRewinds.size).toBe(0);
+      });
+
+      it('ignores (and consumes) a target that is not one of the fan-out inner steps', async () => {
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const calls: string[] = [];
+        const runner: StepRunner = {
+          async runStep(s) {
+            calls.push(s.id);
+            if (s.id === 'implement' && calls.length === 1) directives.laneRewinds.set('t1', 'not-a-step');
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        expect(calls).toEqual(['implement', 'code-review', 'task-verify']);
+        // Consumed on the rejection path too — a request the lane cannot honor must
+        // not linger and re-refuse at every later consult point.
+        expect(directives.laneRewinds.size).toBe(0);
+      });
+
+      it('refuses (and consumes) a FORWARD target — rewind only goes backward', async () => {
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const calls: string[] = [];
+        const runner: StepRunner = {
+          async runStep(s) {
+            calls.push(s.id);
+            // From 'implement' (index 0), ask to jump to 'task-verify' (index 2).
+            if (s.id === 'implement' && calls.length === 1) directives.laneRewinds.set('t1', 'task-verify');
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        expect(calls).toEqual(['implement', 'code-review', 'task-verify']); // no jump
+        expect(directives.laneRewinds.size).toBe(0);
+      });
+
+      it('rewinds ONLY the targeted lane — a sibling lane is untouched', async () => {
+        const d = def([phase('p1', [chain()])]);
+        const driver = makeFanOutDriver(['t1', 't2']);
+        const directives = createRunDirectives();
+        const calls: Array<{ item: string; id: string }> = [];
+        let rewound = false;
+        const runner: StepRunner = {
+          async runStep(s, ctx) {
+            const item = ctx.item?.id ?? '?';
+            calls.push({ item, id: s.id });
+            if (item === 't1' && s.id === 'code-review' && !rewound) {
+              rewound = true;
+              directives.laneRewinds.set('t1', 'implement');
+            }
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, makeFanHost(driver)).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('completed');
+        expect(calls.filter((c) => c.item === 't1').map((c) => c.id)).toEqual([
+          'implement', 'code-review', 'implement', 'code-review', 'task-verify',
+        ]);
+        // t2 walked its chain exactly once.
+        expect(calls.filter((c) => c.item === 't2').map((c) => c.id)).toEqual([
+          'implement', 'code-review', 'task-verify',
+        ]);
+      });
+
+      // ── parked at the visual merge gate ──────────────────────────────────────
+      const verifyChainWithGate = (): WorkflowStep =>
+        step({
+          id: 'execute',
+          agent: 'orchestrate',
+          fanOut: {
+            over: 'tasks',
+            inner: [
+              { id: 'implement', agent: 'implement' },
+              { id: 'task-verify', agent: 'task-verify', loopback: 'implement' },
+              { id: 'visual-verify', agent: 'visual-verify' },
+            ],
+          },
+        });
+
+      /** A task-verify result carrying a valid `## Visual verification task` fence. */
+      const taskVerifyFence = (): string =>
+        `VERDICT: PASS\n\n## Visual verification task\n\n\`\`\`json\n${JSON.stringify({
+          version: 1,
+          summary: 'Check the UI',
+          behaviors: [{ id: 'b1', description: 'renders', expected: 'form visible' }],
+        })}\n\`\`\`\n`;
+
+      it('parked at the merge gate: the unpark hook wakes the lane and it re-drives (not canceled)', async () => {
+        const d = def([phase('p1', [verifyChainWithGate()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const host = makeFanHost(driver);
+        let parks = 0;
+        let hookSeen = false;
+        host.visualGate = {
+          isActive: () => true,
+          awaitVerdict({ itemId, signal }) {
+            parks += 1;
+            if (parks === 1) {
+              // The operator's rewind lands while the lane is parked: record it,
+              // then fire the lane's unpark hook exactly as requestLaneRewind does.
+              directives.laneRewinds.set(itemId, 'implement');
+              const interrupt = directives.laneInterrupts.get(itemId);
+              hookSeen = interrupt !== undefined;
+              interrupt?.();
+            }
+            if (parks === 1) {
+              return Promise.resolve<VisualGateOutcome>(
+                signal?.aborted === true ? { kind: 'aborted' } : { kind: 'advance' },
+              );
+            }
+            return Promise.resolve<VisualGateOutcome>({ kind: 'advance' });
+          },
+        };
+        host.enqueueVisualVerification = async () => ({ outcome: 'enqueued', requestId: 'vr-1' });
+        const calls: string[] = [];
+        const runner: StepRunner = {
+          async runStep(s) {
+            calls.push(s.id);
+            if (s.id === 'task-verify') return { status: 'ok', resultText: taskVerifyFence() };
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, host).run(
+          'r', d, undefined, undefined, undefined, directives,
+        );
+
+        // The gate really did see a registered unpark hook, and the abort it fired
+        // was read as a rewind — NOT as a run cancellation.
+        expect(hookSeen).toBe(true);
+        expect(result.outcome).toBe('completed');
+        expect(calls).toEqual(['implement', 'task-verify', 'implement', 'task-verify']);
+        expect(parks).toBe(2);
+        const laneWrites = driver.lanes.filter((l) => l.itemId === 't1');
+        expect(laneWrites[laneWrites.length - 1].status).toBe('integrated');
+        // The hook is unregistered once the park ends.
+        expect(directives.laneInterrupts.size).toBe(0);
+      });
+
+      it('a RUN cancellation while parked still ends the walk canceled (the park chains the run signal)', async () => {
+        const d = def([phase('p1', [verifyChainWithGate()])]);
+        const driver = makeFanOutDriver(['t1']);
+        const directives = createRunDirectives();
+        const host = makeFanHost(driver);
+        const ac = new AbortController();
+        host.visualGate = {
+          isActive: () => true,
+          awaitVerdict({ signal }) {
+            ac.abort(); // the run is canceled while this lane is parked
+            return Promise.resolve<VisualGateOutcome>(
+              signal?.aborted === true ? { kind: 'aborted' } : { kind: 'advance' },
+            );
+          },
+        };
+        host.enqueueVisualVerification = async () => ({ outcome: 'enqueued', requestId: 'vr-1' });
+        const runner: StepRunner = {
+          async runStep(s) {
+            if (s.id === 'task-verify') return { status: 'ok', resultText: taskVerifyFence() };
+            return { status: 'ok' };
+          },
+        };
+
+        const result = await new WorkflowController(runner, host).run(
+          'r', d, ac.signal, undefined, undefined, directives,
+        );
+
+        expect(result.outcome).toBe('canceled');
+        expect(directives.laneInterrupts.size).toBe(0);
+      });
+    });
   });
 });
 

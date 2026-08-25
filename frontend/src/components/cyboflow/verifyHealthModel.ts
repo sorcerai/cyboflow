@@ -137,13 +137,28 @@ export function probeStatusClass(row: VerifyProbeRow): string {
  * degrade gate silently skips every check, so it is the state most worth
  * naming. It reads as an action remaining rather than a fault, because it is.
  */
-export function projectSetupLine(status: VerifyProjectSetupStatus): {
+export function projectSetupLine(
+  status: VerifyProjectSetupStatus,
+  /**
+   * Migration-105 provenance: at least one proven runbook here was derived by a
+   * lane mid-sprint rather than reviewed at a human gate. Qualifies `'Set up'`
+   * and nothing else — an unproven project's real problem is that verification
+   * is not running, not who wrote the draft.
+   */
+  laneDerived = false,
+): {
   text: string;
   className: string;
 } {
   switch (status) {
     case 'proven':
-      return { text: 'Set up', className: PROBE_STATUS_CLASS.healthy };
+      // Still `healthy`: the proof means exactly the same thing whoever derived
+      // it. What differs is how much review it got, which is a caveat on a
+      // working state rather than a degraded one — colouring it as a warning
+      // would tell people something is wrong when nothing is.
+      return laneDerived
+        ? { text: 'Set up (derived by a run)', className: PROBE_STATUS_CLASS.healthy }
+        : { text: 'Set up', className: PROBE_STATUS_CLASS.healthy };
     case 'unproven':
       return { text: 'Not proven', className: PROBE_STATUS_CLASS['pending action'] };
     case 'none':
@@ -165,6 +180,21 @@ export function setupStatusFor(
   projectId: number,
 ): VerifyProjectSetupStatus {
   return rows?.find((r) => r.projectId === projectId)?.status ?? 'none';
+}
+
+/**
+ * Whether this project's verification was configured, in part, by a run rather
+ * than by a human (migration 105 `origin`).
+ *
+ * Defaults to `false` for a project the query never mentioned and for a pre-105
+ * record — both are honestly unknown, and "a machine wrote this" is a claim that
+ * must not be made on absent data.
+ */
+export function setupIsLaneDerived(
+  rows: readonly VerifyProjectSetupRow[] | null,
+  projectId: number,
+): boolean {
+  return rows?.find((r) => r.projectId === projectId)?.hasLaneDerivedRunbook === true;
 }
 
 /**

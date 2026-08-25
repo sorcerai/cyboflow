@@ -1,6 +1,7 @@
 /**
  * ompApprovalBridge — answers every `extension_ui_request` an `omp --mode rpc-ui`
- * session raises, deterministically and without ever waiting.
+ * session raises. Tool-approval prompts are answered immediately; blocking
+ * content dialogs are delegated to OmpQuestionBridge for the human round-trip.
  *
  * ===========================================================================
  * WHY EVERY KIND IS ANSWERED, NOT JUST THE APPROVAL PROMPT
@@ -10,9 +11,9 @@
  * (`requestRpcDialog`, rpc-mode.ts:606-655; `requestRpcEditor`, :540-604). An
  * unanswered one never resolves, the turn never reaches `agent_end`, and
  * `runTurn` hangs until the manager's turn timeout fires — the failure mode
- * proposal §5.3 calls out (adversarial-review finding #7). So this bridge
- * answers all four, plus anything it does not recognize, and never blocks on
- * anything to do it.
+ * proposal §5.3 calls out (adversarial-review finding #7). This bridge answers
+ * approval selects itself and hands content dialogs to the durable question
+ * surface; unknown blocking methods are still cancelled fail-safe.
  *
  * The remaining methods are fire-and-forget by construction — `notify`
  * (rpc-mode.ts:798-806), `setStatus` (:809-817), `setWidget` (:824-833),
@@ -58,7 +59,9 @@ export type OmpUiRequestDisposition =
   | 'approved'
   /** Approval prompt answered `Deny` (gate unverified). */
   | 'denied'
-  /** A blocking dialog cancelled/declined because v1 has no question bridge. */
+  /** A blocking content dialog was handed to the async question bridge. */
+  | 'question'
+  /** A malformed blocking dialog was cancelled/declined. */
   | 'declined'
   /** A fire-and-forget method: logged, no response written. */
   | 'acknowledged'
@@ -76,27 +79,24 @@ export interface OmpApprovalBridgeOptions {
   isGateVerified(): boolean;
   /** Surfaces a user-visible panel error (the manager's `error` event). */
   onSurfacedError(message: string): void;
+  /** Routes a blocking content dialog through QuestionRouter. */
+  onQuestionRequest(event: OmpExtensionUiRequestEvent): void;
   logger?: Logger;
 }
 
 export class OmpApprovalBridge {
   constructor(private readonly options: OmpApprovalBridgeOptions) {}
 
-  /** Answer (or acknowledge) one `extension_ui_request`. Never throws, never waits. */
+  /** Dispatch one `extension_ui_request`. Never throws; content questions finish asynchronously. */
   handleUiRequest(event: OmpExtensionUiRequestEvent): OmpUiRequestDisposition {
     switch (event.method) {
       case 'select':
         return this.handleSelect(event);
       case 'confirm':
-        // `{confirmed:false}` is the explicit decline OMP parses at
-        // rpc-mode.ts:760-775; `{cancelled:true}` would also resolve false, but
-        // the explicit form records that a host decided rather than timed out.
-        return this.decline(event, { type: 'extension_ui_response', id: event.id, confirmed: false });
       case 'input':
       case 'editor':
-        // Both resolve to `undefined` on a cancel — `parseValueDialogResponse`
-        // (rpc-mode.ts:521-531) and `requestRpcEditor`'s own resolver (:585-593).
-        return this.decline(event, { type: 'extension_ui_response', id: event.id, cancelled: true });
+        this.options.onQuestionRequest(event);
+        return 'question';
       case 'notify':
       case 'setStatus':
       case 'setWidget':
@@ -125,9 +125,8 @@ export class OmpApprovalBridge {
   private handleSelect(event: OmpExtensionUiRequestEvent): OmpUiRequestDisposition {
     const title = event.title ?? '';
     if (!title.startsWith(OMP_APPROVAL_PROMPT_PREFIX)) {
-      // An extension's own picker. v1 has no question bridge, so it is cancelled
-      // (rpc-mode.ts:521-531 turns that into `undefined` for the caller).
-      return this.decline(event, { type: 'extension_ui_response', id: event.id, cancelled: true });
+      this.options.onQuestionRequest(event);
+      return 'question';
     }
 
     const options = event.options ?? [];
@@ -163,19 +162,6 @@ export class OmpApprovalBridge {
       { type: 'extension_ui_response', id: event.id, value: OMP_APPROVE_OPTION },
       'approved',
     );
-  }
-
-  private decline(
-    event: OmpExtensionUiRequestEvent,
-    response: OmpExtensionUiResponse,
-  ): OmpUiRequestDisposition {
-    const message =
-      `cyboflow declined an OMP "${event.method}" dialog${event.title ? ` (${firstLine(event.title)})` : ''}: ` +
-      'this build has no question bridge for OMP, so interactive prompts other than tool approval ' +
-      'are answered as cancelled. Ask the agent to proceed without the prompt.';
-    this.options.onSurfacedError(message);
-    this.options.logger?.warn(`[OmpApprovalBridge] ${message}`);
-    return this.write(response, 'declined');
   }
 
   private write(

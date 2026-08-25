@@ -292,6 +292,24 @@ export interface EnqueueTaskVerificationOptions {
    */
   setupProof?: boolean;
   /**
+   * Migration 107 — mark this as the LANE-DRIVEN bootstrap proof
+   * (docs/proposals/lane-runbook-bootstrap.md §5): exempt from the §3.2 degrade
+   * gate (it exists to prove the runbook whose absence the gate is complaining
+   * about) but COUNTED against the project budget and drained at ordinary
+   * priority, unlike `setupProof`. Never settable over the MCP wire — this
+   * in-process option is its only writer.
+   *
+   * Must be paired with {@link bootstrapRound}, which makes the enqueue key
+   * unique; see the key derivation below for why that is load-bearing rather
+   * than cosmetic.
+   */
+  bootstrapProof?: boolean;
+  /**
+   * 1-based bootstrap draft round, part of the enqueue key. Ignored unless
+   * {@link bootstrapProof} is set.
+   */
+  bootstrapRound?: number;
+  /**
    * §5.2 seam 3 — a caller-supplied PIN, stamped verbatim onto the request row.
    * The phase-2 setup flow's proof run is the caller: it is trying to PROVE a
    * specific derived revision, so it pins that revision's own hash + CAS version
@@ -366,8 +384,84 @@ export async function enqueueTaskVerification(
   // in FALLBACK_CHAINS order. An empty intersection still enqueues (scheduler SKIP).
   const chain = FALLBACK_CHAINS[type].filter((backend) => stampedChain.includes(backend));
 
-  // (2) Snapshot sha (§5.5) — captured at enqueue time. A capture failure falls back
-  // to null and STILL enqueues (the provisioner's dirty-worktree fallback bucket).
+  // (3) FORCE lane identity: laneTaskRef is authoritative for gate attribution, so
+  // it overrides task.taskRef AND drives the derived legacy input — both persisted
+  // columns then carry the SAME ref regardless of what the composing agent wrote.
+  const composedTask: VerificationTaskV1 = { ...opts.task, taskRef: laneTaskRef };
+
+  // (3a) The RUNBOOK BOOTSTRAP (lane-runbook-bootstrap.md §12 steps 1–8).
+  //
+  // Runs HERE — before the shared preparation, before any row — because that is
+  // the last moment a decision still exists. Once the request is written and the
+  // §3.2 gate skips it, the only thing left to write is a `skipped` terminal, and
+  // that terminal BURNS the enqueue key: findLiveRequestByEnqueueKey counts it as
+  // a live dedup hit, so a bootstrap running afterwards could not re-fire this
+  // lane's own request at all.
+  //
+  // The bootstrap either PROVES a runbook (after which the shared preparation
+  // below resolves it, merges it, and pins it — so the lane verifies exactly as
+  // it would on a project a human had configured) or it does not, in which case
+  // this function carries on unchanged and the gate skips the request with a
+  // reason naming the situation. It has no channel to fail a lane, by design.
+  //
+  // THE PROOF ITSELF MUST NOT RE-ENTER HERE. The bootstrap fires its own
+  // attestation-only request through this same seam with `bootstrapProof: true`;
+  // consulting the bootstrap for that request would recurse into a second
+  // bootstrap while the first is mid-flight, and the stamp would report the
+  // recursion as its own owner re-entering. A proof request is by definition the
+  // thing a bootstrap already decided to do.
+  //
+  // Wrapped like every other collaborator call in this function: the seam's
+  // contract is NEVER THROWS, and an unavailable scheduler here must degrade to
+  // today's enqueue rather than crash a lane.
+  if (opts.bootstrapProof !== true && opts.setupProof !== true) {
+    try {
+      const outcome = await VerificationScheduler.getInstance().maybeBootstrapRunbook({
+        projectId,
+        runId,
+        laneTaskRef,
+        modality: resolveTaskModality(type, composedTask),
+        task: composedTask,
+        probePath: worktreePath,
+      });
+      if (outcome.kind !== 'not-attempted') {
+        logger?.info('[enqueueTaskVerification] runbook bootstrap finished', {
+          runId,
+          laneTaskRef,
+          outcome: outcome.kind,
+          ...(outcome.kind === 'proven'
+            ? { runbookHash: outcome.runbookHash, runbookLocalVersion: outcome.runbookVersion }
+            : { detail: outcome.kind === 'declined' ? outcome.detail : outcome.detail }),
+        });
+      }
+    } catch (err) {
+      logger?.debug('[enqueueTaskVerification] runbook bootstrap unavailable', {
+        runId,
+        laneTaskRef,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // (3a1) Snapshot sha (§5.5) — captured AFTER the bootstrap, deliberately.
+  //
+  // The bootstrap writes up to TWO commits onto this branch: the rung-1 config
+  // edit (§8.1 gives it its own commit) and the runbook itself. Capturing the
+  // sha before them pinned the verification to a tree in which the runbook's own
+  // ENABLING EDIT does not exist — so the request would execute a runbook
+  // describing a project that only starts at the commit after the snapshot.
+  //
+  // Live-observed 2026-08-20: a lane whose bootstrap derived `port-from-env` on
+  // `app.config.mjs` then verified against the pre-edit sha, where the port was
+  // still a literal. The harness exported the declared `portEnv`, the config read
+  // it nowhere, the server bound its hardcoded default, and the serve-identity
+  // probe found no listener on the leased port — a `failed`/`ambiguous` terminal
+  // for a deliverable that was fine. Every first lane verification on a project
+  // needing a rung-1 edit would have failed this way.
+  //
+  // Nothing between here and the old position consumed the sha, and the bootstrap
+  // does not read it, so this is a pure reordering. A capture failure still falls
+  // back to null and STILL enqueues (the provisioner's dirty-worktree bucket).
   let snapshotSha: string | null = null;
   try {
     snapshotSha = await captureSnapshotSha(worktreePath);
@@ -379,11 +473,6 @@ export async function enqueueTaskVerification(
     });
     snapshotSha = null;
   }
-
-  // (3) FORCE lane identity: laneTaskRef is authoritative for gate attribution, so
-  // it overrides task.taskRef AND drives the derived legacy input — both persisted
-  // columns then carry the SAME ref regardless of what the composing agent wrote.
-  const composedTask: VerificationTaskV1 = { ...opts.task, taskRef: laneTaskRef };
 
   // (3b) The SHARED enqueue-time rules (§7.2 guard + §5.2 seam-3 injection). Runs
   // BEFORE deriving the legacy input so `deliverable_json` is derived from the
@@ -424,7 +513,24 @@ export async function enqueueTaskVerification(
   }
   const task: VerificationTaskV1 = prepared.task ?? composedTask;
   const input = deriveLegacyInputFromTask(task, laneTaskRef);
-  const enqueueKey = `${runId}:${laneTaskRef}:${attempt}`;
+  // THE KEY MUST CARRY A GENERATION FOR A BOOTSTRAP PROOF (mig 105).
+  //
+  // `findLiveRequestByEnqueueKey` treats ANY non-canceled row sharing the key as
+  // a live dedup hit — terminals included, and explicitly including 'skipped'.
+  // A lane that just got skipped for want of a runbook therefore already OWNS
+  // `${runId}:${laneTaskRef}:${attempt}`, so firing the proof under that same key
+  // would hand back the skipped row's id and deploy NOTHING, while every caller
+  // read it as an enqueued request. Silent, total, and indistinguishable from
+  // success from the outside.
+  //
+  // The `:bootstrap:<round>` segment is what makes each proof its own request,
+  // and re-firing round N after a crash still dedups correctly — which is the
+  // property that lets the bootstrap's recovery be "resume at the first
+  // incomplete step" rather than a bespoke state machine.
+  const enqueueKey =
+    opts.bootstrapProof === true
+      ? `${runId}:${laneTaskRef}:${attempt}:bootstrap:${opts.bootstrapRound ?? 1}`
+      : `${runId}:${laneTaskRef}:${attempt}`;
 
   // (4) Enqueue on the singleton. Guard getInstance (+ the enqueue itself) so an
   // uninitialized scheduler or a transient enqueue error is a fail-open SKIP, never
@@ -444,6 +550,7 @@ export async function enqueueTaskVerification(
       snapshotSha,
       enqueueKey,
       ...(opts.setupProof === true ? { setupProof: true } : {}),
+      ...(opts.bootstrapProof === true ? { bootstrapProof: true } : {}),
       ...(prepared.pin
         ? { runbookHash: prepared.pin.hash, runbookLocalVersion: prepared.pin.localVersion }
         : {}),
@@ -456,6 +563,7 @@ export async function enqueueTaskVerification(
       enqueueKey,
       hasSnapshot: snapshotSha !== null,
       runbookHash: prepared.pin?.hash ?? null,
+      bootstrapProof: opts.bootstrapProof === true,
     });
     return { outcome: 'enqueued', requestId };
   } catch (err) {

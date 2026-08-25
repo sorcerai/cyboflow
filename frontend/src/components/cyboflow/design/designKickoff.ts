@@ -1,18 +1,16 @@
 /**
- * DESIGN_KICKOFF_PROMPT — the canonical first-turn message for a design
- * session (design-mode.md "v0.5 — fullscreen design surface", "Auto-start +
- * clarify-first").
+ * Re-export of the canonical design-session kickoff prompt.
  *
- * Sent automatically as the first user turn of a design session (auto-start,
- * spec v0.5); it appears as a visible user bubble by design (transparency
- * over magic) — see useQuickSession's `kickoffPrompt` param, which dispatches
- * it through the same panel-input path the composer uses right after the
- * session's Claude panel is created (createQuick's `prompt` field is ignored
- * for the SDK path, so a synthetic first turn is not an option — this is a
- * real, restart-safe user turn).
+ * The constant itself lives in `shared/types/designKickoff.ts` because the
+ * MAIN process sends it too (the planner's approve-idea design fork launches
+ * a design session via `orchestrator/designSessionLaunch`), and main cannot
+ * import from `frontend/src`. Keeping one definition means the two launch
+ * doors cannot silently drift into briefing the design agent differently.
+ *
+ * This file remains as the renderer-side import path every existing call site
+ * already uses.
  */
-export const DESIGN_KICKOFF_PROMPT =
-  'Begin the design session. Read the linked idea first. If it leaves meaningful design decisions open, ask me clarifying questions (one round) before designing; otherwise do your grounding pass and produce the first prototype and design-spec draft.';
+export { DESIGN_KICKOFF_PROMPT } from '../../../../../shared/types/designKickoff';
 
 /**
  * DESIGN_PROMOTE_PROMPT — the tier-promotion message for "Make it interactive"

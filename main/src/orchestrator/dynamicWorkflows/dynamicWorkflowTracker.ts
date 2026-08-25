@@ -63,6 +63,24 @@ const TERMINAL_NOTIFICATION_STATUSES = new Set(['completed', 'failed', 'killed']
 export interface DynamicWorkflowRunContext {
   runId: string;
   sessionId: string;
+  /**
+   * The spawn's AUTHORITATIVE worktree path, used to derive the claude project
+   * key dir the {@link WorkflowScriptWatcher} polls.
+   *
+   * Load-bearing for FLOW runs. A workflow run has NO `sessions` row — the
+   * orchestrator invariant is `panelId === runId === sessionId`, and
+   * `getDbSession(sessionId)` returns undefined for it (see the gate-vehicle
+   * discriminator in interactiveClaudeManager.spawnCliProcess). So the
+   * `sessions`-keyed {@link lookupWorktreePath} fallback resolves null for every
+   * flow run, no watcher starts, and — since stream detection does not work on
+   * the interactive layout either (see startScriptWatcher) — a dynamic workflow
+   * launched inside a PTY FLOW run was invisible to the tracker entirely.
+   *
+   * Both managers have the path in `options.worktreePath` at attach time, so
+   * they pass it here. Optional (not required) so the existing quick-session
+   * callers and the tracker's own tests keep working off the `sessions` lookup.
+   */
+  worktreePath?: string;
 }
 
 interface SubagentUsageSink {
@@ -210,13 +228,21 @@ export class DynamicWorkflowTracker {
   }
 
   /**
-   * Start the per-run {@link WorkflowScriptWatcher} over the session's claude
+   * Start the per-run {@link WorkflowScriptWatcher} over the run's claude
    * project key dir (`~/.claude/projects/<encodeCwd(worktree)>`). Skipped (no-op)
-   * when the session's worktree path cannot be resolved. Replaces any prior
-   * watcher for the same runId.
+   * when no worktree path resolves. Replaces any prior watcher for the same runId.
+   *
+   * Path resolution prefers the caller-supplied `ctx.worktreePath` (the spawn's
+   * own authoritative value) and falls back to the `sessions` lookup. The
+   * fallback is quick-session-only in practice: a FLOW run has no `sessions`
+   * row, so without the supplied path this returned null and the run got no
+   * watcher — see {@link DynamicWorkflowRunContext.worktreePath}.
    */
   private startScriptWatcher(ctx: DynamicWorkflowRunContext): void {
-    const worktreePath = this.lookupWorktreePath(ctx.sessionId);
+    const worktreePath =
+      ctx.worktreePath !== undefined && ctx.worktreePath.trim().length > 0
+        ? ctx.worktreePath
+        : this.lookupWorktreePath(ctx.sessionId);
     if (worktreePath === null) return;
 
     this.scriptWatchers.get(ctx.runId)?.stop();
@@ -447,6 +473,27 @@ export class DynamicWorkflowTracker {
     const all = [...this.states.values()];
     const filtered = sessionId === undefined ? all : all.filter((s) => s.sessionId === sessionId);
     return filtered.map((s) => this.snapshot(s));
+  }
+
+  /**
+   * True when ANY tracked workflow for `runId` is still running.
+   *
+   * The lifecycle predicate: a turn-end that lands while this holds is the agent
+   * yielding to a BACKGROUND workflow, not the run finishing, so the caller must
+   * not rest/complete on it. Deliberately scoped to a run rather than a single
+   * wfRunId — a run may launch several workflows over its life, and resting is
+   * only safe once EVERY one of them is terminal.
+   *
+   * NOTE the attribution caveat: a launch is stamped with whichever attached
+   * context's watcher observed the script first, and a session's chat panel and
+   * its flow run poll the SAME project key dir. Callers must treat a `false` as
+   * "no evidence of a running workflow", not proof of absence.
+   */
+  hasRunningForRun(runId: string): boolean {
+    for (const state of this.states.values()) {
+      if (state.runId === runId && state.status === 'running') return true;
+    }
+    return false;
   }
 
   // --------------------------------------------------------------------------

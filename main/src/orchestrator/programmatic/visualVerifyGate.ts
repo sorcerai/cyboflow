@@ -231,14 +231,7 @@ export class SchedulerVisualVerifyGate implements VisualVerifyGate {
    */
   private requestStatusForLane(runId: string, itemId: string): RequestStatus | null {
     try {
-      const rows = this.db
-        .prepare(
-          `SELECT status, deliverable_json AS deliverableJson
-             FROM verification_requests
-            WHERE run_id = ?
-            ORDER BY enqueued_at DESC, id DESC`,
-        )
-        .all(runId) as Array<{ status: string; deliverableJson: string }>;
+      const rows = this.laneAttributableRequests(runId);
       if (rows.length === 0) return null;
 
       const lane = this.resolveLane(runId, itemId);
@@ -264,6 +257,63 @@ export class SchedulerVisualVerifyGate implements VisualVerifyGate {
   }
 
   /**
+   * The run's requests that are ELIGIBLE for lane attribution, newest first.
+   *
+   * Migration 107's `bootstrap_proof` rows are excluded, and the exclusion has to
+   * happen HERE rather than at the call sites: a bootstrap proof is fired by the
+   * controller while a lane is parked, shares the lane's `run_id`, and is often
+   * the run's ONLY request — so it would satisfy both the taskRef match (the
+   * controller stamps the lane ref for its own bookkeeping) and the single-lane
+   * sole-request fallback below. A parked lane would then resolve its gate on a
+   * verdict about the RUNBOOK rather than about its own diff.
+   *
+   * PRE-105 LADDER, and it matters more than it looks. Adding the predicate
+   * unconditionally would make `prepare` throw on a pre-105 DB, and this method's
+   * catch degrades to `[]` — which reads as "no request attributable to this
+   * lane" and ADVANCES every parked lane unverified. Narrowing a query must never
+   * be able to widen behavior, so the fallback runs the original query verbatim;
+   * such a DB cannot hold a bootstrap row anyway.
+   */
+  private laneAttributableRequests(
+    runId: string,
+  ): Array<{ status: string; deliverableJson: string }> {
+    try {
+      return this.db
+        .prepare(
+          `SELECT status, deliverable_json AS deliverableJson
+             FROM verification_requests
+            WHERE run_id = ? AND COALESCE(bootstrap_proof, 0) = 0
+            ORDER BY enqueued_at DESC, id DESC`,
+        )
+        .all(runId) as Array<{ status: string; deliverableJson: string }>;
+    } catch {
+      return this.db
+        .prepare(
+          `SELECT status, deliverable_json AS deliverableJson
+             FROM verification_requests
+            WHERE run_id = ?
+            ORDER BY enqueued_at DESC, id DESC`,
+        )
+        .all(runId) as Array<{ status: string; deliverableJson: string }>;
+    }
+  }
+
+  /**
+   * Is this request a bootstrap proof (migration 107)? Fail-soft to `false` — a
+   * DB that cannot answer cannot contain one.
+   */
+  private isBootstrapProof(requestId: string): boolean {
+    try {
+      const row = this.db
+        .prepare('SELECT bootstrap_proof AS bootstrapProof FROM verification_requests WHERE id = ?')
+        .get(requestId) as { bootstrapProof?: unknown } | undefined;
+      return row?.bootstrapProof === 1 || row?.bootstrapProof === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * True when a terminal event belongs to this lane. An explicit taskRef must
    * match the lane (opaque id or display ref). A taskRef-LESS event is accepted
    * ONLY for a single-lane run (genuinely unambiguous); in a multi-lane run it
@@ -272,6 +322,17 @@ export class SchedulerVisualVerifyGate implements VisualVerifyGate {
    * at WARN naming the requestId + run so it is visible.
    */
   private eventMatchesLane(event: VerificationTerminalEvent, runId: string, itemId: string): boolean {
+    // A bootstrap proof's terminal is never a lane's verdict (mig 105). Checked
+    // FIRST and by column: the controller stamps the owning lane's ref on the
+    // request for its own bookkeeping, so the taskRef branch below would match.
+    if (this.isBootstrapProof(event.requestId)) {
+      this.logger?.debug('[visualVerifyGate] bootstrap-proof terminal; not a lane verdict', {
+        runId,
+        itemId,
+        requestId: event.requestId,
+      });
+      return false;
+    }
     if (event.taskRef !== undefined) {
       const lane = this.resolveLane(runId, itemId);
       if (!lane) return false;

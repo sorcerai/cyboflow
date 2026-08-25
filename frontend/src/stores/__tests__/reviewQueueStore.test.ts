@@ -6,7 +6,7 @@
  * The three reducers under test have well-defined correctness properties:
  *
  *   1. replaceAll  — atomic queue replacement
- *   2. addApproval — idempotent on duplicate id
+ *   2. addApproval — upserts by id (idempotent replay; refreshes a flipped row)
  *   3. removeApproval — no-op on missing id
  *
  * The tRPC client is mocked at the module level so the test can import
@@ -94,6 +94,9 @@ function makeApproval(overrides: Partial<Approval> & { id: string }): Approval {
     rationale: overrides.rationale ?? null,
     createdAt: overrides.createdAt ?? '2026-01-01T00:00:00.000Z',
     status: overrides.status ?? 'pending',
+    awaited: overrides.awaited ?? true,
+    sessionName: overrides.sessionName ?? null,
+    agentProvider: overrides.agentProvider ?? null,
   };
 }
 
@@ -156,6 +159,20 @@ describe('pureAddApproval', () => {
     const existing = [A];
     const result = pureAddApproval(existing, A);
     expect(result).toBe(existing); // same reference — no allocation
+  });
+
+  it('replaces in place when the same id arrives as a DIFFERENT record', () => {
+    // How an `awaited` flip reaches a card already on screen: ApprovalRouter
+    // re-announces the approval (there is no separate "updated" channel), and
+    // skipping it as a duplicate — the old behaviour — left the card claiming a
+    // blocked agent until the next full resync.
+    const flipped = { ...A, awaited: false };
+    const result = pureAddApproval([A, B], flipped);
+    expect(result).toHaveLength(2);
+    expect(result[0].awaited).toBe(false);
+    // Position is preserved: the queue is oldest-first and a flip is not a
+    // reordering event.
+    expect(result.map((a) => a.id)).toEqual([A.id, B.id]);
   });
 
   it('appends to end of queue when id is new', () => {

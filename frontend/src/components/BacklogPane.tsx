@@ -15,8 +15,10 @@
  * per non-empty visible stage). Kanban cards are draggable within their own
  * column (same-column reorder via fractional `sort_order` — see `reorderTask`
  * below); cross-column drops are a no-op in v1. A "+ New" affordance opens
- * NewTaskDialog; each card has a "Run" action that launches a run for the task
- * in ITS project (`task.project_id`, not the pane prop).
+ * NewTaskDialog; each card has a primary action in ITS project
+ * (`task.project_id`, not the pane prop) — "Run" launches a run for an
+ * epic/task, "Open" (idea sessions plan, Stage 4) find-or-creates an idea's
+ * persistent home session via {@link useIdeaSessionOpener} and focuses it.
  *
  * Render pipeline: filterTasks (project narrow + archive-in-place visibility)
  * -> unifiedStages (per-project boards collapsed into one column set by stage
@@ -52,6 +54,7 @@ import { KanbanView } from './Backlog/KanbanView';
 import { ListView } from './Backlog/ListView';
 import { NewTaskDialog } from './Backlog/NewTaskDialog';
 import { useTaskRunLauncher } from './Backlog/useTaskRunLauncher';
+import { useIdeaSessionOpener } from '../hooks/useIdeaSessionOpener';
 import { TaskBatchPickerModal } from './cyboflow/TaskBatchPickerModal';
 import type { BacklogTaskItem, BoardStage } from '../../../shared/types/tasks';
 import { DEFAULT_SUBSTRATE } from '../../../shared/types/substrate';
@@ -326,6 +329,13 @@ export function BacklogPane({ projectId }: BacklogPaneProps): React.JSX.Element 
   const toggleShowArchived = useBacklogStore((s) => s.toggleShowArchived);
 
   const { launchingTaskId, error: launchError, launch, launchSprintBatch } = useTaskRunLauncher();
+  // Backlog idea card "Open" (idea sessions plan, Stage 4) — a SEPARATE
+  // launcher from useTaskRunLauncher (idea Open never calls runs.start).
+  // Merged with launchingTaskId below before reaching TaskCard: an idea never
+  // renders Run and an epic/task never renders Open, so one shared in-flight
+  // id is enough — see TaskCard.tsx's file header.
+  const { openingTaskId, error: openError, openIdeaSession } = useIdeaSessionOpener();
+  const busyTaskId = launchingTaskId ?? openingTaskId;
   const [isNewOpen, setIsNewOpen] = useState(false);
   // Same-column reorder failure (concurrency conflict etc.) — shares the launch
   // error banner styling below.
@@ -370,10 +380,17 @@ export function BacklogPane({ projectId }: BacklogPaneProps): React.JSX.Element 
   // Launch in the task's OWN project — in All-projects mode the pane prop may
   // point at a different (or no) project.
   const handleRun = (task: BacklogTaskItem): void => {
+    // Ideas: "Open" — find-or-create the idea's persistent home session and
+    // focus it (idea sessions plan, Stage 4). No sprint-batch/Planner detour —
+    // opening the home is always the same one action, ledger state and all.
+    if (task.type === 'idea') {
+      void openIdeaSession(task);
+      return;
+    }
     // An epic at "Ready for development" or later is past planning — Run should
     // EXECUTE its ready tasks via Sprint, not re-plan it via Planner. Open the
     // sprint batch picker pre-seeded with the epic's ready-for-dev child tasks so
-    // the user confirms/adjusts the batch. Planning-stage epics/ideas (and tasks)
+    // the user confirms/adjusts the batch. Planning-stage epics (and tasks)
     // keep their direct one-click launch.
     if (task.type === 'epic' && isExecutionStage(task.stage_position)) {
       setBatchPicker({
@@ -448,9 +465,9 @@ export function BacklogPane({ projectId }: BacklogPaneProps): React.JSX.Element 
         onNew={() => setIsNewOpen(true)}
       />
 
-      {(launchError ?? reorderError) && (
+      {(launchError ?? openError ?? reorderError) && (
         <div className="flex-shrink-0 border-b border-border-primary bg-status-error/10 px-7 py-1.5 text-xs text-status-error" role="alert">
-          {launchError ?? reorderError}
+          {launchError ?? openError ?? reorderError}
         </div>
       )}
 
@@ -468,7 +485,7 @@ export function BacklogPane({ projectId }: BacklogPaneProps): React.JSX.Element 
             layoutMode={layoutMode}
             onRun={handleRun}
             onReorder={(task, targetIndex) => void reorderTask(task, targetIndex)}
-            launchingTaskId={launchingTaskId}
+            launchingTaskId={busyTaskId}
             now={now}
           />
         )}

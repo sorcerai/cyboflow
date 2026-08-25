@@ -40,6 +40,7 @@ const SCHEMA = `
     id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, label TEXT NOT NULL,
     spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
     weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+    archived_at TEXT,  -- migration 116
     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE TABLE experiments (

@@ -60,7 +60,13 @@ export function OnboardingModalCard({
         role="dialog"
         aria-modal="true"
         aria-label={ONBOARDING_TITLES[step]}
-        className="relative flex flex-col overflow-hidden border border-border-emphasized bg-bg-primary shadow-modal"
+        /* max-h/max-w-full: the card's 468×512 is a PREFERRED size, not a floor.
+           The app window has no minHeight, so on a short (non-fullscreen) window
+           a hard 512 overflows the centered wrapper equally top and bottom — and
+           since the wrapper does not scroll, the footer carrying Back/primary is
+           clipped off-screen with no way to reach it. Capping instead lets the
+           already-scrolling body absorb the shortfall and keeps the footer up. */
+        className="relative flex max-h-full max-w-full flex-col overflow-hidden border border-border-emphasized bg-bg-primary shadow-modal"
         style={{ width: 468, height: 512 }}
       >
         {/* Compact header — steps 1,2,3,7. Step 0's hero lives inside the body. */}

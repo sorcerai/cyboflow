@@ -10,6 +10,15 @@
  *                             on white, max-width 680px (blue accent #3b6dd6).
  *   - 'arch-design'        -> the idea body's '## Architecture design' section as
  *                             a markdown doc, same chrome (teal accent #2d7a8a).
+ *   - 'idea-summary'       -> a HUB (gray accent) over the five ledger components
+ *                             (idea-spec/prototype/architecture/epics/stories),
+ *                             each with its four-way status (complete/needs
+ *                             review/not started/skipped), plus links out to each
+ *                             real sibling deliverable tab. It points at those
+ *                             tabs — it never inlines them. A SINGLE-idea run
+ *                             renders the per-idea doc; a multi-idea batch's
+ *                             COMBINED tab renders a compact matrix, one row per
+ *                             idea against the five components as columns.
  *   - 'decomposed-stories' -> an epic/task card grid: one card per epic, tasks in
  *                             a 2-col grid (indigo accent #5a4ad6).
  *   - 'screenshots'        -> a 2-col gallery; no disk image source yet, so a
@@ -38,18 +47,26 @@ import { FeedbackDocPanel } from './feedback/FeedbackDocPanel';
 import { FeedbackChip } from './feedback/FeedbackChip';
 import { latestBatchStatus } from './feedback/feedbackLogic';
 import { useArtifactData } from '../../hooks/useArtifactData';
+import type { IdeaSummaryEntry } from '../../hooks/useArtifactData';
 import { useArtifactImages } from '../../hooks/useArtifactImages';
 import { useArtifactHtml } from '../../hooks/useArtifactHtml';
+import { useArtifactsList } from '../../hooks/useArtifactsList';
 import { useReviewItemActions } from '../../hooks/useReviewItemActions';
 import { useReviewItemsSlice } from '../../stores/reviewItemsSlice';
 import { useFeedback } from '../../hooks/useFeedback';
 import { useQuestionStore } from '../../stores/questionStore';
 import { useCyboflowStore } from '../../stores/cyboflowStore';
 import { useDesignModeStore } from '../../stores/designModeStore';
+import { useCenterPaneStore } from '../../stores/centerPaneStore';
+import { useActiveRunsStore } from '../../stores/activeRunsStore';
 import { ScoreSummary, findingLocation, findingCategory } from './WorkflowSummaryPanel';
 import type { FindingRow } from './WorkflowSummaryPanel';
 import type { RunEval } from '../../../../shared/types/insights';
-import { ARTIFACT_COLORS, extractArchDesignSection } from '../../../../shared/types/artifacts';
+import {
+  ARTIFACT_COLORS,
+  extractArchDesignSection,
+  isCombinedBatchArtifact,
+} from '../../../../shared/types/artifacts';
 import type {
   Artifact,
   ApproveIdeasArtifactPayload,
@@ -58,6 +75,8 @@ import type {
   TaskVerificationReportEntry,
 } from '../../../../shared/types/artifacts';
 import type { BacklogTaskItem } from '../../../../shared/types/tasks';
+import { IDEA_COMPONENT_KEYS, IDEA_COMPONENT_LABELS } from '../../../../shared/types/ideaComponents';
+import type { IdeaComponentKey, IdeaComponentState } from '../../../../shared/types/ideaComponents';
 import type { VerdictV1 } from '../../../../shared/types/visualVerification';
 import type { IdeaVerdict, IdeaVerdictMap, ReviewItem } from '../../../../shared/types/reviews';
 import type { Question, QuestionPayload } from '../../../../shared/types/questions';
@@ -327,6 +346,522 @@ function ArchDesignBody({ artifact, projectId }: { artifact: Artifact; projectId
               doc
             );
           })()}
+        </div>
+      )}
+    </Shell>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// idea-summary — the ledger HUB: each idea's five components (with their
+// four-way status — complete / needs review / not started / skipped, per the
+// "reset means re-verify" contract in shared/types/ideaComponents.ts) plus
+// links out to each real sibling deliverable tab. A HUB, not an aggregator: it
+// points at those tabs, it never inlines their content. NO "runs that touched
+// this idea" lineage strip — explicitly out of scope.
+//
+// TWO SHAPES, one atype (matching how the orchestrator mints it):
+//   - SINGLE idea  -> the per-idea doc: five labelled component rows, then the
+//                     deliverable list. Unchanged since migration 102.
+//   - MULTI-idea   -> the COMBINED batch tab: a compact MATRIX, one row per
+//                     idea against five component columns, each row expanding
+//                     to its own deliverable list. A batch used to mint N
+//                     per-idea tabs that all carried the SAME fixed label and
+//                     were therefore indistinguishable in the tab strip.
+// ---------------------------------------------------------------------------
+
+/** One sibling deliverable this hub can point at. */
+interface IdeaSummaryLink {
+  key: string;
+  label: string;
+  artifact: Artifact | undefined;
+}
+
+/** The four-way status chip for one ledger component (or its absence). */
+function ideaSummaryChip(state: IdeaComponentState | undefined): { text: string; color: string } {
+  if (!state) return { text: 'Not started', color: MUTED };
+  if (state.state === 'skipped') return { text: 'Skipped', color: FAINT };
+  if (state.state === 'complete') return { text: 'Complete', color: VERDICT_PASS };
+  // state.state === 'incomplete': staleAt distinguishes "not started" from
+  // "needs review" (prior work exists) — collapsing the two is the one thing
+  // NOT to do here (see shared/types/ideaComponents.ts).
+  return state.staleAt !== null
+    ? { text: 'Needs review', color: VERDICT_LOW }
+    : { text: 'Not started', color: MUTED };
+}
+
+/**
+ * The matrix cell for one ledger component — the same four-way status as
+ * {@link ideaSummaryChip}, compressed to a glyph for the combined tab's grid.
+ *
+ * Each status is distinguished by SHAPE as well as color (and carries a `title`
+ * at the call site), so the grid never rests on color alone; the legend under
+ * the matrix names all four. Glyphs stay inside the app's existing box/dingbat
+ * register rather than introducing an icon set to this surface.
+ */
+function ideaSummaryMark(state: IdeaComponentState | undefined): {
+  glyph: string;
+  color: string;
+  text: string;
+} {
+  const chip = ideaSummaryChip(state);
+  if (chip.text === 'Complete') return { glyph: '✓', color: VERDICT_PASS, text: chip.text };
+  if (chip.text === 'Needs review') return { glyph: '⟳', color: VERDICT_LOW, text: chip.text };
+  if (chip.text === 'Skipped') return { glyph: '–', color: FAINT, text: chip.text };
+  return { glyph: '·', color: FAINT, text: chip.text };
+}
+
+/** Legend entries under the matrix, in the same order as the status ladder. */
+const IDEA_SUMMARY_LEGEND: ReadonlyArray<{ glyph: string; color: string; label: string }> = [
+  { glyph: '✓', color: VERDICT_PASS, label: 'complete' },
+  { glyph: '⟳', color: VERDICT_LOW, label: 'needs review' },
+  { glyph: '·', color: FAINT, label: 'not started' },
+  { glyph: '–', color: FAINT, label: 'skipped' },
+];
+
+/** Short column heads for the matrix, paired with the full labels by key. */
+/**
+ * Floor width for one matrix row: the five fixed 58px status columns + the 16px
+ * chevron + the row's 10px padding either side + the idea column's own 112px
+ * minimum. Applied to the column heads and the row list so a narrowed artifact
+ * pane SCROLLS the matrix sideways instead of clipping the last column and
+ * squeezing the idea title out of existence — a hidden status cell reads as
+ * "no such component", which is exactly the confusion this tab exists to end.
+ */
+const IDEA_SUMMARY_MATRIX_MIN_WIDTH = 424;
+
+/** Floor width for the idea (ref + title) column, so the title never collapses to nothing. */
+const IDEA_SUMMARY_IDEA_COLUMN_MIN_WIDTH = 112;
+
+const IDEA_SUMMARY_COLUMN_HEADS: Record<IdeaComponentKey, string> = {
+  'idea-spec': 'SPEC',
+  prototype: 'PROTO',
+  architecture: 'ARCH',
+  epics: 'EPICS',
+  stories: 'STORY',
+};
+
+/**
+ * The sibling deliverables this run has produced FOR ONE IDEA. Shared by both
+ * shapes so a link can never resolve differently between them.
+ *
+ * The idea-spec link falls back to the run's COMBINED "Idea specs" tab: a
+ * multi-idea batch mints ONE idea-spec artifact anchored on the first owned
+ * idea, so a per-idea `sourceRef` lookup would find it for idea #1 only and
+ * report "not yet" for every other idea in the very batch it renders.
+ * Prototype / decomposed-stories are already run-scoped (no sourceRef);
+ * arch-design stays genuinely per-idea (it is minted once per owned idea).
+ */
+function ideaSummaryLinks(idea: BacklogTaskItem, runArtifacts: Artifact[]): IdeaSummaryLink[] {
+  const combinedSpec = runArtifacts.find(
+    (a) => a.atype === 'idea-spec' && isCombinedBatchArtifact(a.payloadJson),
+  );
+  return [
+    {
+      key: 'idea-spec',
+      label: 'Idea spec',
+      artifact:
+        runArtifacts.find((a) => a.atype === 'idea-spec' && a.sourceRef === idea.id) ?? combinedSpec,
+    },
+    {
+      key: 'prototype',
+      label: 'Prototype',
+      artifact: runArtifacts.find(
+        (a) => a.atype === 'ui-prototype' || a.atype === 'interactive-prototype',
+      ),
+    },
+    {
+      key: 'architecture',
+      label: 'Architecture design',
+      artifact: runArtifacts.find((a) => a.atype === 'arch-design' && a.sourceRef === idea.id),
+    },
+    {
+      key: 'stories',
+      label: 'Decomposed stories',
+      artifact: runArtifacts.find((a) => a.atype === 'decomposed-stories'),
+    },
+  ];
+}
+
+/**
+ * The deliverable list — one row per sibling tab, disabled ("not yet") when the
+ * run has not produced it. Shared by the single-idea doc and each expanded
+ * matrix row; `testidPrefix` keeps the two surfaces' test ids distinct.
+ */
+function IdeaSummaryDeliverables({
+  links,
+  accent,
+  testidPrefix,
+  onOpen,
+}: {
+  links: IdeaSummaryLink[];
+  accent: string;
+  testidPrefix: string;
+  onOpen: (target: Artifact) => void;
+}): ReactElement {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {links.map((link) => {
+        const exists = link.artifact !== undefined;
+        return (
+          <button
+            key={link.key}
+            type="button"
+            data-testid={`${testidPrefix}-${link.key}`}
+            disabled={!exists}
+            onClick={() => {
+              const target = link.artifact;
+              if (!target) return;
+              onOpen(target);
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '7px 10px',
+              border: `1px ${exists ? 'solid' : 'dashed'} ${exists ? SOFT : FAINT}`,
+              background: 'transparent',
+              textAlign: 'left',
+              cursor: exists ? 'pointer' : 'default',
+              opacity: exists ? 1 : 0.6,
+            }}
+          >
+            <span style={{ fontSize: '11px', color: exists ? INK : FAINT }}>{link.label}</span>
+            <span style={{ fontSize: '9px', fontWeight: 700, color: exists ? accent : FAINT }}>
+              {exists ? 'open →' : 'not yet'}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Open a sibling artifact's tab in the center pane.
+ *
+ * centerPaneStore's tab store is keyed by the run's PARENT SESSION (else the run
+ * id itself for a legacy parentless run) — see centerPaneStore.ts /
+ * RunCenterPane. ArtifactTabRendererProps carries no sessionKey, so this
+ * recomputes the SAME derivation independently from the same source
+ * (activeRunsStore) RunCenterPane itself reads.
+ */
+function useOpenSiblingArtifact(runId: string, projectId: number): (target: Artifact) => void {
+  const openArtifactTab = useCenterPaneStore((s) => s.openArtifactTab);
+  const sessionIdForRun = useActiveRunsStore(
+    (s) => s.runsByProject[projectId]?.find((r) => r.id === runId)?.session_id ?? null,
+  );
+  const sessionKey = sessionIdForRun ?? runId;
+  return (target: Artifact) =>
+    openArtifactTab(sessionKey, {
+      atype: target.atype,
+      label: target.label,
+      artifactId: target.id,
+      committed: target.committed,
+      isNew: false,
+    });
+}
+
+/** The SINGLE-idea hub doc: five labelled component rows, then the deliverables. */
+function IdeaSummaryDoc({
+  idea,
+  components,
+  runArtifacts,
+  accent,
+  onOpen,
+}: {
+  idea: BacklogTaskItem;
+  components: IdeaComponentState[];
+  runArtifacts: Artifact[];
+  accent: string;
+  onOpen: (target: Artifact) => void;
+}): ReactElement {
+  return (
+    <div
+      data-testid="artifact-idea-summary-doc"
+      style={{
+        maxWidth: 680,
+        margin: '18px auto',
+        background: 'var(--color-surface-primary)',
+        border: `1px solid ${HAIRLINE}`,
+        padding: '34px 40px 56px',
+      }}
+    >
+      <div
+        style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '.16em', textTransform: 'uppercase', color: accent, marginBottom: 8 }}
+      >
+        {idea.ref}
+      </div>
+      <h1 style={{ fontSize: '22px', fontWeight: 700, lineHeight: 1.25, color: INK, margin: '0 0 6px' }}>
+        {idea.title}
+      </h1>
+      {idea.summary && (
+        <div style={{ fontSize: '11px', color: FAINT, marginBottom: 24 }}>{idea.summary}</div>
+      )}
+
+      <div
+        style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTED, marginBottom: 10 }}
+      >
+        Components
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 28 }}>
+        {IDEA_COMPONENT_KEYS.map((key) => {
+          const state = components.find((c) => c.component === key);
+          const chip = ideaSummaryChip(state);
+          return (
+            <div
+              key={key}
+              data-testid={`artifact-idea-summary-component-${key}`}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '7px 10px',
+                border: `1px solid ${SOFT}`,
+              }}
+            >
+              <span style={{ fontSize: '11px', color: INK }}>{IDEA_COMPONENT_LABELS[key]}</span>
+              <span
+                data-testid={`artifact-idea-summary-component-${key}-status`}
+                style={{ fontSize: '9px', fontWeight: 700, color: chip.color }}
+              >
+                {chip.text}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div
+        style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTED, marginBottom: 10 }}
+      >
+        Deliverables
+      </div>
+      <IdeaSummaryDeliverables
+        links={ideaSummaryLinks(idea, runArtifacts)}
+        accent={accent}
+        testidPrefix="artifact-idea-summary-link"
+        onOpen={onOpen}
+      />
+    </div>
+  );
+}
+
+/**
+ * The COMBINED multi-idea matrix: one row per idea the run owns, against the
+ * five ledger components as columns, with each row expanding to that idea's own
+ * deliverable list. Expansion is per-row and local to the tab (several rows may
+ * be open at once); nothing about which rows are open is persisted.
+ */
+function IdeaSummariesMatrix({
+  entries,
+  runArtifacts,
+  accent,
+  onOpen,
+}: {
+  entries: IdeaSummaryEntry[];
+  runArtifacts: Artifact[];
+  accent: string;
+  onOpen: (target: Artifact) => void;
+}): ReactElement {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  return (
+    <div
+      data-testid="artifact-idea-summaries-doc"
+      style={{
+        maxWidth: 680,
+        margin: '18px auto',
+        background: 'var(--color-surface-primary)',
+        border: `1px solid ${HAIRLINE}`,
+        padding: '30px 34px 34px',
+        // Heads + rows both carry IDEA_SUMMARY_MATRIX_MIN_WIDTH, so they scroll
+        // together here and stay column-aligned in a narrowed pane.
+        overflowX: 'auto',
+      }}
+    >
+      {/* Column heads */}
+      <div style={{ display: 'flex', alignItems: 'center', padding: '0 10px 8px', minWidth: IDEA_SUMMARY_MATRIX_MIN_WIDTH }}>
+        <span
+          style={{ flex: 1, minWidth: IDEA_SUMMARY_IDEA_COLUMN_MIN_WIDTH, fontSize: '9.5px', fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: FAINT }}
+        >
+          Idea
+        </span>
+        {IDEA_COMPONENT_KEYS.map((key) => (
+          <span
+            key={key}
+            title={IDEA_COMPONENT_LABELS[key]}
+            style={{ width: 58, flexShrink: 0, textAlign: 'center', fontSize: '9.5px', fontWeight: 700, letterSpacing: '.1em', color: FAINT }}
+          >
+            {IDEA_SUMMARY_COLUMN_HEADS[key]}
+          </span>
+        ))}
+        <span style={{ width: 16, flexShrink: 0 }} />
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: IDEA_SUMMARY_MATRIX_MIN_WIDTH }}>
+        {entries.map(({ idea, components }) => {
+          const open = expanded[idea.id] === true;
+          return (
+            <div key={idea.id}>
+              <button
+                type="button"
+                data-testid={`artifact-idea-summaries-row-${idea.id}`}
+                aria-expanded={open}
+                onClick={() => setExpanded((prev) => ({ ...prev, [idea.id]: !prev[idea.id] }))}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  width: '100%',
+                  padding: '9px 10px',
+                  border: `1px solid ${SOFT}`,
+                  background: 'transparent',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                }}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: IDEA_SUMMARY_IDEA_COLUMN_MIN_WIDTH,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 3,
+                  }}
+                >
+                  <span style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '.16em', color: accent }}>
+                    {idea.ref}
+                  </span>
+                  <span
+                    style={{ fontSize: '13px', color: INK, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {idea.title}
+                  </span>
+                </span>
+                {IDEA_COMPONENT_KEYS.map((key) => {
+                  const mark = ideaSummaryMark(components.find((c) => c.component === key));
+                  return (
+                    <span
+                      key={key}
+                      data-testid={`artifact-idea-summaries-cell-${idea.id}-${key}`}
+                      title={`${IDEA_COMPONENT_LABELS[key]}: ${mark.text}`}
+                      aria-label={`${IDEA_COMPONENT_LABELS[key]}: ${mark.text}`}
+                      style={{ width: 58, flexShrink: 0, textAlign: 'center', fontSize: '15px', fontWeight: 700, color: mark.color }}
+                    >
+                      {mark.glyph}
+                    </span>
+                  );
+                })}
+                <span
+                  aria-hidden
+                  style={{ width: 16, flexShrink: 0, textAlign: 'right', fontSize: '11px', color: FAINT }}
+                >
+                  {open ? '▾' : '▸'}
+                </span>
+              </button>
+
+              {open && (
+                <div
+                  data-testid={`artifact-idea-summaries-detail-${idea.id}`}
+                  style={{
+                    padding: '10px 10px 12px',
+                    marginTop: -1,
+                    borderLeft: `1px solid ${SOFT}`,
+                    borderRight: `1px solid ${SOFT}`,
+                    borderBottom: `1px solid ${SOFT}`,
+                  }}
+                >
+                  <div
+                    style={{ fontSize: '9.5px', fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTED, marginBottom: 8 }}
+                  >
+                    Deliverables
+                  </div>
+                  <IdeaSummaryDeliverables
+                    links={ideaSummaryLinks(idea, runArtifacts)}
+                    accent={accent}
+                    testidPrefix={`artifact-idea-summaries-link-${idea.id}`}
+                    onOpen={onOpen}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Legend — the matrix compresses status to a glyph, so name all four. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 18, marginTop: 16, padding: '0 10px', flexWrap: 'wrap' }}>
+        {IDEA_SUMMARY_LEGEND.map((entry) => (
+          <span key={entry.label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span aria-hidden style={{ fontSize: '13px', fontWeight: 700, color: entry.color }}>
+              {entry.glyph}
+            </span>
+            <span style={{ fontSize: '11px', color: FAINT }}>{entry.label}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IdeaSummaryBody({ artifact, projectId }: { artifact: Artifact; projectId: number }): ReactElement {
+  const accent = ARTIFACT_COLORS['idea-summary'];
+  const { loading, error, data } = useArtifactData(artifact, projectId);
+  const idea = data?.kind === 'idea-summary' ? data.idea : null;
+  const components = data?.kind === 'idea-summary' ? data.components : [];
+  // The COMBINED multi-idea tab (payload_json.combined): useArtifactData took
+  // the run-scoped path and resolved the batch's ideas zipped against their
+  // ledgers (kind 'idea-summaries'). Null on the single-idea path.
+  const batch = data?.kind === 'idea-summaries' ? data.entries : null;
+
+  // The sibling deliverables this run has actually produced — the hub links out
+  // to them rather than inlining their content.
+  const { artifacts: runArtifacts } = useArtifactsList(artifact.runId, projectId);
+  const openSibling = useOpenSiblingArtifact(artifact.runId, projectId);
+
+  return (
+    <Shell testid="artifact-idea-summary">
+      <ArtifactHeader
+        artifact={artifact}
+        projectId={projectId}
+        accent={accent}
+        eyebrow="Artifact · idea summary"
+        meta={
+          batch !== null
+            ? `${batch.length} ideas · ${artifact.stepOrigin ?? 'orchestrator'}`
+            : artifact.sourceRef
+              ? `${artifact.sourceRef} · ${artifact.stepOrigin ?? 'orchestrator'}`
+              : undefined
+        }
+      />
+      {loading ? (
+        <StateRow testid="artifact-idea-summary-loading" color={MUTED} text="Loading idea summary…" />
+      ) : error ? (
+        <StateRow testid="artifact-idea-summary-error" color={RUST} text={error} />
+      ) : batch !== null ? (
+        batch.length === 0 ? (
+          <StateRow testid="artifact-idea-summary-empty" color={MUTED} text="No idea to summarize." />
+        ) : (
+          <div style={{ flex: 1 }}>
+            <IdeaSummariesMatrix
+              entries={batch}
+              runArtifacts={runArtifacts}
+              accent={accent}
+              onOpen={openSibling}
+            />
+          </div>
+        )
+      ) : !idea ? (
+        <StateRow testid="artifact-idea-summary-empty" color={MUTED} text="No idea to summarize." />
+      ) : (
+        <div style={{ flex: 1 }}>
+          <IdeaSummaryDoc
+            idea={idea}
+            components={components}
+            runArtifacts={runArtifacts}
+            accent={accent}
+            onOpen={openSibling}
+          />
         </div>
       )}
     </Shell>
@@ -1931,24 +2466,39 @@ function CanvasBody({ artifact, projectId }: { artifact: Artifact; projectId: nu
   // A design session's prototype: sourceRef is server-stamped ONLY for
   // design-scoped artifact reports (see cyboflow_report_artifact / design.ts),
   // so its presence (alongside a sessionId) is what distinguishes a design
-  // canvas from an ordinary ui-prototype/generic live canvas. Non-design
-  // canvas tabs (sourceRef null, or sessionId null) get NO Approve control —
-  // `actions` stays exactly `openInBrowser`, unchanged from before.
-  // "Enter design mode" CTA (v0.5 fullscreen design surface, second entry
-  // door) — same render gate as designControl, rendered leftmost of the two.
-  // BOTH prototype-family atypes qualify: a mid-session tier switch leaves an
+  // canvas from an ordinary ui-prototype/generic live canvas. BOTH
+  // prototype-family atypes qualify: a mid-session tier switch leaves an
   // interactive-prototype tab alongside the lo-fi one, and an interactive-only
   // run would otherwise have NO entry door at all.
-  const isDesignCanvas =
+  const isDesignSessionCanvas =
     (artifact.atype === 'ui-prototype' || artifact.atype === 'interactive-prototype') &&
     artifact.sourceRef !== null &&
     artifact.sessionId !== null;
-  const enterDesignModeCta: ReactNode = isDesignCanvas ? (
+
+  // Reopening a prototype that never ran inside a design session (no
+  // sourceRef — e.g. a planner/sprint-produced ui-prototype) into a NEW or
+  // promoted design session is a real, prepared seam: it resolves to the
+  // single idea its producing run belongs to via
+  // cyboflow.design.resolveReopenIdea (main/src/orchestrator/design/
+  // reopenIdeaResolver.ts) — both remain in place and tested. But actually
+  // ADOPTING that resolved artifact into a session is session-creation
+  // plumbing (main/src/services/*, ipc/session.ts) this component does not
+  // own, so rather than advertise a CTA it cannot honour (a permanently
+  // disabled button + a tooltip explaining internal plumbing), this canvas
+  // withholds the affordance entirely — and never fires the resolver query,
+  // since nothing here would consume its result. Re-enable by wiring an
+  // onClick that starts/promotes a design session seeded from this artifact
+  // once that adoption path exists, gating the CTA on the resolved idea again.
+
+  // "Enter design mode" CTA (v0.5 fullscreen design surface, second entry
+  // door) — rendered leftmost of the two, only for a live design-session
+  // canvas (sourceRef + sessionId present).
+  const enterDesignModeCta: ReactNode = isDesignSessionCanvas ? (
     <button
       type="button"
       data-testid="design-mode-enter-cta"
       onClick={() => {
-        const sessionId = artifact.sessionId as string; // narrowed by isDesignCanvas
+        const sessionId = artifact.sessionId as string; // narrowed by isDesignSessionCanvas
         // The fullscreen surface's chat rail derives from the global active
         // session, so entering design mode for this artifact's session must
         // also make that session the selected session — only when it isn't
@@ -1974,10 +2524,10 @@ function CanvasBody({ artifact, projectId }: { artifact: Artifact; projectId: nu
       Design mode
     </button>
   ) : null;
-  const designControl: ReactNode = isDesignCanvas ? (
+  const designControl: ReactNode = isDesignSessionCanvas ? (
     <DesignApproveControl sessionId={artifact.sessionId as string} artifactRevision={artifact.revision} />
   ) : null;
-  const actions: ReactNode = designControl ? (
+  const actions: ReactNode = isDesignSessionCanvas ? (
     <>
       {enterDesignModeCta}
       {designControl}
@@ -2979,6 +3529,8 @@ export function ArtifactTabRenderer({ artifact, projectId }: ArtifactTabRenderer
       return <IdeaSpecBody artifact={artifact} projectId={projectId} />;
     case 'arch-design':
       return <ArchDesignBody artifact={artifact} projectId={projectId} />;
+    case 'idea-summary':
+      return <IdeaSummaryBody artifact={artifact} projectId={projectId} />;
     case 'compound-recommendations':
       return <RecommendationsBody artifact={artifact} projectId={projectId} />;
     case 'verify-runbook':

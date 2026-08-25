@@ -3,7 +3,8 @@
  *
  * create/list/update/setStatus/delete happy paths + CONFLICT on label collision +
  * CONFLICT on delete-with-run-history + BAD_REQUEST on unresolvable/foreign +
- * NOT_FOUND on a missing variant.
+ * NOT_FOUND on a missing variant. setArchived hides a variant from the default
+ * list and restores it (migration 116).
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
@@ -36,6 +37,7 @@ function createVariantsTestDb(): Database.Database {
       spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
       agent_provider TEXT, agent_runtime TEXT,
       weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+      archived_at TEXT,  -- migration 116
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE UNIQUE INDEX idx_workflow_variants_wf_label ON workflow_variants(workflow_id, label);
@@ -169,6 +171,33 @@ describe('cyboflow.variants', () => {
     await expect(caller.cyboflow.variants.delete({ variantId: created.id })).rejects.toMatchObject({
       code: 'CONFLICT',
     });
+  });
+
+  it('setArchived hides a variant from list and restores it (migration 116)', async () => {
+    const caller = makeCaller(db);
+    const created = await caller.cyboflow.variants.create({ workflowId: WF, label: 'challenger' });
+    await caller.cyboflow.variants.setStatus({ variantId: created.id, status: 'active' });
+
+    await caller.cyboflow.variants.setArchived({ variantId: created.id, archived: true });
+    expect(await caller.cyboflow.variants.list({ workflowId: WF })).toEqual([]);
+
+    const withArchived = await caller.cyboflow.variants.list({ workflowId: WF, includeArchived: true });
+    expect(withArchived.map((v) => v.id)).toEqual([created.id]);
+    expect(withArchived[0].archived_at).not.toBeNull();
+    // The status it was archived under is preserved, not overwritten.
+    expect(withArchived[0].status).toBe('active');
+
+    await caller.cyboflow.variants.setArchived({ variantId: created.id, archived: false });
+    const restored = await caller.cyboflow.variants.list({ workflowId: WF });
+    expect(restored.map((v) => v.id)).toEqual([created.id]);
+    expect(restored[0].archived_at).toBeNull();
+  });
+
+  it('setArchived maps a missing variant to NOT_FOUND', async () => {
+    const caller = makeCaller(db);
+    await expect(
+      caller.cyboflow.variants.setArchived({ variantId: 'nope', archived: true }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' } satisfies Partial<TRPCError>);
   });
 
   it('setStatus maps a missing variant to NOT_FOUND', async () => {

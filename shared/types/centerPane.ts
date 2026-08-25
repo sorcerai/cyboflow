@@ -62,6 +62,27 @@ export interface TabItem {
   committed?: boolean;
   /** Freshly auto-minted; pulses until focused, then cleared (artifact tabs). */
   isNew?: boolean;
+  /**
+   * The artifact's OWN run (artifact tabs). Set for an {@link TabItem.external}
+   * tab, whose backing row lives outside the pane's session and can only be
+   * fetched by `(artifactId, runId, atype)` — `artifacts.get` needs the runId to
+   * fall back to the committed on-disk snapshot when the DB row was deleted on
+   * commit (IDEA-039).
+   */
+  runId?: string;
+  /**
+   * EXTERNAL artifact tab: the backing row belongs to ANOTHER run/session (the
+   * idea-scoped "open →" links on the idea-session canvas, which point at
+   * deliverables minted by the idea's launched planner/design runs).
+   *
+   * Two consequences, both load-bearing:
+   *   - it is resolved via `trpc.cyboflow.artifacts.get` against its own
+   *     {@link TabItem.runId}, NOT the pane's session-scoped artifacts list;
+   *   - it is therefore EXEMPT from `useArtifactTabsSync`'s prune loop — it is
+   *     absent from that session list by construction, so pruning against it
+   *     would close the tab the instant it opened.
+   */
+  external?: boolean;
 }
 
 /** Per-session center-pane state. */
@@ -94,9 +115,18 @@ export function fileTabId(filePath: string): string {
  * (the Workflow Progress "creates ⟨artifact⟩" chip's eager open on a single-idea
  * run) returns the plain `art:<atype>` id — the store's openArtifactTab resolves
  * that to the sole open per-entity tab of the atype when exactly one exists.
+ *
+ * `external` (a cross-run tab — see {@link TabItem.external}) forces the
+ * id-keyed form for EVERY atype: the plain `art:<atype>` slot is the session's
+ * own single-viewer slot for that atype, and an artifact belonging to another
+ * run must neither hijack it nor be hijacked by it (a local `decomposed-stories`
+ * arriving in the session list would otherwise land on the same tab as the
+ * idea's cross-run one). Without an artifactId there is nothing to key on, so
+ * the flag is ignored and the plain id is returned.
  */
-export function artifactTabId(atype: ArtifactType, artifactId?: string): string {
-  if (isPerEntityArtifact(atype) && artifactId !== undefined && artifactId.length > 0) {
+export function artifactTabId(atype: ArtifactType, artifactId?: string, external?: boolean): string {
+  const keyed = artifactId !== undefined && artifactId.length > 0;
+  if (keyed && (external === true || isPerEntityArtifact(atype))) {
     return `art:${atype}:${artifactId}`;
   }
   return `art:${atype}`;

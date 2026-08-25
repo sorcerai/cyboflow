@@ -11,12 +11,19 @@
  * The two global launch defaults (model + agent runtime) were added to Session
  * settings, taking the original 12 sections to 14; they are the same class as
  * "Agent Permission Mode" (what a launch starts with), not a capability gate.
+ * "Sprint Batch Size" (the per-substrate sprint task cap, previously the
+ * hardcoded SPRINT_BATCH_MAX_TASKS map) makes 15 — same class again: it bounds
+ * what one run starts with, it does not gate a capability.
  */
 import '@testing-library/jest-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { Settings } from '../../Settings';
 import type { AppConfig } from '../../../types/config';
+import {
+  SPRINT_BATCH_MAX_TASKS_DEFAULTS,
+  SPRINT_MAX_TASKS_MAX,
+} from '../../../../../shared/types/sprintBatch';
 
 const configGet = vi.fn();
 const configUpdate = vi.fn();
@@ -80,6 +87,7 @@ const SESSION_SETTINGS = [
   'Default Launch Model',
   'Default Agent Runtime',
   'Workflow Orchestration',
+  'Sprint Batch Size',
   'Quick Sessions',
   'Quick Session Runtime',
   'Code Review Eval',
@@ -116,7 +124,7 @@ describe('Settings — AI tab groups', () => {
     expect(screen.getByRole('heading', { name: 'Session settings', level: 3 })).toBeInTheDocument();
   });
 
-  it('renders all 14 sections with zero content loss', async () => {
+  it('renders all 15 sections with zero content loss', async () => {
     render(<Settings isOpen onClose={vi.fn()} initialTab="ai" />);
     await screen.findByTestId('settings-feature-controls');
 
@@ -184,7 +192,7 @@ describe('Settings — AI tab groups', () => {
         interactivePtyOnly: true,
         computeCostFromRates: true,
         artifactCommitDir: 'docs/artifacts',
-        visualVerify: { enabled: true },
+        visualVerify: { enabled: true, autoBootstrapRunbook: false },
         idleSessionReview: { enabled: false, thresholdMinutes: 11 },
         // Session settings
         systemPromptAppend: 'be terse',
@@ -196,6 +204,77 @@ describe('Settings — AI tab groups', () => {
         autoGradeVariantRuns: false,
       }),
     );
+  });
+
+  // The sprint task-selection cap used to be a hardcoded per-substrate map. The
+  // inputs must SHOW the effective cap (built-in default when unconfigured), ride
+  // the same single config.update round trip as everything else in this group,
+  // and never let a typo persist an unusable value — the renderer clamps, and the
+  // IPC boundary clamps again.
+  describe('sprint batch size', () => {
+    it('seeds both inputs from the built-in defaults when nothing is configured', async () => {
+      render(<Settings isOpen onClose={vi.fn()} initialTab="ai" />);
+      await screen.findByTestId('settings-session-settings');
+
+      expect(screen.getByTestId('sprintMaxTasksSdk')).toHaveValue(
+        SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk,
+      );
+      expect(screen.getByTestId('sprintMaxTasksInteractive')).toHaveValue(
+        SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+      );
+    });
+
+    it('seeds from the stored override, per substrate', async () => {
+      configGet.mockResolvedValue({
+        success: true,
+        data: baseConfig({ sprintMaxTasks: { sdk: 40 } }),
+      });
+      render(<Settings isOpen onClose={vi.fn()} initialTab="ai" />);
+      await screen.findByTestId('settings-session-settings');
+
+      expect(screen.getByTestId('sprintMaxTasksSdk')).toHaveValue(40);
+      // Not overridden → still the built-in default, not 40.
+      expect(screen.getByTestId('sprintMaxTasksInteractive')).toHaveValue(
+        SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+      );
+    });
+
+    it('carries an edit into the SAME single config.update round trip', async () => {
+      render(<Settings isOpen onClose={vi.fn()} initialTab="ai" />);
+      await screen.findByTestId('settings-session-settings');
+
+      fireEvent.change(screen.getByTestId('sprintMaxTasksSdk'), { target: { value: '40' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(configUpdate).toHaveBeenCalledTimes(1));
+      expect(configUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sprintMaxTasks: {
+            sdk: 40,
+            interactive: SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+          },
+        }),
+      );
+    });
+
+    it('clamps an out-of-range entry and restores the default for a cleared field', async () => {
+      render(<Settings isOpen onClose={vi.fn()} initialTab="ai" />);
+      await screen.findByTestId('settings-session-settings');
+
+      fireEvent.change(screen.getByTestId('sprintMaxTasksSdk'), { target: { value: '9999' } });
+      fireEvent.change(screen.getByTestId('sprintMaxTasksInteractive'), { target: { value: '' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(configUpdate).toHaveBeenCalledTimes(1));
+      expect(configUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sprintMaxTasks: {
+            sdk: SPRINT_MAX_TASKS_MAX,
+            interactive: SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+          },
+        }),
+      );
+    });
   });
 
   // The two global launch defaults are the middle rung of

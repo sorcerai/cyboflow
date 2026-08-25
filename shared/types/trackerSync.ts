@@ -1,6 +1,6 @@
 /**
  * trackerSync — wire shapes for the external issue-tracker sync feature
- * (Settings → Integrations: Linear + Plane). Design: docs/proposals/
+ * (Settings → Integrations: Linear, Plane, Dart). Design: docs/proposals/
  * tracker-sync-integration.md.
  *
  * These types cross the IPC boundary (wizard/connected-view tRPC surface), so
@@ -11,8 +11,9 @@
  * exactly once at connect time; no shape in this file ever carries the stored
  * key back to the renderer.
  */
+import type { EntityCategory, Priority } from './tasks';
 
-export type TrackerProvider = 'linear' | 'plane';
+export type TrackerProvider = 'linear' | 'plane' | 'dart';
 
 /** Renderer→main, connect-time only. */
 export interface TrackerCredentialsInput {
@@ -22,6 +23,20 @@ export interface TrackerCredentialsInput {
   baseUrl?: string;
   /** Plane only: the workspace slug all API paths are scoped under. */
   workspaceSlug?: string;
+}
+
+/**
+ * Wizard probe credential source: exactly one of the two keys.
+ *
+ * `credentials` is the pasted-key path every pre-mapping-management wizard run
+ * takes. `connectionId` is the MANAGEMENT path — "add another mapping to this
+ * connection" — where the key already lives encrypted beside the connection and
+ * asking the user to paste it again would be a worse question than not asking:
+ * main resolves it from the named row, so nothing key-shaped crosses IPC at all.
+ */
+export interface TrackerWizardSourceInput {
+  credentials?: TrackerCredentialsInput;
+  connectionId?: string;
 }
 
 /** Result of a successful credential validation ("Authorized as …" card). */
@@ -45,7 +60,13 @@ export interface TrackerSourceContainer {
   openIssueCount: number | null;
 }
 
-export type TrackerNarrowKind = 'all' | 'project' | 'view' | 'cycle' | 'module';
+/**
+ * The second-level scope on a source selection. `'space'` is Dart's and only
+ * Dart's: a space is the dartboard-title prefix before the first '/', which no
+ * endpoint enumerates, so the adapter resolves the member boards from `/config`
+ * at call time and unions the per-board fetches.
+ */
+export type TrackerNarrowKind = 'all' | 'project' | 'view' | 'cycle' | 'module' | 'space';
 
 export interface TrackerSourceNarrow {
   id: string;
@@ -65,6 +86,48 @@ export interface TrackerSourceSelection {
   containerId: string;
   narrowId: string;
   narrowKind: TrackerNarrowKind;
+  /**
+   * Where a CREATE lands when the selection itself is not a concrete container
+   * — Dart space groups, whose `containerId` is a space name no create can be
+   * filed against. Absent everywhere else, since every other selection's
+   * container is already the level the provider files an issue at.
+   */
+  pushContainerId?: string;
+}
+
+/**
+ * One row of the wizard's Map step: a tracker GROUPING that can be mapped onto
+ * a cyboflow project. The grouping unit is provider-defined — Linear projects
+ * (each paired with a team) plus whole teams, Plane projects, Dart spaces — and
+ * the group carries its READY-MADE `selection`, so nothing downstream has to
+ * know which provider produced it.
+ */
+export interface TrackerGroup {
+  /** Stable within one tree; the Map step's row key, never persisted. */
+  id: string;
+  name: string;
+  /** Short key chip (Linear team key, Plane project identifier); null when none. */
+  key: string | null;
+  /** The `sourceLabel` a connection minted from this group is persisted with. */
+  sourceLabel: string;
+  selection: TrackerSourceSelection;
+  /**
+   * Groups sharing this key share a state list, so the States step renders one
+   * mapping table per distinct value (Linear states are per-team, Plane's
+   * per-project, Dart's workspace-wide).
+   */
+  stateScopeKey: string;
+}
+
+/** A labelled band of groups in the Map step ("Projects", "Whole teams", …). */
+export interface TrackerGroupSection {
+  label: string;
+  groups: TrackerGroup[];
+}
+
+/** Everything `listGroups` offers, in the order the Map step renders it. */
+export interface TrackerGroupTree {
+  sections: TrackerGroupSection[];
 }
 
 /**
@@ -89,11 +152,92 @@ export interface TrackerState {
   group: TrackerStateGroup;
 }
 
-/** Mapping target: cyboflow's four writable stages, or don't-import. */
-export type TrackerMappingTarget = 'dont' | 'idea' | 'ready' | 'done' | 'wontdo';
+/**
+ * Mapping target: cyboflow's four writable stages, don't-import, or the
+ * OUTBOUND-ONLY `'indev'`.
+ *
+ * `'indev'` is deliberately asymmetric and the UI says so ("In development
+ * (one way)"). Position 7 'In development' is orchestrator-DERIVED — a tracker
+ * actor writing it is rejected by TaskChangeRouter as 'forbidden_stage' — so
+ * this target can never place an issue there on the way IN, and inbound treats
+ * it exactly like `'dont'`. What it DOES do is pin the way OUT: it names which
+ * provider state a task entering In development writes back to, replacing the
+ * "first state in the `started` group" guess. That guess is fine where the
+ * provider declares its own state groups (Linear, Plane) and much weaker where
+ * the adapter has to infer them from state NAMES (Dart), which is why the pin
+ * exists at all.
+ */
+export type TrackerMappingTarget = 'dont' | 'idea' | 'ready' | 'done' | 'wontdo' | 'indev';
 
 /** Per-connection state mapping, keyed by tracker state id. */
 export type TrackerStateMapping = Record<string, TrackerMappingTarget>;
+
+/**
+ * What one provider offers for the two MAPPED fields — the seed source for
+ * `priorityMapping` / `categoryMapping` and, from Phase 6, the wizard's value
+ * pickers.
+ *
+ * `null` means "no live list to discover": either the provider's scale is
+ * STATIC and hard-coded in the adapter, or it has no such field at all. Both
+ * read the same way to a caller — there is nothing to fetch and nothing to
+ * re-confirm after a workspace edit — which is why they share one value rather
+ * than being distinguished here.
+ *
+ * Today Linear and Plane return their fixed priority scales (non-null, but
+ * constant) with `categories: null`; Dart returns the live `/config.priorities`
+ * and `/config.types` lists, which a workspace owner can rename at any time.
+ */
+export interface TrackerFieldOptions {
+  /** Provider-raw priority tokens, in the provider's own order. */
+  priorities: string[] | null;
+  /** Provider-raw type/category titles; null where the provider has no such field. */
+  categories: string[] | null;
+  /**
+   * The seeded priority mapping for this provider's `priorities` above,
+   * computed main-side (`priorityMapping.ts`'s `seedDefaultPriorityMapping`) so
+   * the wizard never re-derives the seed table client-side. The Phase-6
+   * mapping picker's initial values, before any edit.
+   */
+  defaultPriorityMapping: TrackerPriorityMapping;
+  /** Same as `defaultPriorityMapping`, for `categories` (`categoryMapping.ts`). */
+  defaultCategoryMapping: TrackerCategoryMapping;
+}
+
+/**
+ * A connection's resolved priority mapping, mirroring the main-side
+ * `PriorityMapping` (priorityMapping.ts) across the wizard/connected-view IPC
+ * boundary. `toProvider[p] === null` means the level has no provider token to
+ * send (see the main-side module header); `toLocal` is keyed by the
+ * lowercased provider token.
+ */
+export interface TrackerPriorityMapping {
+  toProvider: Record<Priority, string | null>;
+  toLocal: Record<string, Priority>;
+}
+
+/** A connection's resolved category mapping, mirroring `CategoryMapping` (categoryMapping.ts). */
+export interface TrackerCategoryMapping {
+  toProvider: Record<EntityCategory, string | null>;
+  toLocal: Record<string, EntityCategory>;
+}
+
+/**
+ * The wizard's edited priority-mapping OVERLAY (migration 118's
+ * `priority_mapping_json`) — `toProvider` only. `toLocal` is deliberately
+ * never sent: the wizard's picker edits only which provider token each local
+ * level sends, and the resolver (`resolveEffectivePriorityMapping`) falls back
+ * to the seed's own `toLocal` when the overlay omits it — which is exactly
+ * the canonical inbound table the picker was seeded from, so there is nothing
+ * for the wizard to re-derive or re-send.
+ */
+export interface TrackerPriorityMappingOverlay {
+  toProvider: Partial<Record<Priority, string | null>>;
+}
+
+/** Same shape as {@link TrackerPriorityMappingOverlay}, for the category mapping. */
+export interface TrackerCategoryMappingOverlay {
+  toProvider: Partial<Record<EntityCategory, string | null>>;
+}
 
 export interface TrackerUserRef {
   id: string;
@@ -124,6 +268,33 @@ export interface TrackerIssue {
   updatedAt: string;
   /** Remote archive marker (Linear archivedAt); null = live. */
   archivedAt: string | null;
+  /**
+   * The remote priority as the PROVIDER spells it: Linear `'0'..'4'` (`'0'` is
+   * a real "No priority" value, never an absence), Plane
+   * `urgent|high|medium|low|none`, Dart the workspace's own priority title
+   * (`Critical`/`High`/…). null only where the provider genuinely carries none
+   * — Dart OMITS the key entirely for an unprioritized task, which reads back
+   * here as null.
+   *
+   * DELIBERATELY PROVIDER-RAW rather than a local {@link
+   * import('./tasks').Priority}: the local scale is 7 levels and every provider
+   * offers 4-5, so mapping on the way in and comparing in local space would flap
+   * a user's P3 down to P2 on every pass. The mapping (priorityMapping.ts) is
+   * applied only at the merge/compose edge; the baseline stores this same raw
+   * token so the three-way diff runs entirely in provider space.
+   */
+  priority: string | null;
+  /**
+   * The remote issue's TYPE, where the provider models one that can carry
+   * cyboflow's entity category (feature/bug/chore) — Dart's task type title.
+   *
+   * ALWAYS null on Linear and Plane: neither has a native type field, and label
+   * emulation is explicitly out of scope, so "unsupported by this provider" and
+   * "this issue has no type" are the same value here. The merge reads that as
+   * ABSENT rather than as a cleared category — see the category arm's provider
+   * gate in inboundSync.ts.
+   */
+  category: string | null;
   /**
    * The `cyboflow-sync` recovery marker found in the provider-native
    * description, surfaced BEFORE the adapter strips it; null when the issue
@@ -158,6 +329,28 @@ export type TrackerConnectionStatus = 'active' | 'paused' | 'disconnected';
  *  - pushMode: NEW cyboflow ideas creating top-level tracker issues
  */
 export type TrackerDirectionMode = 'auto' | 'manual';
+
+/**
+ * Per-connection cadence for field write-back ("Sync task fields") and remote
+ * archive/trash (migration 118). A SEPARATE type from {@link
+ * TrackerDirectionMode} rather than a widening of it — deliberately: the
+ * existing three directions (status/pull/push) answer "auto or manual", never
+ * "never", and coupling a third value onto that pair would let an unrelated
+ * direction accidentally compile against 'off'. `'off'` is the default for
+ * both new modes: an existing connection never consented to writing derived
+ * field values, or archiving issues, into someone else's tracker workspace.
+ *
+ *  - `contentSyncMode`: title/description/priority/category, LINKED items,
+ *    OUTBOUND only.
+ *  - `archiveSyncMode`: a local archive/delete becomes a remote trash/archive
+ *    (never a hard delete).
+ *
+ * Unlike `TrackerDirectionMode`, `'off'` gates at the ENQUEUE rather than the
+ * drain (docs/proposals/tracker-field-writeback.md invariant 5) — a queued row
+ * under an 'off' direction would be undrainable even by "Sync now", which
+ * would permanently stall the inbound cursor.
+ */
+export type TrackerContentSyncMode = 'auto' | 'manual' | 'off';
 
 /** The three entity tables a tracker link can point at (mirrors EntityExternalLinkRow). */
 export type TrackerEntityType = 'idea' | 'epic' | 'task';
@@ -215,13 +408,25 @@ export interface TrackerConnectionSummary {
   baseUrl: string | null;
   /** Human label for the wizard's Step-1 choice, e.g. "Core · Cycle 12". */
   sourceLabel: string;
+  /** The mapping's source scope (parsed from source_json); null on legacy rows with no recorded scope. */
+  sourceScope: { containerId: string; narrowId: string; narrowKind: TrackerNarrowKind } | null;
   selectionMode: TrackerSelectionMode;
   statusSyncMode: TrackerDirectionMode;
   pullMode: TrackerDirectionMode;
   pushMode: TrackerDirectionMode;
+  /** Field write-back cadence (migration 118); 'off' on every pre-Phase-3 connection. */
+  contentSyncMode: TrackerContentSyncMode;
+  /** Remote archive/trash cadence (migration 118); 'off' on every pre-Phase-3 connection. */
+  archiveSyncMode: TrackerContentSyncMode;
   mirrorSubissues: boolean;
   conflictMode: TrackerConflictMode;
+  /** This mapping is the one its provider pushes new ideas through. */
+  pushTarget: boolean;
   stateMapping: TrackerStateMapping;
+  /** The connection's RESOLVED priority mapping (seed + stored overlay) — the mappings card's read-only count. */
+  priorityMapping: TrackerPriorityMapping;
+  /** Same, for category; `toProvider` is all-null on a provider `providerSupportsCategorySync` refuses. */
+  categoryMapping: TrackerCategoryMapping;
   lastSyncAt: string | null;
   lastSyncLog: TrackerSyncLogEntry[];
   /** Active (non-orphaned) entity links on this connection. */
@@ -244,8 +449,18 @@ export interface TrackerConflictSummary {
   id: number;
   connectionId: string;
   kind: TrackerConflictKind;
-  /** 'title' | 'description' | 'stage' on a field conflict; null on remote_deleted. */
+  /**
+   * 'title' | 'description' | 'stage' | 'priority' | 'category' on a field
+   * conflict; null on remote_deleted.
+   */
   field: string | null;
+  /**
+   * The two sides' values as the conflict recorded them. Content fields carry
+   * the literal text; a STAGE row's `remoteValue` is the MAPPED board stage id;
+   * a PRIORITY or CATEGORY row carries BOTH sides as PROVIDER-RAW tokens (the
+   * local side run through the effective mapping), because that is the space the
+   * comparison happened in — see TrackerIssue.priority.
+   */
   localValue: string | null;
   remoteValue: string | null;
   entityRef: string | null;
@@ -294,7 +509,12 @@ export interface TrackerSelectionJson {
 /** Everything the wizard's final Review step hands to `connect`. */
 export interface TrackerConnectPayload {
   projectId: number;
-  credentials: TrackerCredentialsInput;
+  credentials?: TrackerCredentialsInput;
+  /**
+   * Reuse an existing live connection's stored key + identity instead of pasting
+   * one. Exactly one of credentials / sourceConnectionId must be set.
+   */
+  sourceConnectionId?: string;
   source: TrackerSourceSelection;
   sourceLabel: string;
   selectionMode: TrackerSelectionMode;
@@ -303,9 +523,36 @@ export interface TrackerConnectPayload {
   statusSyncMode: TrackerDirectionMode;
   pullMode: TrackerDirectionMode;
   pushMode: TrackerDirectionMode;
+  /**
+   * Omitted = 'off', matching the column default — no wizard step offers this
+   * control yet (docs/proposals/tracker-field-writeback.md Phase 6), so every
+   * connect() call in this build takes the safe default rather than silently
+   * requiring a field the renderer does not send.
+   */
+  contentSyncMode?: TrackerContentSyncMode;
+  /** Omitted = 'off'; see contentSyncMode. */
+  archiveSyncMode?: TrackerContentSyncMode;
+  /**
+   * Omitted = the seed only, no user override (every pre-Phase-6 connect()
+   * call). The wizard's Phase-6 mapping table sends the edited `toProvider`
+   * table verbatim; see {@link TrackerPriorityMappingOverlay}.
+   */
+  priorityMapping?: TrackerPriorityMappingOverlay;
+  /**
+   * Omitted = the seed only; also omitted by the wizard for a provider
+   * `providerSupportsCategorySync` refuses (no editor renders for it).
+   */
+  categoryMapping?: TrackerCategoryMappingOverlay;
   mirrorSubissues: boolean;
   conflictMode: TrackerConflictMode;
   reconcile: TrackerReconcileDecision[];
+  /**
+   * May this mapping create new tracker issues? Omitted = true, which is the
+   * single-mapping shape every pre-rev-4 connection has. The Map step sets it
+   * false on every sibling but one where N groups target the same cyboflow
+   * project, so a locally filed idea is pushed once rather than N times.
+   */
+  pushTarget?: boolean;
 }
 
 /**
@@ -316,6 +563,12 @@ export interface TrackerSettingsPatch {
   statusSyncMode?: TrackerDirectionMode;
   pullMode?: TrackerDirectionMode;
   pushMode?: TrackerDirectionMode;
+  contentSyncMode?: TrackerContentSyncMode;
+  archiveSyncMode?: TrackerContentSyncMode;
+  /** See {@link TrackerConnectPayload.priorityMapping}; no v1 UI patches this yet (mirrors stateMapping below). */
+  priorityMapping?: TrackerPriorityMappingOverlay;
+  /** See {@link TrackerConnectPayload.categoryMapping}. */
+  categoryMapping?: TrackerCategoryMappingOverlay;
   mirrorSubissues?: boolean;
   conflictMode?: TrackerConflictMode;
   stateMapping?: TrackerStateMapping;
@@ -329,4 +582,13 @@ export interface TrackerEntityLinkRef {
   provider: TrackerProvider;
   externalUrl: string | null;
   externalIdentifier: string | null;
+  /**
+   * What a removal ruling's "cancel it in the tracker" would ACTUALLY do to
+   * this issue: the provider's trash/archive, or the cancelled-state fallback
+   * (provider has no archive, OR the connection's archive sync is 'off' — an
+   * archive row would be undrainable there, so the fallback is forced). The
+   * removal dialog's copy is built from this so it promises exactly the action
+   * the service enqueues.
+   */
+  removalAction: 'archive' | 'cancel';
 }

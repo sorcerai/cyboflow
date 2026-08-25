@@ -195,6 +195,18 @@ describe('ClaudeJudge', () => {
     );
   });
 
+  it('reports the PRE-truncation diff size so the boundary can stretch its deadline', async () => {
+    const fake: EvalStructuredQueryFn = vi.fn(async () => ({
+      verdicts: [{ id: 'COR-1', verdict: 'PASS', evidence: '' }],
+    }));
+    const judge = new ClaudeJudge({ structuredQuery: fake });
+    const oversized = 'x'.repeat(MAX_DIFF_CHARS + 5_000);
+    await judge.grade({ diff: oversized, gateResults: null });
+    expect(fake).toHaveBeenCalledWith(
+      expect.objectContaining({ diffChars: oversized.length }),
+    );
+  });
+
   it('propagates a throw from a malformed structured output (worker retries)', async () => {
     const fake: EvalStructuredQueryFn = vi.fn(async () => ({ verdicts: [] }));
     const judge = new ClaudeJudge({ structuredQuery: fake });

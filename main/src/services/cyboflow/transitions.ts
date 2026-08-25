@@ -142,11 +142,24 @@ export function transitionToAwaitingReview(
         SET status = 'awaiting_review', updated_at = CURRENT_TIMESTAMP
       WHERE id = @runId AND status = 'running'`,
   );
+  // created_at is written EXPLICITLY as an ISO-8601 string rather than left to
+  // the column's `DEFAULT CURRENT_TIMESTAMP`. The two disagree on format —
+  // CURRENT_TIMESTAMP yields 'YYYY-MM-DD HH:MM:SS' (space separator, no
+  // fractional seconds, no zone) while every other approval writer, and every
+  // consumer that compares against one, uses new Date().toISOString()
+  // ('YYYY-MM-DDTHH:MM:SS.sssZ'). Because ' ' (0x20) sorts below 'T' (0x54),
+  // a row in the space form compares as OLDER than any same-date ISO cutoff,
+  // whatever the actual clock times are. StuckDetector's stale scan is a
+  // string comparison against exactly such a cutoff, so a row written here was
+  // classified stale the instant it was created and its run stamped 'stuck' —
+  // the 45-minute threshold never applied to this writer at all. Keep this
+  // column in one format; StuckDetector normalizes with unixepoch() as a belt
+  // for rows that predate this fix.
   const insertApproval = db.prepare(
     `INSERT INTO approvals
-       (id, run_id, tool_name, tool_input_json, tool_use_id, rationale, status)
+       (id, run_id, tool_name, tool_input_json, tool_use_id, rationale, status, created_at)
      VALUES
-       (@approvalId, @runId, @toolName, @toolInputJson, @toolUseId, @rationale, 'pending')`,
+       (@approvalId, @runId, @toolName, @toolInputJson, @toolUseId, @rationale, 'pending', @createdAt)`,
   );
 
   const tx = db.transaction((p: TransitionToAwaitingReviewParams) => {
@@ -165,6 +178,7 @@ export function transitionToAwaitingReview(
       toolInputJson: p.toolInputJson,
       toolUseId: p.toolUseId,
       rationale: p.rationale,
+      createdAt: new Date().toISOString(),
     });
   });
 

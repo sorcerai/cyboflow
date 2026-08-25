@@ -454,7 +454,7 @@ export interface OmpAvailableCommandsUpdateEvent {
  * rpc.md:589-594. Arrives even under `--no-extensions` (built-ins emit
  * `setWidget`), so it MUST be tolerated. Blocking kinds (`select`, `confirm`,
  * `input`, `editor`) expect an {@link OmpExtensionUiResponse}; answering them is
- * `ompApprovalBridge`'s job, not this transport's.
+ * `ompApprovalBridge` / `ompQuestionBridge`'s job, not this transport's.
  *
  * `title` / `message` / `options` are the three payload fields the bridge reads:
  * `select` carries `title` + `options` (rpc-types.ts:373), `confirm` carries

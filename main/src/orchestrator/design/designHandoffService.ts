@@ -45,6 +45,7 @@ import {
 import { selectTaskById } from '../taskListing';
 import type { TaskChangedEvent } from '../../../../shared/types/tasks';
 import { coWriteIdeaBodyReplace } from './entityBodyFold';
+import { IdeaComponentRouter } from '../ideaComponents/ideaComponentRouter';
 
 // ---------------------------------------------------------------------------
 // Public API shapes
@@ -241,6 +242,77 @@ function codeFromError(error: string | null): DesignApproveCode {
   ];
   const prefix = (error ?? '').split(':', 1)[0]?.trim() ?? '';
   return (known as string[]).includes(prefix) ? (prefix as DesignApproveCode) : 'link-broken';
+}
+
+// ---------------------------------------------------------------------------
+// Post-commit idea-component ledger stamp (the two-prototype-pathway
+// convergence fix — migration 101 / shared/types/ideaComponents.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Once a design approval reaches `complete`, stamp the idea's `prototype`
+ * ledger component `complete` through `IdeaComponentRouter.applyChange`. The
+ * whole point of the ledger is that it is the ONE record both the planner's
+ * ui-prototype step and design mode converge on (shared/types/ideaComponents.ts
+ * file header) — without this stamp, design mode never wrote it at all, so
+ * convergence rested entirely on `approved_designs` DERIVATION, and
+ * derivation is masked outright the moment any `prototype` row exists (a
+ * ledger row always wins over derivation). Concretely: an idea planned once
+ * has `prototype`=complete (source 'flow'); an idea body edit flips it
+ * stale+incomplete via taskChangeRouter.ts's staleness hook; a user then
+ * iterates in design mode and approves a NEW design — without this stamp the
+ * ledger would keep reading "needs review" forever, even though the
+ * freshly-approved design is exactly the re-verification that hook was
+ * waiting for. `set-component-state` is an UPSERT that always clears
+ * `stale_at`/`stale_reason` as a side effect (an explicit stamp is a
+ * reviewed judgment — see the op's own JSDoc), which is exactly the fix.
+ *
+ * Placement mirrors the precedent set by that same staleness hook
+ * (taskChangeRouter.ts's post-commit block): called strictly AFTER the
+ * publish transaction below has committed, never from inside it —
+ * `IdeaComponentRouter` keys its own per-project PQueue + transaction, and
+ * calling it from inside an already-open transaction risks a nested/re-
+ * entrant write the driver does not support. Best-effort and fail-soft in a
+ * real try/catch (NOT a bare `.catch()` on the returned promise) because
+ * `IdeaComponentRouter.getInstance()` THROWS SYNCHRONOUSLY when the
+ * singleton was never initialized (e.g. every existing unit test in this
+ * file, which never calls `IdeaComponentRouter.initialize()`) — a `.catch()`
+ * chained onto a call that never returns a promise would not catch that. A
+ * ledger write failure must never fail or roll back an approval whose
+ * `approved_designs` row and `state='complete'` transition already
+ * committed.
+ *
+ * Idempotent across the state machine's re-approve / crash-recovery
+ * retries: this only runs on an ACTUAL folded -> complete transition — the
+ * guarded UPDATE inside `runPublishStep` advances a given handoff row at
+ * most once, and every later call (a re-approve of an already-`complete`
+ * handoff, or `driveHandoffForward` resuming a `complete` row after a
+ * restart) short-circuits to the `case 'complete'` terminal without ever
+ * re-entering `runPublishStep`. `set-component-state` is itself an UPSERT,
+ * so even a hypothetical duplicate call would just re-affirm the same
+ * complete state rather than misbehave.
+ */
+async function stampPrototypeComplete(deps: DesignHandoffDeps, handoff: DesignHandoffRow): Promise<void> {
+  try {
+    const session = loadSession(deps.db, handoff.session_id);
+    const idea = loadIdea(deps.db, handoff.idea_id);
+    await IdeaComponentRouter.getInstance().applyChange(handoff.project_id, {
+      op: 'set-component-state',
+      ideaId: handoff.idea_id,
+      component: 'prototype',
+      state: 'complete',
+      source: 'flow',
+      sourceRunId: session?.chat_run_id ?? null,
+      sourceSessionId: handoff.session_id,
+      builtAgainstVersion: idea?.version ?? null,
+    });
+  } catch (err) {
+    deps.logger?.warn('[designHandoff] idea-component ledger stamp failed (approval already committed)', {
+      handoffId: handoff.id,
+      ideaId: handoff.idea_id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +534,11 @@ export async function runPublishStep(deps: DesignHandoffDeps, handoff: DesignHan
     if (!(err instanceof HandoffTxnAbort)) throw err;
   }
 
-  return raced ? { kind: 'raced' } : { kind: 'advanced' };
+  if (raced) return { kind: 'raced' };
+  // Post-commit ledger stamp — see stampPrototypeComplete's own JSDoc for the
+  // full placement/idempotency/fail-soft rationale.
+  await stampPrototypeComplete(deps, handoff);
+  return { kind: 'advanced' };
 }
 
 /**

@@ -230,7 +230,16 @@ per-item review-queue spam):
 
 Between them, Compound applies every approved change and commits — it emits no
 review-queue items. On Approve the branch is mergeable and **you merge it
-yourself**; on Reject the committed changes are left as they stand.`,
+yourself**; on Reject the committed changes are left as they stand.
+
+## When to reach for it
+
+Reach for Compound after merging a meaningful batch of work, or when open
+findings have piled up in the review queue. A Compound run seeded from the
+Insights triage tray — or launched with the pending findings as
+\`findingIds\` — turns that pile into durable improvements (a quick fix, a doc
+edit, a follow-up task) instead of leaving it as unresolved noise you keep
+scrolling past.`,
   },
 
   'ship-flow': {

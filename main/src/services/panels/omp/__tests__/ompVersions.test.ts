@@ -5,6 +5,7 @@ import {
   OMP_MIN_SUPPORTED_VERSION,
   OMP_TESTED_VERSION,
   parseOmpVersion,
+  supportsConfigurableHandlerTimeout,
 } from '../ompVersions';
 
 describe('parseOmpVersion', () => {
@@ -71,5 +72,30 @@ describe('evaluateOmpVersionPolicy', () => {
 
   it('accepts AND flags a version newer than tested — never refuses it', () => {
     expect(evaluateOmpVersionPolicy('omp/99.0.0')).toEqual({ ok: true, aboveTested: true });
+  });
+});
+
+describe('supportsConfigurableHandlerTimeout', () => {
+  it('accepts the release that introduced the setting and everything after', () => {
+    // 17.3.5: "Made extension tool-call timeouts configurable and paused them
+    // during user dialogs" — the exact release, read off the shipped binary's
+    // own changelog rather than inferred.
+    expect(supportsConfigurableHandlerTimeout('17.3.5')).toBe(true);
+    expect(supportsConfigurableHandlerTimeout('omp/17.3.5')).toBe(true);
+    expect(supportsConfigurableHandlerTimeout('17.4.0')).toBe(true);
+    expect(supportsConfigurableHandlerTimeout('18.0.0')).toBe(true);
+  });
+
+  it('refuses every release that still hard-caps handlers at 30s', () => {
+    // These accept the setting into config and ignore it. Raising cyboflow's
+    // budget against one of them would make the gate outlive the handler.
+    expect(supportsConfigurableHandlerTimeout('17.3.4')).toBe(false);
+    expect(supportsConfigurableHandlerTimeout('17.3.2')).toBe(false);
+    expect(supportsConfigurableHandlerTimeout('17.2.9')).toBe(false);
+  });
+
+  it('refuses unparseable output rather than assuming support', () => {
+    expect(supportsConfigurableHandlerTimeout('')).toBe(false);
+    expect(supportsConfigurableHandlerTimeout('unknown')).toBe(false);
   });
 });

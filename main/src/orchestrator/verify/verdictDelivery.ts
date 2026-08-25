@@ -51,7 +51,8 @@ import { ReviewItemRouter } from '../reviewItemRouter';
 import { applyMergeGateVerdict, isMergeGateBlocking, resolveLaneAttempts } from './mergeGateLaneAdvance';
 import type { DatabaseLike, LoggerLike } from '../types';
 import type { CapabilityBreakerFindingFn, OnVerdict } from './verificationScheduler';
-import { VERIFY_NO_RUNBOOK_REASON } from './verificationScheduler';
+import { VERIFY_NO_RUNBOOK_REASON, runbookDeclineForSkipReason } from './verificationScheduler';
+import { bootstrapRemedyText } from './bootstrapEligibility';
 import type {
   CaptureOrigin,
   VerdictV1,
@@ -140,6 +141,40 @@ function readRequestColumns(db: DatabaseLike, requestId: string, logger?: Logger
       error: err instanceof Error ? err.message : String(err),
     });
     return { reportJson: null, taskJson: null, enqueueKey: null, errorMessage: null };
+  }
+}
+
+/**
+ * Is this request a LANE-DRIVEN bootstrap proof (migration 107)?
+ *
+ * WHY THE DELIVERY HAS TO ASK. A bootstrap proof is fired by the controller to
+ * prove a freshly-derived runbook, and it carries the RUNBOOK's build/serve with
+ * NO lane behaviors — it is not a judgment about any lane's diff. Letting it
+ * reach the merge gate would therefore charge a lane's implement-retry budget for
+ * a runbook defect, or integrate a lane on a verdict that never looked at its
+ * acceptance criteria. Neither is recoverable after the fact, so the exclusion
+ * lives here, in the ONE place every terminal passes through.
+ *
+ * KEYED ON THE COLUMN, NEVER ON AN ABSENT taskRef. `resolveLaneForVerdict` falls
+ * back to the sole lane of a single-lane run, so a ref-less proof would still be
+ * attributed to that lane — which is exactly the common case (a one-task sprint
+ * bootstrapping its project).
+ *
+ * Fail-soft to `false` on a pre-105 DB or a read error: such a DB cannot contain
+ * a bootstrap row, so `false` is the truth rather than a guess.
+ */
+function readBootstrapProof(db: DatabaseLike, requestId: string, logger?: LoggerLike): boolean {
+  try {
+    const row = db
+      .prepare('SELECT bootstrap_proof AS bootstrapProof FROM verification_requests WHERE id = ?')
+      .get(requestId) as { bootstrapProof?: unknown } | undefined;
+    return row?.bootstrapProof === 1 || row?.bootstrapProof === true;
+  } catch (err) {
+    logger?.debug('[verdictDelivery] bootstrap_proof unavailable (fail-soft: ordinary request)', {
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
   }
 }
 
@@ -369,11 +404,22 @@ function buildFindingText(args: {
     ];
     if (errorMessage) parts.push(`Reason: ${errorMessage}`);
     parts.push(...renderClassification(classification));
-    // The §3.2 degrade path is the ONE skip reason with a direct human remedy —
-    // everything else above is "the harness could not", this one is "the project
-    // was never set up". Phase 2 turns this sentence into a launch affordance for
-    // the verification-setup flow; the wording stays generic until then.
-    if (errorMessage === VERIFY_NO_RUNBOOK_REASON) {
+    // The §3.2 degrade path is the ONE family of skip reasons with a direct human
+    // remedy — everything else above is "the harness could not", this one is
+    // "something about this project's verification setup needs your attention".
+    //
+    // WHICH remedy is not cosmetic. "No proven runbook" and "a proven runbook
+    // that is not in THIS branch" both skip the request, but the actions are
+    // mutually exclusive: running verification setup on the second one derives a
+    // fresh runbook and UPSERTs it over the proven singleton record every other
+    // branch shares (lane-runbook-bootstrap.md §4). So the reason is mapped back
+    // to its situation and the situation picks the sentence, rather than one
+    // catch-all CTA being attached to every runbook-shaped skip.
+    const runbookDecline = runbookDeclineForSkipReason(errorMessage);
+    const remedy = runbookDecline === null ? null : bootstrapRemedyText(runbookDecline);
+    if (remedy !== null) {
+      parts.push(remedy);
+    } else if (errorMessage === VERIFY_NO_RUNBOOK_REASON) {
       parts.push(
         'Run verification setup for this project to enable visual verification. Until a verification runbook has been derived AND proven by an actual run, requests that need the deliverable built or served are skipped rather than guessed at.',
       );
@@ -708,6 +754,22 @@ export function createVerdictDelivery(deps: VerdictDeliveryDeps): OnVerdict {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    // ---- 1b. BOOTSTRAP PROOF: evidence only, never a lane verdict (mig 105) ----
+    // Everything above this point is EVIDENCE (screenshots + the report entry), and
+    // a bootstrap proof earns that like any other run — its captures are exactly
+    // what makes a failed bootstrap diagnosable. Everything BELOW is lane POLICY:
+    // driving the lane off awaiting-verify, superseding that lane's prior findings,
+    // and filing a finding attributed to it. None of that is this request's to do;
+    // the controller that fired it owns its outcome, synchronously, via awaitTerminal.
+    if (readBootstrapProof(db, requestId, logger)) {
+      logger?.debug('[verdictDelivery] bootstrap proof terminal — evidence merged, lane untouched', {
+        runId,
+        requestId,
+        status,
+      });
+      return allOk;
     }
 
     // ---- 2. MERGE-GATE: drive the sprint lane off `awaiting-verify` ----

@@ -11,8 +11,18 @@ node_modules/
 
 # Build outputs
 dist/
-build/
-!build/entitlements.mac.plist
+# /build/* (not build/) so the negations below can work — git cannot re-include
+# files under an excluded DIRECTORY. The electron-builder hooks + their tests
+# are SOURCE, not build output; without these negations a plain `git add`
+# silently skips them (afterSign.js was historically force-added; a fresh clone
+# missing verifyArtifact.js would fail the build resolving the registered
+# artifactBuildCompleted hook).
+/build/*
+!/build/entitlements.mac.plist
+!/build/afterSign.js
+!/build/afterSign.test.js
+!/build/verifyArtifact.js
+!/build/verifyArtifact.test.js
 *.tsbuildinfo
 dist-electron/
 main/dist/
@@ -123,3 +133,6 @@ shared/*.d.ts
 shared/*.d.ts.map
 .cyboflow/worktrees/
 frontend/dist-harness/
+
+# Perf profiling artifacts (scripts/profile-electron.mjs)
+.perf/

@@ -40,6 +40,7 @@ import {
   updateSessionAgentPermissionMode,
   type SessionAgentPermissionModeDeps,
 } from './sessionPermissionMode';
+import { assertIdeaNotBusy } from './ideaBusy';
 
 /**
  * Provides the Unix socket path that the orchestrator IPC server listens on.
@@ -124,6 +125,22 @@ export interface SprintLanesLike {
   ): { batchId: string };
 }
 
+/**
+ * Narrow SessionManager slice used to make a raw `sessions` UPDATE visible to
+ * the renderer: `refreshSessionFromDatabase` re-maps the row into the runtime
+ * cache and emits `session-updated`. A raw UPDATE alone never reaches the UI.
+ *
+ * Injected as a structural interface (not the concrete SessionManager) to
+ * preserve the standalone-typecheck invariant — same shape/rationale as
+ * TaskStageDeriverLike and SprintLanesLike above. Optional: legacy call sites
+ * and the constructor-injection tests omit it, and the origin-lineage stamp
+ * simply lands without an immediate emit (the sidebar picks it up on the next
+ * session read).
+ */
+export interface SessionRefresherLike {
+  refreshSessionFromDatabase(sessionId: string): unknown;
+}
+
 export class RunLauncher {
   constructor(
     private readonly db: DatabaseLike,
@@ -177,6 +194,14 @@ export class RunLauncher {
      * baseline live-spec run, byte-identical to before.
      */
     private readonly variantResolver?: VariantResolver,
+    /**
+     * Optional session-refresh seam (idea sessions, migration 114). When
+     * injected AND a launch carries a SINGULAR seed idea, the launcher stamps
+     * `sessions.origin_idea_id` on the host session and refreshes it so the
+     * sidebar regroups the new session under the idea immediately. When absent
+     * the stamp still lands; only the immediate emit is skipped.
+     */
+    private readonly sessionRefresher?: SessionRefresherLike,
   ) {
     // Legacy-bridge collaborators are required only when no runExecutor is
     // supplied.  Under the SDK substrate, the PreToolUse hook gates permissions
@@ -340,6 +365,14 @@ export class RunLauncher {
       // planner-only ideaIds guard). RunExecutor.getPrompt reads this column to
       // inject the `# What you are building` block.
       seedPrompt?: string;
+      // Idea-session lineage for a launch whose SEED is not an idea (e.g. the
+      // idea canvas's "Launch sprint" tile, seeded with taskIds). Carries only
+      // the origin_idea_id session stamp + the max-one-running-per-idea guard —
+      // NO seed semantics: workflow_runs.seed_idea_id stays untouched, so the
+      // run's prompt never grows a `# Selected idea` block. When a singular
+      // ideaId seed is also present it wins (they should never disagree; the
+      // seed path already stamps).
+      originIdeaId?: string;
     },
     // The user's explicit per-run AGENT PROVIDER/RUNTIME choice. Omitted means
     // createRun keeps the Claude defaults; codex-sdk is stored as provider/runtime
@@ -396,6 +429,35 @@ export class RunLauncher {
       if (ideaIds.length < 1) {
         throw new Error('ideaIds must contain at least one idea id');
       }
+    }
+
+    // The SINGULAR seed idea for this launch, or undefined when there is none
+    // (no idea seed at all, or a multi-idea `ideaIds` batch). A batch dual-writes
+    // seed_idea_id = ideaIds[0], which is LOSSY: treating it as singular would
+    // mis-assign the whole batch to idea #1. Both idea-scoped behaviours below —
+    // the max-one-running guard and the origin-lineage stamp — key off this, so a
+    // batch launch is exempt from each (idea sessions plan, Stage 1).
+    const singularSeedIdeaId = ideaIds === undefined || ideaIds.length === 0 ? ideaId : undefined;
+
+    // Max-one-running-per-idea (idea sessions plan, Stage 1 "hard rule"): reject
+    // a singular idea-seeded launch while that idea already has a run in flight
+    // or a session mid-turn. Checked HERE — before createRun — so a rejection
+    // never leaves a half-created run row behind. Throws a structured
+    // IdeaBusyError (code 'idea_busy') the caller surfaces as a toast; the idea
+    // canvas greys the same tiles from the same signal, and this is the backstop
+    // for a stale/scripted caller that never saw the greying.
+    if (singularSeedIdeaId !== undefined) {
+      assertIdeaNotBusy(this.db, singularSeedIdeaId);
+    }
+
+    // The non-seed lineage variant of the same guard: a taskIds-seeded sprint
+    // launched FROM an idea canvas carries originIdeaId instead of an idea seed,
+    // and must respect the same max-one-running rule (its origin stamp below is
+    // what makes the canvas grey / the sidebar nest, so the guard and the stamp
+    // key off the same id). Skipped when it duplicates the singular seed.
+    const originIdeaId = launchOptions?.originIdeaId;
+    if (originIdeaId !== undefined && originIdeaId !== singularSeedIdeaId) {
+      assertIdeaNotBusy(this.db, originIdeaId);
     }
 
     // Launch pre-launch seed-prompt validation (migration 100) — BEFORE createRun
@@ -619,6 +681,37 @@ export class RunLauncher {
         this.db
           .prepare('UPDATE workflow_runs SET seed_idea_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
           .run(JSON.stringify(ideaIds), runId);
+      }
+
+      // Idea-session nesting lineage (migration 114). A SINGULAR idea-seeded
+      // launch records which idea minted this host session so the sidebar can
+      // nest it under that idea's home session. `AND origin_idea_id IS NULL`
+      // makes it first-writer-wins: a session that hosts several runs over its
+      // life keeps the origin of the launch that created it. Multi-idea batches
+      // are deliberately excluded (see singularSeedIdeaId above) — they stay
+      // ungrouped rather than all landing under idea #1.
+      //
+      // Fail-soft: lineage is presentation, not correctness. A pre-112 schema
+      // (or any write failure) must never abort a launch that is otherwise fine.
+      // `?? originIdeaId`: the taskIds-seeded sprint path (idea canvas "Launch
+      // sprint") has no idea seed but the same lineage — stamp from the explicit
+      // launch option instead. Seed wins when both are present.
+      const lineageIdeaId = singularSeedIdeaId ?? originIdeaId;
+      if (lineageIdeaId !== undefined) {
+        try {
+          const stamped = this.db
+            .prepare('UPDATE sessions SET origin_idea_id = ? WHERE id = ? AND origin_idea_id IS NULL')
+            .run(lineageIdeaId, sessionId);
+          // Raw UPDATEs never reach the renderer; refresh so the sidebar regroups now.
+          if (stamped.changes > 0) this.sessionRefresher?.refreshSessionFromDatabase(sessionId);
+        } catch (err) {
+          this.logger.warn('RunLauncher: origin_idea_id lineage stamp failed (best-effort)', {
+            runId,
+            sessionId,
+            ideaId: lineageIdeaId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
 
       // Parallel-sprint lane seeding (feat/parallel-sprint, migration 022).

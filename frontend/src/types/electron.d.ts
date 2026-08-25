@@ -11,6 +11,7 @@ import type { PermissionMode } from '../../../shared/types/workflows';
 import type { UnifiedMessage } from '../../../shared/types/unifiedMessage';
 import type { QuickSessionRow } from '../../../shared/types/quickSessions';
 import type { SessionSummaryPayload } from '../../../shared/types/sessionSummary';
+import type { OpenIdeaSessionRequest, OpenIdeaSessionResponse } from '../../../shared/types/ideaSession';
 import type {
   BugReportPreview,
   BugReportRunLink,
@@ -77,6 +78,13 @@ interface IPCResponse<T = unknown> {
    * dual declaration in frontend/src/utils/api.ts.
    */
   needsRebase?: boolean;
+  /**
+   * Set by the merge handlers when the branch had NOTHING left to merge — its
+   * work is already in main, almost always because the agent merged it in chat.
+   * Not a failure: the dialog offers Mark complete instead of an error. Keep in
+   * sync with the dual declaration in frontend/src/utils/api.ts.
+   */
+  alreadyUpToDate?: boolean;
 }
 
 // IPCDataResponse<T> is like IPCResponse<T> but with data required (non-optional).
@@ -135,6 +143,13 @@ interface ElectronAPI {
     // callers must then SKIP their own claude createPanel. KEEP IN SYNC with the
     // sessions:create-quick handler (IPC handler ↔ declared T parity rule).
     createQuick: (request: CreateSessionRequest) => Promise<IPCResponse<{ jobId: string; sessionId: string; worktreePath: string; runId: string; claudePanelId?: string }>>;
+    /**
+     * Backlog idea card "Open" — find-or-create the idea's ONE persistent,
+     * in-place, SDK-pinned home session, plus a REGISTERED (never started) Chat
+     * panel. Shapes come from shared/types/ideaSession.ts, the same declaration
+     * main/src/preload.ts and the handler use.
+     */
+    openIdeaSession: (request: OpenIdeaSessionRequest) => Promise<IPCResponse<OpenIdeaSessionResponse>>;
     delete: (sessionId: string) => Promise<IPCResponse<void>>;
     sendInput: (sessionId: string, input: string) => Promise<IPCResponse<void>>;
     continue: (sessionId: string, prompt?: string, model?: string) => Promise<IPCResponse<void>>;
@@ -209,6 +224,15 @@ interface ElectronAPI {
     getLastCommits: (sessionId: string, count: number) => Promise<IPCResponse<unknown>>; // Caller does not consume .data directly
     // Subjects of the session branch's own commits (main..HEAD), newest first
     getBranchCommitSubjects: (sessionId: string) => Promise<IPCResponse<{ subjects: string[] }>>;
+    // Did this session's work land? `delivered` = a run carries a DELIVERED_RUN_OUTCOMES
+    // stamp (our merge/PR path ran); `landed` = git says the branch has nothing left to
+    // give main (the agent merged it in chat). Either one turns Dismiss into a choice.
+    getDeliveryState: (
+      sessionId: string,
+    ) => Promise<IPCResponse<{ delivered: boolean; landed: boolean; ownCommits: number }>>;
+    // Stamp outcome='completed' on the session's runs — bookkeeping only, archives
+    // nothing. Call BEFORE delete so the archive keeps the session's findings.
+    markComplete: (sessionId: string) => Promise<IPCResponse<{ stamped: number }>>;
 
     // IDE operations
     openIDE: (sessionId: string) => Promise<IPCResponse<void>>;

@@ -40,7 +40,7 @@ export function ModeIdentityStrip({
     mode === 'flow' && runStatus != null
       ? resolveFlowStatusPill(runStatus)
       : resolveChatStatus({ mode, running });
-  const transportLabel = transport === 'sdk' ? 'SDK' : 'PTY';
+  const transportLabel = transport === 'sdk' ? 'SDK' : 'CLI';
   return (
     <div
       data-testid="chat-mode-identity"

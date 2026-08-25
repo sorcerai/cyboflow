@@ -52,14 +52,22 @@ const READY_FOR_DEV_POSITION = 6;
  * the canonical `Priority` union, tolerating the common friendly synonyms.
  * Returns undefined for anything unrecognized so the chokepoint default (P2)
  * applies rather than a bogus write.
+ *
+ * Widened for the 7-level P0-P6 scale (migration 117): URGENT/CRITICAL keep
+ * the top slot, HIGH now gets its own tier below them (previously grouped
+ * with URGENT/CRITICAL at P0, back when only 3 levels existed), and the
+ * bottom of the scale gains LOW (P4) and MINOR/LOWEST/TRIVIAL (P6) so a low
+ * synonym no longer collapses onto the same P2 as MEDIUM.
  */
 function coercePriority(raw: string | undefined): Priority | undefined {
   if (!raw) return undefined;
   const s = raw.trim().toUpperCase();
-  if (s === 'P0' || s === 'P1' || s === 'P2') return s;
-  if (s === 'HIGH' || s === 'URGENT' || s === 'CRITICAL') return 'P0';
-  if (s === 'MEDIUM' || s === 'NORMAL') return 'P1';
-  if (s === 'LOW' || s === 'MINOR') return 'P2';
+  if (s === 'P0' || s === 'P1' || s === 'P2' || s === 'P3' || s === 'P4' || s === 'P5' || s === 'P6') return s;
+  if (s === 'URGENT' || s === 'CRITICAL') return 'P0';
+  if (s === 'HIGH') return 'P1';
+  if (s === 'MEDIUM' || s === 'NORMAL') return 'P2';
+  if (s === 'LOW') return 'P4';
+  if (s === 'MINOR' || s === 'LOWEST' || s === 'TRIVIAL') return 'P6';
   return undefined;
 }
 

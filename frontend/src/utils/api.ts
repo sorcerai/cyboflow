@@ -10,6 +10,7 @@ import type { ProviderModelCatalogs } from '../../../shared/types/agentModels';
 import type { AgentProvider } from '../../../shared/types/agentRuntime';
 import type { QuickSessionRow } from '../../../shared/types/quickSessions';
 import type { SessionSummaryPayload } from '../../../shared/types/sessionSummary';
+import type { OpenIdeaSessionRequest } from '../../../shared/types/ideaSession';
 import type { ReasoningEffort } from '../../../shared/types/reasoningEffort';
 import type { CliSubstrate } from '../../../shared/types/substrate';
 import type { RunTypeDefaults, RunTypeDefaultsOp } from '../../../shared/types/sessionDefaults';
@@ -33,6 +34,13 @@ export interface IPCResponse<T = unknown> {
    * dual declaration in frontend/src/types/electron.d.ts.
    */
   needsRebase?: boolean;
+  /**
+   * Set by the merge handlers when the branch had NOTHING left to merge — its
+   * work is already in main, almost always because the agent merged it in chat.
+   * Not a failure: the dialog offers Mark complete instead of an error. Keep in
+   * sync with the dual declaration in frontend/src/types/electron.d.ts.
+   */
+  alreadyUpToDate?: boolean;
 }
 
 // Type for Git error response.
@@ -108,6 +116,14 @@ export class API {
     async createQuick(request: CreateSessionRequest) {
       if (!isElectron()) throw new Error('Electron API not available');
       return window.electronAPI.sessions.createQuick(request);
+    },
+
+    // Backlog idea card "Open" — find-or-create the idea's persistent home
+    // session. `created: false` means an existing home was reused; either way
+    // `claudePanelId` is a registered (not started) Chat panel.
+    async openIdeaSession(request: OpenIdeaSessionRequest) {
+      if (!isElectron()) throw new Error('Electron API not available');
+      return window.electronAPI.sessions.openIdeaSession(request);
     },
 
     async delete(sessionId: string) {
@@ -273,6 +289,27 @@ export class API {
     async abortRebaseAndUseClaude(sessionId: string) {
       if (!isElectron()) throw new Error('Electron API not available');
       return window.electronAPI.sessions.abortRebaseAndUseClaude(sessionId);
+    },
+
+    /**
+     * Did this session's work land? `delivered` = a run carries a delivery stamp
+     * (our merge / create-PR path ran); `landed` = git says the branch has
+     * nothing left to give main (the agent merged it in chat). Either turns
+     * Dismiss into a Mark-complete choice.
+     */
+    async getDeliveryState(sessionId: string) {
+      if (!isElectron()) throw new Error('Electron API not available');
+      return window.electronAPI.sessions.getDeliveryState(sessionId);
+    },
+
+    /**
+     * Stamp this session's runs as delivered-by-another-path. Bookkeeping only —
+     * it archives nothing, so callers follow it with `delete`. Order matters:
+     * the stamp is what makes that archive KEEP the session's findings.
+     */
+    async markComplete(sessionId: string) {
+      if (!isElectron()) throw new Error('Electron API not available');
+      return window.electronAPI.sessions.markComplete(sessionId);
     },
 
     async squashAndRebaseToMain(sessionId: string, commitMessage: string) {

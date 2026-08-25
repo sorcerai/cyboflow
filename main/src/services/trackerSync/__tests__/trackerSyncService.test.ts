@@ -15,7 +15,8 @@
  * so the loop is driven directly instead of against wall-clock timers.
  *
  * Covers, per the task brief:
- *   - boot recovery: `in_flight` -> `ambiguous` -> adopted on the next pass.
+ *   - boot recovery: `in_flight` -> `ambiguous` -> adopted on the next pass, and
+ *     the push-target repair that demotes every armed sibling but the oldest.
  *   - due-connection gating: a fresh pass stamps last_sync_at, a second tick
  *     inside the interval skips, and syncNow bypasses the gate.
  *   - phase order (ambiguous -> outbox drain -> inbound -> sweep), observed
@@ -67,11 +68,18 @@ import type {
   TrackerIssue,
   TrackerSourceNarrow,
   TrackerSourceSelection,
+  TrackerGroupTree,
   TrackerSourceTree,
   TrackerState,
   TrackerWorkspaceIdentity,
 } from '../../../../../shared/types/trackerSync';
-import type { IssueDraft, TrackerAdapter, TrackerAdapterCapabilities } from '../adapterTypes';
+import type {
+  IssueContentPatch,
+  IssueDraft,
+  TrackerAdapter,
+  TrackerAdapterCapabilities,
+  TrackerFieldOptionsRaw,
+} from '../adapterTypes';
 import { TrackerApiError, TrackerAuthError } from '../errors';
 import {
   enqueueOutbox,
@@ -120,6 +128,8 @@ class FakeAdapter implements TrackerAdapter {
     nativeParentAutoClose: true,
     selfHostedBaseUrl: false,
     idempotentCreate: true,
+    contentWrite: { title: true, description: true, priority: true, category: false },
+    archive: 'trash',
   };
 
   /** Every method call, in order — the phase-sequence assertion. */
@@ -144,6 +154,8 @@ class FakeAdapter implements TrackerAdapter {
   updateStateGate: Promise<void> | null = null;
 
   readonly updateCalls: Array<{ externalId: string; stateId: string }> = [];
+  readonly contentCalls: Array<{ externalId: string; patch: IssueContentPatch }> = [];
+  readonly archiveCalls: string[] = [];
   /** Every top-level push, with the container it was filed into and the draft. */
   readonly createIssueCalls: Array<{
     selection: TrackerSourceSelection;
@@ -154,6 +166,9 @@ class FakeAdapter implements TrackerAdapter {
   async validateCredentials(): Promise<TrackerWorkspaceIdentity> {
     this.calls.push('validateCredentials');
     return { workspaceId: 'ws-1', workspaceName: 'Acme', actorLabel: 'K.' };
+  }
+  async listGroups(): Promise<TrackerGroupTree> {
+    return { sections: [] };
   }
   async listContainers(): Promise<TrackerSourceTree> {
     this.calls.push('listContainers');
@@ -167,6 +182,10 @@ class FakeAdapter implements TrackerAdapter {
     this.calls.push('listStates');
     return this.states;
   }
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    this.calls.push('listFieldOptions');
+    return { priorities: ['0', '1', '2', '3', '4'], categories: null };
+  }
   async listIssues(): Promise<TrackerIssue[]> {
     this.calls.push('listIssues');
     if (this.gate !== null) await this.gate;
@@ -179,7 +198,13 @@ class FakeAdapter implements TrackerAdapter {
   }
   async getIssue(externalId: string): Promise<TrackerIssue | null> {
     this.calls.push('getIssue');
-    return this.issuesById.get(externalId) ?? null;
+    // Point lookup and list serve the SAME store, as on a real provider — the
+    // content drain's pre-send divergence read must see what listIssues shows.
+    return (
+      this.issuesById.get(externalId) ??
+      this.issues.find((issue) => issue.externalId === externalId) ??
+      null
+    );
   }
   async createSubIssue(
     parentExternalId: string,
@@ -209,6 +234,24 @@ class FakeAdapter implements TrackerAdapter {
     if (this.updateStateGate !== null) await this.updateStateGate;
     this.updateCalls.push({ externalId, stateId });
   }
+  async updateIssueContent(
+    externalId: string,
+    patch: IssueContentPatch,
+  ): Promise<TrackerIssue | null> {
+    this.calls.push('updateIssueContent');
+    this.contentCalls.push({ externalId, patch });
+    const next = applyContentPatch(
+      this.issuesById.get(externalId) ?? makeIssue({ externalId }),
+      patch,
+    );
+    this.issuesById.set(externalId, next);
+    this.issues = this.issues.map((issue) => (issue.externalId === externalId ? next : issue));
+    return next;
+  }
+  async archiveIssue(externalId: string): Promise<void> {
+    this.calls.push('archiveIssue');
+    this.archiveCalls.push(externalId);
+  }
 
   /** Calls filtered to the ones the phase-order assertion cares about. */
   phaseCalls(): string[] {
@@ -230,6 +273,8 @@ class PlaneLikeAdapter implements TrackerAdapter {
     nativeParentAutoClose: false,
     selfHostedBaseUrl: true,
     idempotentCreate: false,
+    contentWrite: { title: true, description: true, priority: true, category: false },
+    archive: 'none',
   };
 
   /** The tracker's own issue list — createSubIssue appends to it before failing. */
@@ -242,6 +287,9 @@ class PlaneLikeAdapter implements TrackerAdapter {
   async validateCredentials(): Promise<TrackerWorkspaceIdentity> {
     throw new Error('not used');
   }
+  async listGroups(): Promise<TrackerGroupTree> {
+    return { sections: [] };
+  }
   async listContainers(): Promise<TrackerSourceTree> {
     throw new Error('not used');
   }
@@ -251,6 +299,10 @@ class PlaneLikeAdapter implements TrackerAdapter {
   async listStates(): Promise<TrackerState[]> {
     this.calls.push('listStates');
     return STATES;
+  }
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    this.calls.push('listFieldOptions');
+    return { priorities: ['urgent', 'high', 'medium', 'low', 'none'], categories: null };
   }
   async listIssues(): Promise<TrackerIssue[]> {
     this.calls.push('listIssues');
@@ -304,6 +356,12 @@ class PlaneLikeAdapter implements TrackerAdapter {
   async updateIssueState(): Promise<void> {
     throw new Error('not used');
   }
+  async updateIssueContent(): Promise<TrackerIssue | null> {
+    throw new Error('not used');
+  }
+  async archiveIssue(): Promise<void> {
+    throw new Error('not used');
+  }
 
   /** The marker lookup the outbox's ambiguous recovery uses (see outboxWorker). */
   async findIssueByClientKey(
@@ -323,6 +381,22 @@ class PlaneLikeAdapter implements TrackerAdapter {
   }
 }
 
+/**
+ * The post-write issue a provider echoes back — the ECHO-SUPPRESSION STAMP
+ * SOURCE. Absent fields are left alone, exactly as `IssueContentPatch`
+ * specifies, so a fake that applied the whole patch blindly would hide the
+ * "only send what changed" property these tests rely on.
+ */
+function applyContentPatch(issue: TrackerIssue, patch: IssueContentPatch): TrackerIssue {
+  return {
+    ...issue,
+    ...(patch.title !== undefined ? { title: patch.title } : {}),
+    ...(patch.description !== undefined ? { description: patch.description } : {}),
+    ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
+    ...(patch.category !== undefined ? { category: patch.category } : {}),
+  };
+}
+
 function makeIssue(overrides: Partial<TrackerIssue> = {}): TrackerIssue {
   return {
     externalId: 'ext-1',
@@ -336,6 +410,10 @@ function makeIssue(overrides: Partial<TrackerIssue> = {}): TrackerIssue {
     parentExternalId: null,
     updatedAt: '2026-07-30T10:00:00.000Z',
     archivedAt: null,
+    // The default mapping round-trips '3' (Linear Medium) with the P2 every
+    // entity here carries, so an untouched issue never produces a priority diff.
+    priority: '3',
+    category: null,
     recoveryClientKey: null,
     ...overrides,
   };
@@ -372,6 +450,11 @@ function makeConnection(overrides: Partial<NewConnectionRow> = {}): TrackerConne
     status_sync_mode: 'auto',
     pull_mode: 'auto',
     push_mode: 'auto',
+    push_target: 1,
+    content_sync_mode: 'off',
+    archive_sync_mode: 'off',
+    priority_mapping_json: '{}',
+    category_mapping_json: '{}',
     mirror_subissues: 1,
     conflict_mode: 'auto',
     cursor_updated_at: null,
@@ -485,6 +568,58 @@ describe('TrackerSyncService boot recovery', () => {
     service.start();
 
     expect(outboxRows()[0].state).toBe('in_flight');
+  });
+
+  it('demotes duplicate push targets at boot, keeping the OLDEST row armed', () => {
+    // The defect a ledger-wiped migration replay manufactures: 105's table
+    // recreate predates 109, so a replay drops push_target and 109 re-adds it at
+    // DEFAULT 1 on EVERY row. Left alone, the next pushed idea files one remote
+    // issue per armed sibling. Not reachable through connect(), which is exactly
+    // why boot has to repair it.
+    makeConnection();
+    makeConnection({
+      id: 'conn-sibling',
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+    // Out of scope: another provider's row keeps its flag, duplicate or not.
+    makeConnection({ id: 'conn-plane', provider: 'plane' });
+    // `datetime('now')` has one-second resolution, so two inserts in the same
+    // test tie — stamp them apart rather than sleeping.
+    const stamp = raw.prepare('UPDATE tracker_connections SET created_at = ? WHERE id = ?');
+    stamp.run('2026-07-01 00:00:00', CONN_ID);
+    stamp.run('2026-07-02 00:00:00', 'conn-sibling');
+
+    service.start();
+
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-sibling')?.push_target).toBe(0);
+    expect(getConnection(raw, 'conn-plane')?.push_target).toBe(1);
+  });
+
+  it('boot repair keeps the oldest ARMED row — a deliberately demoted older row is never re-armed', () => {
+    // Mixed state: the OLDEST row was explicitly demoted (a user's push-target
+    // choice), and two younger siblings are both armed (the replay defect). The
+    // repair must pick among the ARMED rows only — re-arming the demoted one
+    // would overturn an explicit choice to fix an unrelated inconsistency.
+    makeConnection({ push_target: 0 });
+    makeConnection({
+      id: 'conn-armed-a',
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+    makeConnection({
+      id: 'conn-armed-b',
+      source_json: JSON.stringify({ containerId: 'team-3', narrowId: 'all', narrowKind: 'all' }),
+    });
+    const stamp = raw.prepare('UPDATE tracker_connections SET created_at = ? WHERE id = ?');
+    stamp.run('2026-07-01 00:00:00', CONN_ID);
+    stamp.run('2026-07-02 00:00:00', 'conn-armed-a');
+    stamp.run('2026-07-03 00:00:00', 'conn-armed-b');
+
+    service.start();
+
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(0);
+    expect(getConnection(raw, 'conn-armed-a')?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-armed-b')?.push_target).toBe(0);
   });
 });
 
@@ -956,6 +1091,11 @@ describe('TrackerSyncService sync log', () => {
     await service.syncConnection(CONN_ID);
 
     expect(renderedLog()).toEqual([
+      // Every connection defaults both migration-112 modes to 'off' until
+      // Phase 6 wires a wizard control — surfaced so "sync complete" does not
+      // look broken on a connection that never opted into write-back.
+      '· content changes off',
+      '· archive off',
       '▸ GET issues',
       '· matched 0',
       '✓ created 1 idea',
@@ -982,6 +1122,22 @@ describe('TrackerSyncService sync log', () => {
     expect(lines).toContain('✓ updated 1 linked item');
     expect(lines).toContain('✎ conflicts 1');
     expect(lines[lines.length - 1]).toBe('✓ sync complete · next in 5m');
+  });
+
+  it('warns LOUDLY about a remote value no mapping can express', async () => {
+    // Dart addresses priorities by TITLE, so a workspace rename leaves a
+    // mapping pointing at a value nothing answers to. Nothing is applied and no
+    // conflict is opened — the user is asked to confirm the mapping instead,
+    // with the '⚠' the connected view renders as a problem rather than a note.
+    makeConnection();
+    adapter.issues = [makeIssue({ priority: '1' })];
+    service.start();
+    await service.syncConnection(CONN_ID);
+
+    adapter.issues = [makeIssue({ priority: '9', updatedAt: '2026-07-30T11:00:00.000Z' })];
+    await service.syncNow(CONN_ID);
+
+    expect(renderedLog()).toContain('⚠ 1 unmapped remote value · confirm the mapping');
   });
 });
 
@@ -1396,5 +1552,547 @@ describe('TrackerSyncService direction modes', () => {
     expect(adapter.updateCalls).toEqual([{ externalId: 'ext-1', stateId: 'state-done' }]);
     expect(adapter.createIssueCalls).toHaveLength(1);
     expect(ideas().map((i) => i.title)).toContain('Remote newcomer');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Content/archive sync modes (migration 118) — the THREE-state gate.
+//
+// Phase 5 has not wired an enqueue trigger for either kind yet, so these tests
+// enqueue an `update_content`/`archive_issue` row directly (exactly the shape
+// a Phase-5 trigger will produce) and drive it through the real drain via
+// `syncConnection` (auto trigger) / `syncNow` (manual trigger) — proving the
+// MODE GATE (drainKinds' claim filter) independently of who does the
+// enqueuing. A claimed row terminally fails with the Phase-5 stub error
+// (outboxWorker.processUnimplementedContentKind); the point here is only that
+// 'off' and 'manual' correctly withhold the CLAIM.
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService content/archive sync modes', () => {
+  function enqueueContentRow(
+    connectionId: string,
+    kind: 'update_content' | 'archive_issue',
+    externalId = 'ext-1',
+  ): TrackerOutboxRow {
+    return enqueueOutbox(raw, {
+      connection_id: connectionId,
+      kind,
+      entity_type: 'idea',
+      entity_id: 'idea-1',
+      external_id: externalId,
+      payload_json: '{}',
+    });
+  }
+
+  function outboxRow(id: number): TrackerOutboxRow {
+    return raw.prepare('SELECT * FROM tracker_outbox WHERE id = ?').get(id) as TrackerOutboxRow;
+  }
+
+  it('content OFF: the row is never CLAIMED — and the pass settles it rather than leaving it', async () => {
+    const connection = makeConnection({ content_sync_mode: 'off' });
+    const row = enqueueContentRow(connection.id, 'update_content');
+
+    const auto = await service.syncConnection(CONN_ID);
+
+    // Nothing was sent: 'off' is not something a pass — or "Sync now" — can
+    // unstick, which is invariant 5's whole point.
+    expect(adapter.contentCalls).toHaveLength(0);
+    expect(auto.entries.map((e) => e.line)).toContain('content changes off');
+    // And it is not left sitting there either. A pending row of an off kind is
+    // UNDRAINABLE, and the kind-agnostic inbound blocker would halt the batch
+    // at its issue on every pass forever — so the pass settles it on sight.
+    expect(outboxRow(row.id).state).toBe('done');
+    expect(outboxRow(row.id).last_error).toContain('content sync is off');
+    expect(auto.entries.map((e) => e.line)).toContain('1 queued write dropped · that direction is off');
+
+    await service.syncNow(CONN_ID);
+    expect(adapter.contentCalls).toHaveLength(0);
+  });
+
+  it('content MANUAL: an automatic pass holds the row; Sync now claims it', async () => {
+    const connection = makeConnection({ content_sync_mode: 'manual' });
+    const row = enqueueContentRow(connection.id, 'update_content');
+
+    const auto = await service.syncConnection(CONN_ID);
+    expect(outboxRow(row.id).state).toBe('pending');
+    expect(auto.entries.map((e) => e.line)).toContain('content changes held (manual) · use Sync now');
+
+    await service.syncNow(CONN_ID);
+    // CLAIMED is the property this test is about. The row addresses an issue
+    // with no link behind it, so the handler settles it `done` with nothing
+    // sent — which is exactly how a claim shows up here.
+    expect(outboxRow(row.id).state).toBe('done');
+  });
+
+  it('content AUTO: an automatic pass claims the row immediately', async () => {
+    const connection = makeConnection({ content_sync_mode: 'auto' });
+    const row = enqueueContentRow(connection.id, 'update_content');
+
+    const auto = await service.syncConnection(CONN_ID);
+
+    expect(outboxRow(row.id).state).toBe('done');
+    expect(auto.entries.map((e) => e.line)).not.toContain('content changes off');
+    expect(auto.entries.map((e) => e.line)).not.toContain('content changes held (manual) · use Sync now');
+  });
+
+  /** Flip one connection's archive_sync_mode after the fixture work is done. */
+  function setArchiveMode(mode: 'auto' | 'manual' | 'off'): void {
+    raw.prepare('UPDATE tracker_connections SET archive_sync_mode = ? WHERE id = ?').run(mode, CONN_ID);
+  }
+
+  it('archive OFF/MANUAL/AUTO gate the same way, independently of content_sync_mode', async () => {
+    makeConnection({ content_sync_mode: 'off', archive_sync_mode: 'off' });
+    const offRow = enqueueContentRow(CONN_ID, 'archive_issue', 'ext-off');
+    const autoPass1 = await service.syncConnection(CONN_ID);
+    // Settled unsent, for the same reason the content-off row is — see above.
+    expect(adapter.archiveCalls).toHaveLength(0);
+    expect(outboxRow(offRow.id).state).toBe('done');
+    expect(outboxRow(offRow.id).last_error).toContain('archive sync is off');
+    expect(autoPass1.entries.map((e) => e.line)).toContain('archive off');
+
+    setArchiveMode('manual');
+    const manualRow = enqueueContentRow(CONN_ID, 'archive_issue', 'ext-manual');
+    const autoPass2 = await service.syncConnection(CONN_ID);
+    expect(outboxRow(manualRow.id).state).toBe('pending');
+    expect(autoPass2.entries.map((e) => e.line)).toContain('archive held (manual) · use Sync now');
+    await service.syncNow(CONN_ID);
+    expect(outboxRow(manualRow.id).state).toBe('done');
+    expect(adapter.archiveCalls).toContain('ext-manual');
+
+    setArchiveMode('auto');
+    const autoRow = enqueueContentRow(CONN_ID, 'archive_issue', 'ext-auto');
+    await service.syncConnection(CONN_ID);
+    expect(outboxRow(autoRow.id).state).toBe('done');
+    expect(adapter.archiveCalls).toContain('ext-auto');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ECHO SUITE — a local edit must not come back as a remote one
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService content write-back — echo suppression', () => {
+  /** Import one issue and return the idea it landed as. */
+  async function importOne(overrides: Partial<TrackerIssue> = {}): Promise<string> {
+    adapter.issues = [makeIssue(overrides)];
+    adapter.issuesById.set('ext-1', adapter.issues[0]);
+    service.start();
+    await service.syncConnection(CONN_ID);
+    return getLinkByExternal(raw, CONN_ID, 'ext-1')?.entity_id ?? '';
+  }
+
+  function baselineOf(): Record<string, unknown> {
+    const link = getLinkByExternal(raw, CONN_ID, 'ext-1');
+    return JSON.parse(link?.baseline_json ?? '{}') as Record<string, unknown>;
+  }
+
+  it('local edit -> enqueue -> drain -> stamp -> the NEXT inbound pass sees no change', async () => {
+    makeConnection({ content_sync_mode: 'auto', conflict_mode: 'manual' });
+    const ideaId = await importOne();
+
+    // A real local edit through the real chokepoint: the subscribed listener
+    // is what turns it into an outbox row.
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { title: 'Locally renamed', priority: 'P0' },
+    });
+    const queued = listUnresolvedOutbox(raw, CONN_ID);
+    expect(queued.map((row) => row.kind)).toEqual(['update_content']);
+
+    await service.drainConnection(CONN_ID);
+
+    expect(adapter.contentCalls).toEqual([
+      { externalId: 'ext-1', patch: { title: 'Locally renamed', priority: '1' } },
+    ]);
+    expect(baselineOf()).toMatchObject({ title: 'Locally renamed', priority: '1' });
+
+    // THE ECHO: the tracker now serves our own write back, with a fresh
+    // updatedAt so the incremental window really re-delivers it.
+    adapter.issues = [
+      makeIssue({
+        title: 'Locally renamed',
+        priority: '1',
+        updatedAt: '2026-07-30T13:00:00.000Z',
+      }),
+    ];
+    await service.syncNow(CONN_ID);
+
+    // No conflict, no counter-write, and the local values stand.
+    expect(raw.prepare('SELECT COUNT(*) AS n FROM tracker_conflicts').get()).toEqual({ n: 0 });
+    expect(listUnresolvedOutbox(raw, CONN_ID)).toHaveLength(0);
+    const idea = raw.prepare('SELECT title, priority FROM ideas WHERE id = ?').get(ideaId);
+    expect(idea).toEqual({ title: 'Locally renamed', priority: 'P0' });
+  });
+
+  it('the body ALIGNMENT it performs does not itself queue a second write', async () => {
+    makeConnection({ content_sync_mode: 'auto' });
+    const ideaId = await importOne({ description: 'original' });
+
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { body: 'rewritten' },
+    });
+    await service.drainConnection(CONN_ID);
+
+    // The drain's own `applyChange` runs as the PROVIDER actor, which the
+    // content trigger skips — otherwise every body write would loop.
+    expect(listUnresolvedOutbox(raw, CONN_ID)).toHaveLength(0);
+    expect(adapter.contentCalls).toHaveLength(1);
+  });
+
+  it("'off' declines the enqueue, so a local edit never stalls the inbound cursor", async () => {
+    makeConnection({ content_sync_mode: 'off' });
+    const ideaId = await importOne();
+
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { title: 'Locally renamed' },
+    });
+
+    expect(listUnresolvedOutbox(raw, CONN_ID)).toHaveLength(0);
+    // The inbound half is unaffected: an unresolved row for this issue would
+    // halt the batch at it on every pass, forever.
+    adapter.issues = [makeIssue({ updatedAt: '2026-07-30T13:00:00.000Z' })];
+    const pass = await service.syncNow(CONN_ID);
+    expect(pass.entries.map((entry) => entry.line)).not.toContain('held at ext-1 — our write is in flight');
+    expect(getConnection(raw, CONN_ID)?.cursor_external_id).toBe('ext-1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Flip-to-off must not strand a queued row
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService content/archive flip to off', () => {
+  function outboxRow(id: number): TrackerOutboxRow {
+    return raw.prepare('SELECT * FROM tracker_outbox WHERE id = ?').get(id) as TrackerOutboxRow;
+  }
+
+  it('settles the PENDING rows of the direction being turned off, and leaves in-flight alone', async () => {
+    makeConnection({ content_sync_mode: 'auto', archive_sync_mode: 'auto' });
+    const pending = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'update_content',
+      entity_type: 'idea',
+      entity_id: 'idea-1',
+      external_id: 'ext-1',
+      payload_json: '{}',
+    });
+    const inFlight = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'update_content',
+      entity_type: 'idea',
+      entity_id: 'idea-2',
+      external_id: 'ext-2',
+      payload_json: '{}',
+    });
+    raw.prepare("UPDATE tracker_outbox SET state = 'in_flight' WHERE id = ?").run(inFlight.id);
+    const archiveRow = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'archive_issue',
+      entity_type: 'idea',
+      entity_id: 'idea-3',
+      external_id: 'ext-3',
+      payload_json: '{}',
+    });
+
+    await service.updateSettings(CONN_ID, { contentSyncMode: 'off' });
+
+    const rows = outboxRows();
+    expect(rows.find((row) => row.id === pending.id)?.state).toBe('done');
+    expect(rows.find((row) => row.id === pending.id)?.last_error).toContain('turned off');
+    // A request already on the wire cannot be recalled, and its resolution is
+    // what stamps the baseline.
+    expect(rows.find((row) => row.id === inFlight.id)?.state).toBe('in_flight');
+    // The OTHER direction is untouched — the user turned off one of them.
+    expect(rows.find((row) => row.id === archiveRow.id)?.state).toBe('pending');
+
+    await service.updateSettings(CONN_ID, { archiveSyncMode: 'off' });
+    expect(outboxRows().find((row) => row.id === archiveRow.id)?.state).toBe('done');
+  });
+
+  it('SELF-HEALS a row that becomes pending AFTER the flip (the retry path)', async () => {
+    // The flip-time sweep settles what is pending AT THE FLIP. An in_flight row
+    // is deliberately left alone — its request cannot be recalled — and when it
+    // fails retryably it lands right back in `pending`, of a kind nothing will
+    // ever claim. Left there it halts inbound at that issue forever.
+    makeConnection({ content_sync_mode: 'auto' });
+    adapter.issues = [makeIssue()];
+    service.start();
+    await service.syncConnection(CONN_ID);
+    const ideaId = getLinkByExternal(raw, CONN_ID, 'ext-1')?.entity_id ?? '';
+
+    const row = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'update_content',
+      entity_type: 'idea',
+      entity_id: ideaId,
+      external_id: 'ext-1',
+      payload_json: '{}',
+    });
+    raw.prepare("UPDATE tracker_outbox SET state = 'in_flight' WHERE id = ?").run(row.id);
+
+    await service.updateSettings(CONN_ID, { contentSyncMode: 'off' });
+    // Untouched by the flip, exactly as intended…
+    expect(outboxRow(row.id).state).toBe('in_flight');
+
+    // …then the in-flight request fails retryably and the row returns to the
+    // queue, now undrainable.
+    raw
+      .prepare("UPDATE tracker_outbox SET state = 'pending', attempts = 1 WHERE id = ?")
+      .run(row.id);
+
+    adapter.issues = [makeIssue({ updatedAt: '2026-07-30T13:00:00.000Z' })];
+    const pass = await service.syncNow(CONN_ID);
+
+    expect(outboxRow(row.id).state).toBe('done');
+    expect(outboxRow(row.id).last_error).toContain('content sync is off');
+    // The stall never happens: the sweep runs BEFORE the blocker scan.
+    expect(pass.entries.map((entry) => entry.line)).not.toContain(
+      'held at ext-1 — our write is in flight',
+    );
+    expect(getConnection(raw, CONN_ID)?.cursor_updated_at).toBe('2026-07-30T13:00:00.000Z');
+  });
+
+  it('SELF-HEALS the boot-recovery path: ambiguous -> requeued -> pending, of an off kind', async () => {
+    // The other route back into `pending`: a crash leaves the row `in_flight`,
+    // boot recovery demotes it to `ambiguous`, and processAmbiguous requeues
+    // every NON-CREATE kind straight to pending (re-performing them is
+    // idempotent). Nothing in that chain consults the direction mode.
+    makeConnection({ content_sync_mode: 'off', archive_sync_mode: 'off' });
+    adapter.issues = [makeIssue()];
+
+    const content = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'update_content',
+      entity_type: 'idea',
+      entity_id: 'idea-1',
+      external_id: 'ext-1',
+      payload_json: '{}',
+    });
+    const archive = enqueueOutbox(raw, {
+      connection_id: CONN_ID,
+      kind: 'archive_issue',
+      entity_type: 'idea',
+      entity_id: 'idea-2',
+      external_id: 'ext-2',
+      payload_json: '{}',
+    });
+    raw.prepare("UPDATE tracker_outbox SET state = 'in_flight'").run();
+
+    // start() demotes both to ambiguous…
+    service.start();
+    expect(outboxRows().map((r) => r.state)).toEqual(['ambiguous', 'ambiguous']);
+
+    // …and the pass requeues them to pending, then heals them in the same pass.
+    const pass = await service.syncConnection(CONN_ID);
+
+    expect(outboxRows().map((r) => r.state)).toEqual(['done', 'done']);
+    expect(outboxRow(content.id).last_error).toContain('content sync is off');
+    expect(outboxRow(archive.id).last_error).toContain('archive sync is off');
+    expect(adapter.contentCalls).toHaveLength(0);
+    expect(adapter.archiveCalls).toHaveLength(0);
+    expect(pass.entries.map((entry) => entry.line)).not.toContain(
+      'held at ext-1 — our write is in flight',
+    );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// The removal pipeline, through the REAL handleLocalRemoval -> listener order
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService removal pipeline', () => {
+  async function linkedIdea(): Promise<string> {
+    adapter.issues = [makeIssue()];
+    service.start();
+    await service.syncConnection(CONN_ID);
+    return getLinkByExternal(raw, CONN_ID, 'ext-1')?.entity_id ?? '';
+  }
+
+  function outboxKinds(): string[] {
+    return outboxRows().map((row) => row.kind);
+  }
+
+  it('PLAIN archive (no ruling): the listener arm files one archive_issue', async () => {
+    makeConnection({ archive_sync_mode: 'auto' });
+    const ideaId = await linkedIdea();
+
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      archived: true,
+    });
+
+    expect(outboxKinds()).toEqual(['archive_issue']);
+    expect(outboxRows()[0].external_id).toBe('ext-1');
+    // The link is still LIVE: only a CONFIRMED archive takes it out of sync.
+    expect(getLinkByExternal(raw, CONN_ID, 'ext-1')?.orphaned_at).toBeNull();
+  });
+
+  it('RULED archive: dropLink files the archive BEFORE orphaning, and the listener adds nothing', async () => {
+    makeConnection({ archive_sync_mode: 'auto' });
+    const ideaId = await linkedIdea();
+
+    await service.stageUnlinkRuling('idea', ideaId, { cancelRemote: true });
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      archived: true,
+    });
+
+    // EXACTLY ONE row. handleLocalRemoval runs first and orphans the link, so
+    // the listener arm that follows finds nothing to duplicate.
+    expect(outboxKinds()).toEqual(['archive_issue']);
+    expect(getLinkByExternal(raw, CONN_ID, 'ext-1')?.orphaned_at).not.toBeNull();
+
+    await service.drainConnection(CONN_ID);
+    expect(adapter.archiveCalls).toEqual(['ext-1']);
+  });
+
+  it('RULED delete: the pre-delete snapshot is the only path, and it still archives', async () => {
+    makeConnection({ archive_sync_mode: 'auto' });
+    const ideaId = await linkedIdea();
+
+    await service.stageUnlinkRuling('idea', ideaId, { cancelRemote: true });
+    await router.applyDelete(PROJECT_ID, { actor: 'user', entityType: 'idea', taskId: ideaId });
+
+    expect(outboxKinds()).toEqual(['archive_issue']);
+    await service.drainConnection(CONN_ID);
+    expect(adapter.archiveCalls).toEqual(['ext-1']);
+  });
+
+  it("a 'keep it' ruling writes nothing remotely", async () => {
+    makeConnection({ archive_sync_mode: 'auto' });
+    const ideaId = await linkedIdea();
+
+    await service.stageUnlinkRuling('idea', ideaId, { cancelRemote: false });
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      archived: true,
+    });
+
+    expect(outboxKinds()).toEqual([]);
+    expect(getLinkByExternal(raw, CONN_ID, 'ext-1')?.orphaned_at).not.toBeNull();
+  });
+
+  it("falls back to the cancelled-state write when the provider cannot archive", async () => {
+    makeConnection({ provider: 'plane', archive_sync_mode: 'auto', workspace_id: 'acme' });
+    const ideaId = await linkedIdea();
+
+    await service.stageUnlinkRuling('idea', ideaId, { cancelRemote: true });
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      archived: true,
+    });
+
+    // Plane declares archive: 'none'. The ruling still reaches the tracker —
+    // through the one write its API can actually perform.
+    expect(outboxKinds()).toEqual(['update_state']);
+    expect(JSON.parse(outboxRows()[0].payload_json)).toEqual({ desiredGroup: 'cancelled' });
+  });
+
+  it("falls back to the cancelled-state write when archive sync is 'off'", async () => {
+    makeConnection({ archive_sync_mode: 'off' });
+    const ideaId = await linkedIdea();
+
+    await service.stageUnlinkRuling('idea', ideaId, { cancelRemote: true });
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      archived: true,
+    });
+
+    // An archive_issue row here could never be claimed, and an unclaimable row
+    // halts inbound for this issue forever.
+    expect(outboxKinds()).toEqual(['update_state']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conflict resolution -> the tracker converges on the local value
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService conflict resolution — content convergence', () => {
+  /** Import an issue, then diverge BOTH sides so a manual pass opens a conflict. */
+  async function openTitleConflict(): Promise<{ ideaId: string; conflictId: number }> {
+    adapter.issues = [makeIssue()];
+    service.start();
+    await service.syncConnection(CONN_ID);
+    const ideaId = getLinkByExternal(raw, CONN_ID, 'ext-1')?.entity_id ?? '';
+
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: ideaId,
+      fields: { title: 'Local title' },
+    });
+    // Whatever the local edit queued is irrelevant to the conflict itself, and
+    // an unresolved row would halt the inbound pass that must open it.
+    raw.prepare("UPDATE tracker_outbox SET state = 'done'").run();
+
+    adapter.issues = [makeIssue({ title: 'Remote title', updatedAt: '2026-07-30T13:00:00.000Z' })];
+    await service.syncNow(CONN_ID);
+
+    const row = raw.prepare('SELECT id FROM tracker_conflicts WHERE field = ?').get('title') as
+      | { id: number }
+      | undefined;
+    return { ideaId, conflictId: row?.id ?? 0 };
+  }
+
+  it("accepting LOCAL stamps the baseline AND queues the convergence write", async () => {
+    makeConnection({ conflict_mode: 'manual', content_sync_mode: 'auto' });
+    const { conflictId } = await openTitleConflict();
+    expect(conflictId).toBeGreaterThan(0);
+
+    await service.resolveConflictChoice(conflictId, 'local');
+
+    const queued = listUnresolvedOutbox(raw, CONN_ID);
+    expect(queued.map((row) => row.kind)).toEqual(['update_content']);
+
+    await service.drainConnection(CONN_ID);
+    expect(adapter.contentCalls).toEqual([
+      { externalId: 'ext-1', patch: { title: 'Local title' } },
+    ]);
+  });
+
+  it("accepting LOCAL under 'off' stamps ONLY — an enqueued row would be undrainable", async () => {
+    makeConnection({ conflict_mode: 'manual', content_sync_mode: 'off' });
+    const { conflictId } = await openTitleConflict();
+
+    await service.resolveConflictChoice(conflictId, 'local');
+
+    expect(listUnresolvedOutbox(raw, CONN_ID)).toHaveLength(0);
+    // The stamp still lands, so the conflict does not re-open every pass.
+    const link = getLinkByExternal(raw, CONN_ID, 'ext-1');
+    expect(JSON.parse(link?.baseline_json ?? '{}')).toMatchObject({ title: 'Remote title' });
+  });
+
+  it('accepting REMOTE applies the value and queues NOTHING back', async () => {
+    makeConnection({ conflict_mode: 'manual', content_sync_mode: 'auto' });
+    const { ideaId, conflictId } = await openTitleConflict();
+
+    await service.resolveConflictChoice(conflictId, 'remote');
+
+    // The apply runs as the PROVIDER actor and the stamp precedes it, so the
+    // content trigger has neither a reason nor permission to echo it back.
+    expect(listUnresolvedOutbox(raw, CONN_ID)).toHaveLength(0);
+    expect(raw.prepare('SELECT title FROM ideas WHERE id = ?').get(ideaId)).toEqual({
+      title: 'Remote title',
+    });
   });
 });

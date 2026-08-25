@@ -39,17 +39,20 @@ import { useEffect, useState } from 'react';
 import { ChevronLeft, RotateCcw } from 'lucide-react';
 import { useConfigStore } from '../../stores/configStore';
 import { useCodexModelCatalog } from '../../stores/codexModelCatalogStore';
+import { useOmpModelCatalog } from '../../stores/ompModelCatalogStore';
+import { useOmpAvailability, type OmpAvailability } from '../../hooks/useOmpAvailability';
 import {
   RUN_TYPE_EFFORT_OPTIONS,
   RUN_TYPE_MODEL_OPTIONS,
   RUN_TYPE_FIELD_LABELS,
-  agentRuntimeOptions,
+  agentRuntimePickerOptions,
+  runtimeUnavailableReason,
   baselineValueFor,
   coerceDraftForModel,
   coerceDraftForRuntime,
   coerceDraftForSubstrate,
   draftFromStored,
-  draftUsesCodexRuntime,
+  draftRuntimeProvider,
   isQuickRunTypeKey,
   patchFromDraft,
   runTypeValueLabel,
@@ -57,8 +60,9 @@ import {
   type RunTypeDraft,
   type RunTypeFieldId,
 } from './runTypeOverrides';
-import type { AgentRuntime } from '../../../../shared/types/agentRuntime';
-import type { CodexModelOption } from '../../../../shared/types/agentModels';
+import { AGENT_PROVIDER_LABELS } from '../../../../shared/types/agentRuntime';
+import type { AgentProvider, AgentRuntime } from '../../../../shared/types/agentRuntime';
+import type { CodexModelOption, OmpModelOption } from '../../../../shared/types/agentModels';
 import type { ReasoningEffort } from '../../../../shared/types/reasoningEffort';
 import type { RunTypeDefaults } from '../../../../shared/types/sessionDefaults';
 import type { CliSubstrate } from '../../../../shared/types/substrate';
@@ -136,12 +140,14 @@ export function RunTypeOverrideDetail({
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // Every control is scoped to the runtime this key would ACTUALLY launch on
-  // (the draft's own override, else the baseline) — offering the other family's
+  // (the draft's own override, else the baseline) — offering another family's
   // options is what let a cross-family pair be assembled in the first place.
-  // Codex models come from the same catalog store the launch pickers read
-  // (`ModelSelector` / `ModelPill`), never from a second hardcoded list.
-  const usesCodex = draftUsesCodexRuntime(draft, baseline);
+  // Codex and OMP models come from the same catalog stores the launch pickers
+  // read (`ModelSelector` / `ModelPill`), never from a second hardcoded list.
+  const provider = draftRuntimeProvider(draft, baseline);
+  const usesCodex = provider === 'codex';
   const { options: codexModelOptions } = useCodexModelCatalog(usesCodex);
+  const { options: ompModelOptions } = useOmpModelCatalog(provider === 'omp');
 
   // Re-seed when the key changes (list → another type without unmounting).
   // `stored` is intentionally not a dependency: a config refetch mid-edit must
@@ -186,19 +192,53 @@ export function RunTypeOverrideDetail({
     });
   };
 
+  // Which OMP flavor this install runs (Aria mode) — the runtime picker offers
+  // the remote fleet OR the local runtimes, never both. Same source the launch
+  // picker reads, so the two surfaces cannot disagree.
+  const omp = useOmpAvailability();
+
   const draftValue = (field: RunTypeFieldId): string | null => draft[field];
 
   const cardIsOn = (card: KnobCard): boolean => card.fields.some((f) => draftValue(f) !== null);
 
   /**
-   * Flipping a card ON seeds each of its fields from the baseline so the control
-   * starts at the value the launch would have used; effort has no baseline, so
-   * it stays unset ("Follow defaults") until the user picks a level. Flipping
-   * OFF clears every field in the card back to "follow defaults".
+   * The value a field starts at when its card is switched ON: normally the
+   * baseline, so the control opens showing what the launch would have used.
+   *
+   * `model` needs a second rung because its baseline is the always-Claude floor
+   * (`DEFAULT_RUN_TYPE_MODEL_FLOORS`), which a non-Claude provider legitimately
+   * refuses — `coerceModelForRuntime` returns `null` for it under OMP, since
+   * absence there means "OMP picks its own default". Seeding that `null` would
+   * make the card UNOPENABLE rather than merely unset: `cardIsOn` is DERIVED
+   * from "some field is non-null", so the switch flips straight back off and no
+   * amount of clicking can ever reveal the control. Falling back to the first
+   * option the control will actually offer keeps the seed launchable by
+   * construction — it comes from the same `fieldOptions` list that renders.
+   *
+   * Residual: a provider whose catalog is still loading (or failed) offers
+   * nothing, so the card stays closed until it arrives. That is honest — there
+   * is no model to pick yet — but it is indistinguishable from the switch being
+   * broken, which is why the catalog is fetched eagerly for the draft provider.
+   */
+  const seedValueFor = (field: RunTypeFieldId): string | null => {
+    const fromBaseline = baselineValueFor(field, baseline);
+    if (field !== 'model') return fromBaseline;
+    const coerced = coerceDraftForModel(draft, fromBaseline, baseline).model;
+    if (coerced !== null) return coerced;
+    const offered = fieldOptions(field, runTypeKey, provider, codexModelOptions, ompModelOptions, omp, draftValue('agentRuntime'));
+    return offered[0]?.id ?? null;
+  };
+
+  /**
+   * Flipping a card ON seeds each of its fields from {@link seedValueFor} so the
+   * control starts at the value the launch would have used; effort has no
+   * baseline, so it stays unset ("Follow defaults") until the user picks a
+   * level. Flipping OFF clears every field in the card back to "follow
+   * defaults".
    */
   const toggleCard = (card: KnobCard, next: boolean): void => {
     for (const field of card.fields) {
-      setField(field, next ? baselineValueFor(field, baseline) : null);
+      setField(field, next ? seedValueFor(field) : null);
     }
   };
 
@@ -244,16 +284,18 @@ export function RunTypeOverrideDetail({
     const base = baselineValueFor(field, baseline);
     const changed = value !== null && value !== base;
     const selectId = `run-type-${field}`;
-    const options = fieldOptions(field, runTypeKey, usesCodex, codexModelOptions);
-    // "Follow defaults" is unavailable for a Codex model, exactly as on the
-    // launch pickers (`ModelSelector`'s `allowDefaultOption` is Claude-only):
-    // an omitted model member resolves to the always-Claude floor, so offering
-    // it here would BE the cross-family pair rather than an escape from it.
+    const options = fieldOptions(field, runTypeKey, provider, codexModelOptions, ompModelOptions, omp, draftValue('agentRuntime'));
+    // "Follow defaults" is unavailable for a CODEX model, exactly as on the
+    // launch pickers: an omitted model member resolves to the always-Claude
+    // floor, so offering it here would BE the cross-family pair rather than an
+    // escape from it. It stays available on OMP, whose spawn seam DROPS that
+    // Claude floor (`normalizeAgentModelSelection`) and starts on OMP's own
+    // default — see `coerceModelForRuntime`, which encodes the same split.
     const allowFollowDefaults = !(field === 'model' && usesCodex);
-    // A Codex runtime carries no sdk/interactive transport of its own, so there
-    // is no substrate to pick — the control states that instead of offering a
-    // value the resolved runtime would contradict.
-    const notApplicable = field === 'substrate' && usesCodex;
+    // A non-Claude runtime carries no sdk/interactive transport of its own, so
+    // there is no substrate to pick — the control states that instead of
+    // offering a value the resolved runtime would contradict.
+    const notApplicable = field === 'substrate' && provider !== 'claude';
     return (
       <div key={field} className="flex flex-col gap-1" data-testid={`run-type-field-${field}`}>
         <label htmlFor={selectId} className="text-xs font-medium text-text-secondary">
@@ -267,15 +309,11 @@ export function RunTypeOverrideDetail({
           className="w-full rounded-input border border-border-primary bg-bg-primary px-2 py-1 text-sm text-text-primary disabled:opacity-50"
         >
           {allowFollowDefaults && <option value="">Follow defaults</option>}
-          {options.map((option) => (
-            <option key={option.id} value={option.id}>
-              {option.label}
-            </option>
-          ))}
+          {renderFieldOptions(options)}
         </select>
         {notApplicable && (
           <span className="text-xs text-text-tertiary" data-testid={`run-type-na-${field}`}>
-            Not applicable · the selected Codex runtime has no substrate
+            Not applicable · the selected {AGENT_PROVIDER_LABELS[provider]} runtime has no substrate
           </span>
         )}
         {changed && !notApplicable && (
@@ -409,6 +447,53 @@ export function RunTypeOverrideDetail({
 interface FieldOption {
   id: string;
   label: string;
+  /**
+   * Offered but not selectable on this machine — the label already names why
+   * (e.g. an omp-fleet row with no bridge configured). Distinct from an absent
+   * option: the row exists so the setting explains itself.
+   */
+  disabled?: boolean;
+  /**
+   * Optional section heading. Only OMP sets it — its catalog fronts many
+   * vendors (495 rows across anthropic / openai-codex / openrouter on the
+   * author's host), so a flat list is unnavigable. Consecutive options sharing
+   * a group render inside one <optgroup>.
+   */
+  group?: string;
+}
+
+/** Options as <option>s, folding any consecutive same-`group` run into an <optgroup>. */
+function renderFieldOptions(options: readonly FieldOption[]): React.JSX.Element[] {
+  const nodes: React.JSX.Element[] = [];
+  let index = 0;
+  while (index < options.length) {
+    const group = options[index]!.group;
+    if (group === undefined) {
+      const option = options[index]!;
+      nodes.push(
+        <option key={option.id} value={option.id} disabled={option.disabled === true}>
+          {option.label}
+        </option>,
+      );
+      index += 1;
+      continue;
+    }
+    const run: FieldOption[] = [];
+    while (index < options.length && options[index]!.group === group) {
+      run.push(options[index]!);
+      index += 1;
+    }
+    nodes.push(
+      <optgroup key={group} label={group}>
+        {run.map((option) => (
+          <option key={option.id} value={option.id} disabled={option.disabled === true}>
+            {option.label}
+          </option>
+        ))}
+      </optgroup>,
+    );
+  }
+  return nodes;
 }
 
 /** Option ids labelled from the same maps the chips and pickers already use. */
@@ -417,35 +502,46 @@ function labelled(field: RunTypeFieldId, ids: readonly string[]): FieldOption[] 
 }
 
 /**
- * The options offered for one field on one key, scoped to the runtime the key
+ * The options offered for one field on one key, scoped to the PROVIDER the key
  * would actually launch on.
  *
- * `model` is the load-bearing one: an unconditional Claude list let a Codex
- * runtime be paired with a Claude alias no matter how carefully the runtime
- * pick coerced. The Codex list is the SAME `model/list` catalog the launch
- * pickers render (`ModelSelector` / `ModelPill` via `useCodexModelCatalog`),
- * so Settings cannot offer a model a launch would not.
+ * `model` is the load-bearing one: an unconditional Claude list let a Codex or
+ * OMP runtime be paired with a Claude alias no matter how carefully the runtime
+ * pick coerced. Each non-Claude list is the SAME catalog the launch pickers
+ * render (`ModelSelector` / `ModelPill` via `useCodexModelCatalog` /
+ * `useOmpModelCatalog`), so Settings cannot offer a model a launch would not.
  *
- * `substrate` collapses to nothing on a Codex runtime — that family has no
- * sdk/interactive transport, so every value would disagree with the runtime.
+ * `substrate` collapses to nothing on a non-Claude runtime — neither family has
+ * an sdk/interactive transport, so every value would disagree with the runtime.
  */
 function fieldOptions(
   field: RunTypeFieldId,
   runTypeKey: string,
-  usesCodex: boolean,
+  provider: AgentProvider,
   codexModels: readonly CodexModelOption[],
+  ompModels: readonly OmpModelOption[],
+  omp: OmpAvailability,
+  currentRuntime: string | null,
 ): readonly FieldOption[] {
   switch (field) {
     case 'model':
-      return usesCodex
-        ? codexModels.map((o) => ({ id: o.id, label: o.label }))
-        : labelled(field, RUN_TYPE_MODEL_OPTIONS.map((o) => o.id));
+      if (provider === 'codex') return codexModels.map((o) => ({ id: o.id, label: o.label }));
+      if (provider === 'omp') {
+        return ompModels.map((o) => ({ id: o.id, label: o.label, group: o.ompProvider }));
+      }
+      return labelled(field, RUN_TYPE_MODEL_OPTIONS.map((o) => o.id));
     case 'reasoningEffort':
       return labelled(field, RUN_TYPE_EFFORT_OPTIONS);
     case 'substrate':
-      return usesCodex ? [] : labelled(field, ['sdk', 'interactive']);
+      return provider === 'claude' ? labelled(field, ['sdk', 'interactive']) : [];
     case 'agentRuntime':
-      return labelled(field, agentRuntimeOptions(runTypeKey));
+      return agentRuntimePickerOptions(runTypeKey, omp, currentRuntime).map((runtime) => {
+        const reason = runtimeUnavailableReason(runtime, omp);
+        const base = runTypeValueLabel(field, runtime);
+        return reason === null
+          ? { id: runtime, label: base }
+          : { id: runtime, label: `${base} (${reason})`, disabled: true };
+      });
     case 'permissionMode':
       return labelled(field, PERMISSION_MODE_OPTIONS.map((o) => o.id));
   }

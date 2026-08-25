@@ -15,7 +15,9 @@
  *   - paused / unlinked / epic entities ignored, and a MANUAL direction still
  *     enqueuing (the mode gates the drain, never the intent).
  *   - the IDEA PUSH trigger: a locally-created idea enqueues one create_issue
- *     per active connection, and each of its four skips.
+ *     per active connection, each of its four event-level skips, and the
+ *     per-connection `push_target = 0` skip that keeps sibling mapping rows
+ *     from filing the same idea N times.
  *   - decomposition: origin 'started' + one create_sub_issue per unlinked
  *     minted task, and NO creates when mirroring is off.
  *   - close_parent only once EVERY mirrored sibling is terminal — including
@@ -84,6 +86,11 @@ function makeConnectionRow(overrides: Partial<NewConnectionRow> = {}): NewConnec
     status_sync_mode: 'auto',
     pull_mode: 'auto',
     push_mode: 'auto',
+    push_target: 1,
+    content_sync_mode: 'off',
+    archive_sync_mode: 'off',
+    priority_mapping_json: '{}',
+    category_mapping_json: '{}',
     mirror_subissues: 1,
     conflict_mode: 'auto',
     cursor_updated_at: null,
@@ -448,11 +455,15 @@ describe('writeBack — decomposition', () => {
       expect(create.entity_type).toBe('task');
       expect(create.client_key).toMatch(/^[0-9a-f-]{36}$/);
     }
-    // Description prefers the body, falling back to the summary.
+    // Description prefers the body, falling back to the summary. The LOCAL
+    // priority/category ride along so the drain can map them against the
+    // workspace's live vocabulary — which only exists there.
     expect(JSON.parse(creates[0].payload_json)).toEqual({
       parentExternalId: 'ext-idea',
       title: 'Task TASK-1',
       description: 'body one',
+      priority: 'P2',
+      category: 'feature',
     });
     expect(JSON.parse(creates[1].payload_json).description).toBe('summary TASK-2');
   });
@@ -740,6 +751,21 @@ describe('writeBack — idea push (create_issue)', () => {
     expect(outbox(active)).toHaveLength(1);
   });
 
+  it('files ONE issue when sibling mapping rows share the project — only push_target = 1 pushes', () => {
+    // Two mappings of the same Linear workspace onto one cyboflow project: the
+    // second is import-only, or the idea would be filed twice remotely.
+    seedConnection({ id: 'conn-team-a', push_target: 1 });
+    seedConnection({ id: 'conn-team-b', push_target: 0 });
+    seedIdea('ide_1', 'IDEA-1');
+
+    makeListener().handleTaskChanged(createdEvent('ide_1', {}, 'user'));
+
+    const pushed = outbox('conn-team-a');
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0].kind).toBe('create_issue');
+    expect(outbox('conn-team-b')).toHaveLength(0);
+  });
+
   it('queues on a PUSH-MANUAL connection too — the drain is where the hold lives', () => {
     seedConnection({ push_mode: 'manual' });
     seedIdea('ide_1', 'IDEA-1');
@@ -764,5 +790,257 @@ describe('writeBack — idea push (create_issue)', () => {
     listener.handleTaskChanged(makeEvent('tsk_1', 'task', stageIds.idea, {}, 'created'));
 
     expect(outbox()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trigger 5 — content write-back
+// ---------------------------------------------------------------------------
+
+/**
+ * A baseline agreeing with `makeEvent`'s defaults on every synced field, so a
+ * test that changes exactly one thing produces exactly one reason to enqueue.
+ * `priority: '3'` is Linear Medium, which the seeded mapping round-trips with
+ * the P2 every synthesized event carries.
+ */
+const SYNCED_BASELINE = {
+  title: 'Title ide_1',
+  description: null,
+  stateId: 'state-backlog',
+  priority: '3',
+  category: null,
+};
+
+function linkIdea(
+  connectionId: string,
+  overrides: { baseline?: Record<string, unknown>; provider?: 'linear' | 'plane' | 'dart'; externalId?: string; entityId?: string } = {},
+): ReturnType<typeof upsertLink> {
+  return upsertLink(raw, {
+    connection_id: connectionId,
+    entity_type: 'idea',
+    entity_id: overrides.entityId ?? 'ide_1',
+    provider: overrides.provider ?? 'linear',
+    external_id: overrides.externalId ?? 'ext-1',
+    baseline_json: JSON.stringify(overrides.baseline ?? SYNCED_BASELINE),
+  });
+}
+
+/** An entity-change event for the linked idea, with one field moved. */
+function contentEvent(
+  overrides: Partial<BacklogTaskItem>,
+  actor?: TaskChangedEvent['actor'],
+): TaskChangedEvent {
+  const event = makeEvent('ide_1', 'idea', stageIds.idea, overrides, 'updated');
+  return actor === undefined ? event : { ...event, actor };
+}
+
+describe('writeBack — content trigger', () => {
+  beforeEach(() => {
+    seedIdea('ide_1', 'IDEA-1');
+  });
+
+  it('enqueues one update_content with an EMPTY payload when the title diverges', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    linkIdea(connectionId);
+
+    makeListener().handleTaskChanged(contentEvent({ title: 'Renamed' }));
+
+    const rows = outbox();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('update_content');
+    expect(rows[0].external_id).toBe('ext-1');
+    expect(rows[0].entity_id).toBe('ide_1');
+    // Drain-time compose: the row states an INTENT, never a payload.
+    expect(rows[0].payload_json).toBe('{}');
+  });
+
+  it('fires on description and on priority, in PROVIDER space', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    linkIdea(connectionId);
+    const listener = makeListener();
+
+    // P3 and P2 both map to Linear's '3' — a LOCAL-space diff would fire here
+    // and demote the user's P3 on the next inbound pass.
+    listener.handleTaskChanged(contentEvent({ priority: 'P3' }));
+    expect(outbox()).toHaveLength(0);
+
+    listener.handleTaskChanged(contentEvent({ priority: 'P0' }));
+    expect(outbox()).toHaveLength(1);
+  });
+
+  it('ignores the provenance FOOTER — only the remote-owned half of the body counts', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    linkIdea(connectionId, { baseline: { ...SYNCED_BASELINE, description: 'Shared body' } });
+
+    makeListener().handleTaskChanged(
+      contentEvent({ body: 'Shared body\n\n---\n<!-- cyboflow:tracker linear:ext-1 -->\nImported' }),
+    );
+
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it('does NOT fire on a provider-authored event, even when the entity diverges', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    linkIdea(connectionId);
+
+    makeListener().handleTaskChanged(contentEvent({ title: 'Renamed' }, 'linear'));
+
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it('does NOT fire when the baseline never synced the field (the backfill arm)', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    // A pre-feature link: no priority key at all.
+    linkIdea(connectionId, {
+      baseline: { title: 'Title ide_1', description: null, stateId: 'state-backlog' },
+    });
+
+    makeListener().handleTaskChanged(contentEvent({ priority: 'P0' }));
+
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it("declines the enqueue entirely when content sync is 'off'", () => {
+    const connectionId = seedConnection({ content_sync_mode: 'off' });
+    linkIdea(connectionId);
+
+    makeListener().handleTaskChanged(contentEvent({ title: 'Renamed' }));
+
+    // Not delayed — DECLINED. A queued row of a kind no drain will ever claim
+    // halts the inbound batch at this issue forever (invariant 5).
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it('collapses a burst onto the PENDING row, but succeeds an in-flight one', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto' });
+    linkIdea(connectionId);
+    const listener = makeListener();
+
+    listener.handleTaskChanged(contentEvent({ title: 'Rename 1' }));
+    listener.handleTaskChanged(contentEvent({ title: 'Rename 2' }));
+    expect(outbox()).toHaveLength(1);
+
+    // The row is now on the wire, carrying a payload composed from 'Rename 2'.
+    raw.prepare("UPDATE tracker_outbox SET state = 'in_flight'").run();
+    listener.handleTaskChanged(contentEvent({ title: 'Rename 3' }));
+
+    // Suppressing here would lose 'Rename 3' outright — the in-flight write is
+    // going to land the older text and no row would be left to say otherwise.
+    const rows = outbox();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.state)).toEqual(['in_flight', 'pending']);
+  });
+
+  it('gives two connections on ONE idea two independent decisions', () => {
+    const linearConn = seedConnection({ id: 'conn-linear', content_sync_mode: 'auto' });
+    const planeConn = seedConnection({
+      id: 'conn-plane',
+      provider: 'plane',
+      content_sync_mode: 'off',
+    });
+    linkIdea(linearConn, { externalId: 'ext-lin' });
+    linkIdea(planeConn, { provider: 'plane', externalId: 'proj/ext-plane' });
+
+    makeListener().handleTaskChanged(contentEvent({ title: 'Renamed' }));
+
+    expect(outbox('conn-linear')).toHaveLength(1);
+    // resolveLinked would have answered 'linear' and stopped; the off-mode
+    // connection has to be reached and then declined on its own terms.
+    expect(outbox('conn-plane')).toHaveLength(0);
+  });
+
+  it('says nothing about an entity on its way OUT of the tracker', () => {
+    const connectionId = seedConnection({ content_sync_mode: 'auto', archive_sync_mode: 'off' });
+    linkIdea(connectionId);
+
+    makeListener().handleTaskChanged(
+      contentEvent({ title: 'Renamed', archived_at: '2026-07-30 12:00:00' }),
+    );
+
+    expect(outbox()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trigger 6 — archive
+// ---------------------------------------------------------------------------
+
+describe('writeBack — archive trigger', () => {
+  beforeEach(() => {
+    seedIdea('ide_1', 'IDEA-1');
+  });
+
+  function archivedEvent(actor?: TaskChangedEvent['actor']): TaskChangedEvent {
+    return contentEvent({ archived_at: '2026-07-30 12:00:00' }, actor);
+  }
+
+  it('enqueues archive_issue on the archive, once, and supersedes every queued kind', () => {
+    const connectionId = seedConnection({ archive_sync_mode: 'auto', content_sync_mode: 'auto' });
+    const link = linkIdea(connectionId);
+    const listener = makeListener();
+
+    // A state write and a content write are already queued for this issue.
+    listener.handleTaskChanged(makeEvent('ide_1', 'idea', stageIds.done));
+    listener.handleTaskChanged(contentEvent({ title: 'Renamed' }));
+    expect(outbox()).toHaveLength(2);
+
+    listener.handleTaskChanged(archivedEvent());
+
+    const rows = outbox();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('archive_issue');
+    expect(rows[0].payload_json).toBe('{}');
+    expect(link.id).toBeGreaterThan(0);
+
+    // A replayed archive event adds nothing.
+    listener.handleTaskChanged(archivedEvent());
+    expect(outbox()).toHaveLength(1);
+  });
+
+  it("declines for 'off', for a provider with no archive endpoint, and for the provider actor", () => {
+    const off = seedConnection({ id: 'conn-off', archive_sync_mode: 'off' });
+    const plane = seedConnection({
+      id: 'conn-plane',
+      provider: 'plane',
+      archive_sync_mode: 'auto',
+    });
+    const linear = seedConnection({ id: 'conn-lin', archive_sync_mode: 'auto' });
+    linkIdea(off, { externalId: 'ext-off' });
+    linkIdea(plane, { provider: 'plane', externalId: 'proj/ext-plane' });
+    linkIdea(linear, { provider: 'dart', externalId: 'ext-dart' });
+    const listener = makeListener();
+
+    listener.handleTaskChanged(archivedEvent('linear'));
+    expect([...outbox('conn-off'), ...outbox('conn-plane'), ...outbox('conn-lin')]).toHaveLength(0);
+
+    listener.handleTaskChanged(archivedEvent());
+    expect(outbox('conn-off')).toHaveLength(0);
+    // Plane declares archive: 'none' — a row here could only ever throw, and an
+    // unsettleable row halts inbound for that issue forever.
+    expect(outbox('conn-plane')).toHaveLength(0);
+    expect(outbox('conn-lin')).toHaveLength(1);
+  });
+
+  it('re-arms after an unarchive: the stamp is cleared, and nothing is written remotely', () => {
+    const connectionId = seedConnection({ archive_sync_mode: 'auto' });
+    const link = linkIdea(connectionId, {
+      baseline: { ...SYNCED_BASELINE, archivedWrittenAt: '2026-07-29 09:00:00' },
+    });
+    const listener = makeListener();
+
+    // Already archived remotely -> the replayed archive says nothing.
+    listener.handleTaskChanged(archivedEvent());
+    expect(outbox()).toHaveLength(0);
+
+    // Unarchived locally: no remote write, but the stamp goes…
+    listener.handleTaskChanged(contentEvent({}));
+    expect(outbox()).toHaveLength(0);
+    expect(JSON.parse(getLinkByEntity(raw, 'idea', 'ide_1', 'linear')?.baseline_json ?? '{}')).not.toHaveProperty(
+      'archivedWrittenAt',
+    );
+
+    // …so a LATER archive is a genuine first write again.
+    listener.handleTaskChanged(archivedEvent());
+    expect(outbox().map((row) => row.kind)).toEqual(['archive_issue']);
   });
 });

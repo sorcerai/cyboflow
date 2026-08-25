@@ -114,6 +114,10 @@ function buildDb(): Database.Database {
   // recipe as 089/091/097, same must-run-LAST rule) — the "accepts every atype
   // in the union" loop below now iterates project-brief too.
   db.exec(readFileSync(join(migDir, '099_project_brief_artifact.sql'), 'utf-8'));
+  // Migration 102 widens the CHECK once more for 'idea-summary' (the per-idea
+  // component-ledger hub). Same ordering rule as above — each recreate carries
+  // only the atypes it names, so this must run last.
+  db.exec(readFileSync(join(migDir, '102_idea_summary_atype.sql'), 'utf-8'));
   return db;
 }
 

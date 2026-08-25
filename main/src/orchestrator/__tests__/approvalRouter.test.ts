@@ -45,7 +45,7 @@ describe('ApprovalRouter', () => {
   //         inside a single transaction
   // -------------------------------------------------------------------------
   it('requestApproval inserts approvals (pending) and sets workflow_runs to awaiting_review', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const noopSocketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -86,11 +86,90 @@ describe('ApprovalRouter', () => {
   });
 
   // -------------------------------------------------------------------------
+  // A run marked `stuck` while the human was deciding must still accept their
+  // answer. StuckDetector fires after 5 minutes of a stale pending approval —
+  // shorter than the ~30 minutes the OMP gate gives a human — and `stuck` is a
+  // NON-terminal state everywhere else (runLauncher's live-run set,
+  // runRecovery). Observed live 2026-08-21: stuck at 5m23s, approved at 6m14s,
+  // recorded 'rejected' by 'auto-policy' with the socket reply suppressed.
+  // -------------------------------------------------------------------------
+  it('respond (allow) revives a run marked stuck while awaiting the human', async () => {
+    const db = createTestDb({ includeStuckDetectedAt: true });
+    const adapter = dbAdapter(db);
+    const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
+    const router = ApprovalRouter.initialize(adapter);
+
+    const runId = 'run-stuck';
+    seedRun(db, { id: runId, status: 'running' });
+    const approvalPromise = router.requestApproval(runId, 'bash', { cmd: 'whoami' }, socketReply);
+    await router['getApprovalQueue'](runId).onIdle();
+
+    const approvalId = (db
+      .prepare('SELECT id FROM approvals WHERE run_id = ?')
+      .get(runId) as { id: string }).id;
+
+    // StuckDetector's transition, verbatim.
+    db.prepare(
+      `UPDATE workflow_runs
+          SET status = 'stuck', stuck_reason = 'cross_run_deadlock', stuck_detected_at = ?
+        WHERE id = ?`,
+    ).run(Date.now(), runId);
+
+    await router.respond(approvalId, { behavior: 'allow' });
+    const decision = await approvalPromise;
+
+    // The human said yes, and it was recorded as such — not converted to a deny.
+    expect(decision.behavior).toBe('allow');
+    expect(socketReply).toHaveBeenCalledWith(expect.objectContaining({ behavior: 'allow' }));
+    const approval = db
+      .prepare('SELECT status, decided_by FROM approvals WHERE id = ?')
+      .get(approvalId) as { status: string; decided_by: string };
+    expect(approval.status).toBe('approved');
+    expect(approval.decided_by).toBe('user');
+
+    // …and the run is running again, with the stuck markers cleared so no
+    // surface keeps reporting a block the human already answered.
+    const run = db
+      .prepare('SELECT status, stuck_reason, stuck_detected_at FROM workflow_runs WHERE id = ?')
+      .get(runId) as { status: string; stuck_reason: string | null; stuck_detected_at: number | null };
+    expect(run.status).toBe('running');
+    expect(run.stuck_reason).toBeNull();
+    expect(run.stuck_detected_at).toBeNull();
+  });
+
+  it('respond (deny) also revives a stuck run so the agent can try another way', async () => {
+    const db = createTestDb({ includeStuckDetectedAt: true });
+    const router = ApprovalRouter.initialize(dbAdapter(db));
+
+    const runId = 'run-stuck-deny';
+    seedRun(db, { id: runId, status: 'running' });
+    const approvalPromise = router.requestApproval(runId, 'bash', { cmd: 'whoami' }, vi.fn());
+    await router['getApprovalQueue'](runId).onIdle();
+    const approvalId = (db
+      .prepare('SELECT id FROM approvals WHERE run_id = ?')
+      .get(runId) as { id: string }).id;
+
+    db.prepare(
+      `UPDATE workflow_runs SET status = 'stuck', stuck_reason = 'orphan_pty', stuck_detected_at = ?
+        WHERE id = ?`,
+    ).run(Date.now(), runId);
+
+    await router.respond(approvalId, { behavior: 'deny' });
+    await approvalPromise;
+
+    const run = db
+      .prepare('SELECT status, stuck_reason FROM workflow_runs WHERE id = ?')
+      .get(runId) as { status: string; stuck_reason: string | null };
+    expect(run.status).toBe('running');
+    expect(run.stuck_reason).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
   // Case 2: respond after run is canceled → status guard (changes=0),
   //         socketReply NOT called with 'allow'
   // -------------------------------------------------------------------------
   it('respond (allow) after run is canceled does NOT call socketReply with allow', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -153,7 +232,7 @@ describe('ApprovalRouter', () => {
   //   that replaces the old "second throws RunNotRunningError" deny-storm path.
   // -------------------------------------------------------------------------
   it('a sibling requestApproval waits (does NOT throw) while one is in flight, then grabs after respond settles', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     const router = ApprovalRouter.initialize(adapter);
@@ -230,7 +309,7 @@ describe('ApprovalRouter', () => {
   //   denies (correct) rather than waiting forever.
   // -------------------------------------------------------------------------
   it('a waiting sibling throws RunNotRunningError when the run goes terminal', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const router = ApprovalRouter.initialize(adapter);
 
@@ -265,7 +344,7 @@ describe('ApprovalRouter', () => {
   //   txn attempt sees changes=0 and a non-awaiting_review status.
   // -------------------------------------------------------------------------
   it('requestApproval on an already-terminal run throws RunNotRunningError immediately', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const router = ApprovalRouter.initialize(adapter);
 
@@ -287,7 +366,7 @@ describe('ApprovalRouter', () => {
   //         agent can retry with a different tool.
   // -------------------------------------------------------------------------
   it("respond deny updates approvals to 'rejected' and transitions workflow_runs back to running", async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -340,7 +419,7 @@ describe('ApprovalRouter', () => {
   //         (TASK-302 code-review fix: reservation must happen inside the queue)
   // -------------------------------------------------------------------------
   it('two concurrent respond(deny) calls invoke socketReply exactly once', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -398,7 +477,7 @@ describe('ApprovalRouter', () => {
   //         workflow_runs back to 'running', socketReply called with allow
   // -------------------------------------------------------------------------
   it("respond(allow) on a non-canceled run marks approvals 'approved', run 'running', calls socketReply with allow", async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -448,7 +527,7 @@ describe('ApprovalRouter', () => {
   // Case 7: getPending() reflects in-flight approvals and clears after respond
   // -------------------------------------------------------------------------
   it('getPending returns in-flight approvals and is empty after respond', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -481,7 +560,7 @@ describe('ApprovalRouter', () => {
   // -------------------------------------------------------------------------
   // (Case 8 below — Cases 9-11 cover clearPendingForRun)
   it("emits 'approvalCreated' event after requestApproval transaction commits", async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -515,7 +594,7 @@ describe('ApprovalRouter', () => {
   //         socketReply NOT called, DB row updated to 'rejected'
   // -------------------------------------------------------------------------
   it('clearPendingForRun resolves in-flight pending entry with deny; socketReply NOT called; DB row rejected', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
@@ -563,7 +642,7 @@ describe('ApprovalRouter', () => {
   //          silent no-op
   // -------------------------------------------------------------------------
   it('clearPendingForRun on a runId with no pending entries is a silent no-op', () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     const router = ApprovalRouter.initialize(adapter);
@@ -579,7 +658,7 @@ describe('ApprovalRouter', () => {
   //          only clears the targeted run; the other entry remains intact
   // -------------------------------------------------------------------------
   it('clearPendingForRun only clears the targeted runId; unrelated entries remain intact', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReplyA = vi.fn<(decision: ApprovalDecision) => void>();
     const socketReplyB = vi.fn<(decision: ApprovalDecision) => void>();
@@ -654,7 +733,7 @@ describe('ApprovalRouter', () => {
   //  technique since clearPendingForRun must handle whatever is in the Map.
   // -------------------------------------------------------------------------
   it('clearPendingForRun with two pending entries for the same runId rejects both', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const socketReply1 = vi.fn<(decision: ApprovalDecision) => void>();
     const socketReply2 = vi.fn<(decision: ApprovalDecision) => void>();
@@ -715,7 +794,7 @@ describe('ApprovalRouter', () => {
   // clearPendingForRun PLUS a guarded awaiting_review → running restore.
   // -------------------------------------------------------------------------
   it('abandonPendingForRun settles the approval with deny AND restores the run to running', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
     const router = ApprovalRouter.initialize(dbAdapter(db));
 
@@ -752,7 +831,7 @@ describe('ApprovalRouter', () => {
   // later requestApproval takes the 'wait' branch forever — no approvals row, no
   // 'approvalCreated', nothing for the user to act on.
   it('a requestApproval AFTER abandonPendingForRun grabs immediately (inserts a row + emits approvalCreated)', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
 
     const runId = 'run-abandon-regrab';
@@ -785,7 +864,7 @@ describe('ApprovalRouter', () => {
   });
 
   it('abandonPendingForRun restores a wedged run with NO in-memory entry (the wedge outlives the entry)', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
 
     const runId = 'run-abandon-orphan';
@@ -803,7 +882,7 @@ describe('ApprovalRouter', () => {
   });
 
   it('abandonPendingForRun does NOT resurrect a run that concurrently went terminal', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
 
     const runId = 'run-abandon-canceled';
@@ -823,7 +902,7 @@ describe('ApprovalRouter', () => {
   });
 
   it('clearPendingForRun (termination path) leaves workflow_runs.status untouched', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
 
     const runId = 'run-terminate-status';
@@ -841,7 +920,7 @@ describe('ApprovalRouter', () => {
   });
 
   it('clearPendingForSource settles one invocation without canceling a sibling lane', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
     const runId = 'run-source-scoped';
     seedRun(db, { id: runId, status: 'running' });
@@ -960,7 +1039,7 @@ describe('ApprovalRouter', () => {
   // last test in the main describe, numbered 13.
   // -------------------------------------------------------------------------
   it('clearPendingForRun swallows a DB error and still resolves the pending promise with deny', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const socketReply = vi.fn<(decision: ApprovalDecision) => void>();
 
     // Inject a DB adapter whose prepare() throws for UPDATE approvals statements
@@ -1036,7 +1115,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   //             flips workflow_runs.status, and returns allow on respond(allow)
   // -------------------------------------------------------------------------
   it("routePreToolUseThroughApprovalRouter inserts approvals row, flips workflow_runs.status, and returns allow on respond(allow)", async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     const router = ApprovalRouter.initialize(adapter);
@@ -1085,7 +1164,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   //             (bridge contract regression)
   // -------------------------------------------------------------------------
   it("emits 'approvalCreated' exactly once with the inserted ApprovalRequest payload (bridge contract)", async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     const router = ApprovalRouter.initialize(adapter);
@@ -1130,7 +1209,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   //   - clearPendingForRun sweeps DB-only `pending` rows, scoped to the run
   // -------------------------------------------------------------------------
   it('respond settles a stale (DB-only) pending approval and emits approvalDecided', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
     const runId = 'run-stale';
     seedRun(db, { id: runId, status: 'canceled' });
@@ -1152,7 +1231,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   });
 
   it('respond (stale allow) settles the DB row to approved', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
     const runId = 'run-stale-allow';
     seedRun(db, { id: runId, status: 'canceled' });
@@ -1165,7 +1244,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   });
 
   it('respond throws ApprovalNotFoundError when nothing pending exists (unknown or already-terminal)', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
     const runId = 'run-none';
     seedRun(db, { id: runId, status: 'canceled' });
@@ -1176,7 +1255,7 @@ describe("ApprovalRouter — PreToolUse end-to-end (real ApprovalRouter + real S
   });
 
   it('clearPendingForRun sweeps DB-only pending approvals (scoped to the run) and emits approvalDecided', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const router = ApprovalRouter.initialize(dbAdapter(db));
     const runId = 'run-sweep';
     seedRun(db, { id: runId, status: 'awaiting_review' });

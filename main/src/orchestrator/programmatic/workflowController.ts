@@ -47,6 +47,7 @@ import type {
   StepReport,
   StepRunner,
   SupervisorEvent,
+  VisualGateOutcome,
 } from './types';
 import { FAN_OUT_LANE_ATTEMPT_CAP } from './types';
 import { createRunDirectives, type RunDirectives } from './runDirectives';
@@ -683,6 +684,18 @@ export class WorkflowController {
    * on 'giveup' / seam-absent / budget-exhausted they are failed like a blocked
    * lane. `systemicPauses` is the SAME run-level map the single-step path uses,
    * keyed here on the outer step id.
+   *
+   * Operator LANE REWIND: `RunDirectives.laneRewinds` lets the monitor pull ONE
+   * lane back to an earlier inner step while the fan-out stays live — sibling
+   * lanes, the outer walk, and the run's step_results are untouched (that is the
+   * whole-run `rewindRunHandler`'s job). The request is consulted at THREE points
+   * in `driveItem` so it lands wherever the lane happens to be: idle between inner
+   * steps, mid-agent-turn (the handler kills the lane's spawn to force the step to
+   * return, and the pending request is what keeps the resulting failure from
+   * failing the lane), and parked at the visual merge gate (woken via the
+   * `laneInterrupts` unpark hook this method registers around the park). A rewind
+   * restores the lane's automatic loopback budgets but never bumps its attempt
+   * counter — see `clearStateForRewind`.
    */
   private async runFanOut(
     runId: string,
@@ -719,6 +732,55 @@ export class WorkflowController {
     /** Resolve a declared inner-chain loopback target; invalid data fails the lane. */
     const loopbackIndex = (innerStep: (typeof inner)[number]): number =>
       innerStep.loopback === undefined ? -1 : inner.findIndex((candidate) => candidate.id === innerStep.loopback);
+    /** Chain index of the step that COMPOSES the visual-verification task, or -1. */
+    const taskVerifyIndex = inner.findIndex((candidate) => candidate.id === SPRINT_TASK_VERIFY_STEP);
+
+    /**
+     * Consume a pending OPERATOR LANE REWIND for `itemId` (RunDirectives.laneRewinds,
+     * written by the monitor's `rewind_lane_to_step` action) and resolve it to an
+     * inner-chain index, or null when there is nothing to honor.
+     *
+     * ALWAYS deletes the request it read, including on every rejection path — a
+     * request the lane cannot honor must not persist and re-fire at the next
+     * consult point (an unknown id would then re-refuse on every inner step for the
+     * rest of the lane's life, and a stale forward target would jump the lane
+     * forward the moment its chain position caught up).
+     *
+     * Two rejections, both logged rather than lane-failing (an operator's malformed
+     * ask must never destroy in-flight work):
+     *   - a target that is not in THIS fan-out's inner chain, and
+     *   - a FORWARD target (`targetIndex > currentIndex`): rewind means backward.
+     *     The handler already checked this against the lane's persisted pointer;
+     *     re-checking against the live in-memory index closes the window where the
+     *     lane advanced between the operator's request and this consult.
+     * `targetIndex === currentIndex` IS honored — "restart this step" — mirroring
+     * the whole-run rewind's `target === current` allowance.
+     */
+    const takeLaneRewind = (itemId: string, currentIndex: number): number | null => {
+      const targetId = this.directives.laneRewinds.get(itemId);
+      if (targetId === undefined) return null;
+      this.directives.laneRewinds.delete(itemId);
+      const targetIndex = inner.findIndex((candidate) => candidate.id === targetId);
+      if (targetIndex < 0) {
+        this.host.log?.(
+          'warn',
+          `fan-out item '${itemId}': operator asked to rewind to '${targetId}', which is not one of this fan-out's inner steps; ignoring`,
+        );
+        return null;
+      }
+      if (targetIndex > currentIndex) {
+        this.host.log?.(
+          'warn',
+          `fan-out item '${itemId}': operator asked to rewind to '${targetId}', which is AHEAD of the lane's current step; ignoring (rewind only goes backward)`,
+        );
+        return null;
+      }
+      this.host.log?.(
+        'info',
+        `fan-out item '${itemId}': operator rewind → '${targetId}' (from inner index ${currentIndex})`,
+      );
+      return targetIndex;
+    };
     // The park step is NOT an inner-chain id, so the lane-store vocabulary must be
     // widened to accept it when the controller parks at the merge-gate.
     const parkAllowedStepIds: readonly string[] = [...allowedStepIds, AWAITING_VERIFY_STEP];
@@ -774,8 +836,54 @@ export class WorkflowController {
       let pendingContractError: string | undefined;
       let pendingLoopbackFeedback: string | undefined;
 
+      /**
+       * Reset the per-attempt state an OPERATOR LANE REWIND invalidates, so the
+       * re-driven region starts from a clean slate rather than inheriting the
+       * superseded attempt's leftovers.
+       *
+       * What is cleared and why:
+       *   - the one-shot prompt sections (a task-verify contract defect, a visual
+       *     FAIL report) and any armed loopback attempt write — they describe work
+       *     the rewind is discarding;
+       *   - `adoptedPreFiredRequest` — the adopted request belongs to the
+       *     superseded attempt;
+       *   - `visualVerifyTask`, but ONLY when the target is at or before the
+       *     task-verify step that composed it (a rewind landing AFTER task-verify
+       *     keeps the still-current task);
+       *   - the AUTOMATIC loopback budgets (`laneContractRetries`,
+       *     `visualLoopbacks`) — an exhausted budget would make the rewind
+       *     cosmetic, failing the lane on the first defect of the very region the
+       *     operator just asked to redo.
+       *
+       * What is deliberately NOT touched: `laneAttempt`. It is written to the lane
+       * row and read by humans as the re-delegate count, and bumping it would BURN
+       * the lane's FAN_OUT_LANE_ATTEMPT_CAP budget on an operator action — the same
+       * reasoning that makes an operator skip of a required step advance the walk
+       * instead of failing the run.
+       */
+      const clearStateForRewind = (targetIndex: number): void => {
+        pendingContractError = undefined;
+        pendingLoopbackFeedback = undefined;
+        loopbackAttemptStepIndex = undefined;
+        adoptedPreFiredRequest = false;
+        laneContractRetries = 0;
+        visualLoopbacks = 0;
+        if (taskVerifyIndex >= 0 && targetIndex <= taskVerifyIndex) visualVerifyTask = undefined;
+      };
+
       for (let k = 0; k < inner.length; k++) {
         if (signal?.aborted) return 'aborted';
+        // Operator LANE REWIND — consult 1 of 3 (IDLE between inner steps). Covers
+        // a request that lands while the lane is between turns (mid commit-probe,
+        // or in the gap before the next step's lane write). Consulted BEFORE the
+        // skip check and before any lane write, so the skipped-over steps are never
+        // stamped onto the lane pointer.
+        const idleRewind = takeLaneRewind(itemId, k);
+        if (idleRewind !== null) {
+          clearStateForRewind(idleRewind);
+          k = idleRewind - 1; // The loop's k++ lands on the target next.
+          continue;
+        }
         const innerStep = inner[k];
         // Operator SKIP (RunDirectives): skip this inner step for the lane,
         // mirroring the optional-inner-skip idiom below — advance to the next
@@ -842,11 +950,41 @@ export class WorkflowController {
             currentStepId: AWAITING_VERIFY_STEP,
             allowedStepIds: parkAllowedStepIds,
           });
-          const outcome = await this.host.visualGate.awaitVerdict({
-            runId,
-            itemId,
-            ...(signal ? { signal } : {}),
-          });
+          // A lane parked here is blocked on an ASYNC verdict no spawn abort can
+          // break, so an operator rewind needs its own wake-up path: park on a
+          // per-lane AbortController instead of the run signal directly, chain the
+          // run signal into it (so a run cancel still aborts the gate exactly as
+          // before), and publish its abort as this lane's UNPARK hook for the
+          // duration of the park. RunExecutor.requestLaneRewind fires that hook
+          // AFTER recording the request, so the consult below always finds it.
+          const parkAbort = new AbortController();
+          const onRunAbort = (): void => parkAbort.abort();
+          if (signal?.aborted === true) parkAbort.abort();
+          else signal?.addEventListener('abort', onRunAbort, { once: true });
+          this.directives.laneInterrupts.set(itemId, onRunAbort);
+          let outcome: VisualGateOutcome;
+          try {
+            outcome = await this.host.visualGate.awaitVerdict({
+              runId,
+              itemId,
+              signal: parkAbort.signal,
+            });
+          } finally {
+            this.directives.laneInterrupts.delete(itemId);
+            signal?.removeEventListener('abort', onRunAbort);
+          }
+          // Operator LANE REWIND — consult 3 of 3 (PARKED at the merge gate). The
+          // unpark hook above resolves `awaitVerdict` as 'aborted'; this consult is
+          // what tells that abort apart from a real run cancellation, so the lane
+          // re-drives instead of ending the whole fan-out as canceled.
+          if (!signal?.aborted) {
+            const parkRewind = takeLaneRewind(itemId, k);
+            if (parkRewind !== null) {
+              clearStateForRewind(parkRewind);
+              k = parkRewind - 1; // The loop's k++ lands on the target next.
+              continue;
+            }
+          }
           if (outcome.kind === 'aborted') return 'aborted';
           if (outcome.kind === 'failed') {
             driver.driveLane({ runId, itemId, status: 'failed', allowedStepIds });
@@ -927,6 +1065,23 @@ export class WorkflowController {
         pendingContractError = undefined;
         pendingLoopbackFeedback = undefined;
         const result = await this.runner.runStep(synthesized, ctx);
+
+        // Operator LANE REWIND — consult 2 of 3 (MID-AGENT-TURN). This is the
+        // load-bearing one for a STUCK lane: the handler kills that lane's spawn
+        // (its `${runId}:${itemId}` key) to force this await to return, and the
+        // spawn rejection surfaces here as a plain `failed` result because the RUN
+        // signal never fired. Consulting BEFORE the aborted/failed handling is what
+        // stops that operator-induced failure from consuming a loopback attempt or
+        // failing the lane outright. Guarded on the run signal so a genuine run
+        // cancellation still wins (the request simply stays unread on a dying run).
+        if (!signal?.aborted) {
+          const stepRewind = takeLaneRewind(itemId, k);
+          if (stepRewind !== null) {
+            clearStateForRewind(stepRewind);
+            k = stepRewind - 1; // The loop's k++ lands on the target next.
+            continue;
+          }
+        }
 
         if (result.status === 'aborted') return 'aborted';
         if (result.status === 'failed') {

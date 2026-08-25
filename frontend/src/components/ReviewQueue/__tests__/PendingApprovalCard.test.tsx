@@ -59,7 +59,7 @@ vi.mock('../../../trpc/client', () => ({
   },
 }));
 
-import { PendingApprovalCard } from '../PendingApprovalCard';
+import { PendingApprovalCard, resolveRequesterLabel } from '../PendingApprovalCard';
 import { useReviewQueueSlice } from '../../../stores/reviewQueueSlice';
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,9 @@ const baseApproval: Approval = {
   rationale: null,
   createdAt: new Date(Date.now() - 120_000).toISOString(),
   status: 'pending',
+  awaited: true,
+  sessionName: null,
+  agentProvider: null,
 };
 
 const singleItem: QueueItem = { kind: 'single', approval: baseApproval, isBlocking: false };
@@ -88,6 +91,9 @@ const groupApprovals: Approval[] = Array.from({ length: 3 }, (_, i) => ({
   rationale: null,
   createdAt: new Date(Date.now() - 120_000).toISOString(),
   status: 'pending' as const,
+  awaited: true,
+  sessionName: null,
+  agentProvider: null,
 }));
 
 const groupItem: QueueItem = {
@@ -468,5 +474,86 @@ describe('PendingApprovalCard — baseline behavior', () => {
     await waitFor(() => {
       expect(mockApproveRestOfRunMutate).toHaveBeenCalledWith({ runId: 'run-group' });
     });
+  });
+});
+
+describe('PendingApprovalCard — standing (un-awaited) asks', () => {
+  it('labels an un-awaited approval as having no agent waiting, and never as blocked', () => {
+    // The card is still fully answerable: a decision on a standing ask is
+    // honored if the agent retries the same call, this turn or a later one.
+    // What must NOT appear is the red "blocked" badge, which asserts a halted
+    // agent that has in fact moved on.
+    const standing: QueueItem = {
+      kind: 'single',
+      approval: { ...baseApproval, awaited: false },
+      isBlocking: false,
+    };
+    render(<PendingApprovalCard item={standing} />);
+
+    expect(screen.getByText('no agent waiting')).toBeInTheDocument();
+    expect(screen.queryByText(/^blocked /)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /approve/i })).toBeEnabled();
+  });
+
+  it('says nothing extra for an ordinary awaited approval', () => {
+    render(<PendingApprovalCard item={singleItem} />);
+    expect(screen.queryByText('no agent waiting')).not.toBeInTheDocument();
+  });
+});
+
+describe('resolveRequesterLabel', () => {
+  it('prefers the session name, which is the part a human recognizes', () => {
+    expect(
+      resolveRequesterLabel({ sessionName: 'noble-wolf', workflowName: '__quick__' }),
+    ).toBe('noble-wolf');
+  });
+
+  it('drops the __quick__ sentinel rather than showing it', () => {
+    // Every chat session shares it, so as a label it identified nothing — a
+    // live queue of cards all reading `__quick__` is what prompted this.
+    expect(resolveRequesterLabel({ sessionName: null, workflowName: '__quick__' })).toBe('');
+  });
+
+  it('falls back to a real workflow name for a flow run', () => {
+    expect(resolveRequesterLabel({ sessionName: null, workflowName: 'Sprint' })).toBe('Sprint');
+  });
+
+  it('treats a blank session name as absent', () => {
+    expect(resolveRequesterLabel({ sessionName: '   ', workflowName: 'Sprint' })).toBe('Sprint');
+  });
+});
+
+describe('PendingApprovalCard attribution', () => {
+  it('shows the session name and provider badge', () => {
+    render(
+      <PendingApprovalCard
+        item={{
+          kind: 'single',
+          approval: {
+            ...baseApproval,
+            workflowName: '__quick__',
+            sessionName: 'noble-wolf',
+            agentProvider: 'omp',
+          },
+          isBlocking: false,
+        }}
+      />,
+    );
+    expect(screen.getByText('noble-wolf')).toBeInTheDocument();
+    expect(screen.getByText('omp')).toBeInTheDocument();
+    expect(screen.queryByText('__quick__')).not.toBeInTheDocument();
+  });
+
+  it('renders no provider badge when the run predates the provider axis', () => {
+    render(
+      <PendingApprovalCard
+        item={{
+          kind: 'single',
+          approval: { ...baseApproval, agentProvider: null },
+          isBlocking: false,
+        }}
+      />,
+    );
+    expect(screen.queryByTitle(/Asked by a/)).not.toBeInTheDocument();
   });
 });

@@ -30,7 +30,7 @@ import { McpQueryHandler, type McpQueryResponse } from '../mcpServer/mcpQueryHan
 import { dbAdapter } from '../__test_fixtures__/dbAdapter';
 import { SprintLaneStore, sprintLaneEvents } from '../sprintLaneStore';
 import { runStatusEvents } from '../trpc/routers/events';
-import { SPRINT_BATCH_MAX_TASKS } from '../../../../shared/types/sprintBatch';
+import { SPRINT_BATCH_MAX_TASKS_DEFAULTS } from '../../../../shared/types/sprintBatch';
 import type { RunStatusChangedEvent } from '../../../../shared/types/cyboflow';
 
 // ---------------------------------------------------------------------------
@@ -263,7 +263,7 @@ describe('cyboflow_create_sprint_batch (ship handoff seam)', () => {
   // (e) over-cap -> ship_batch_too_large.
   it('rejects with ship_batch_too_large when the task count exceeds the substrate cap', async () => {
     seedShipRun(db, { runId: 'run-e', substrate: 'sdk' });
-    const overCap = SPRINT_BATCH_MAX_TASKS.sdk + 1;
+    const overCap = SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk + 1;
     for (let i = 0; i < overCap; i++) {
       seedCreatedTask(db, { runId: 'run-e', taskId: `tsk_${i}`, ref: `TASK-${100 + i}`, seq: 1 });
     }

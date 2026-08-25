@@ -48,17 +48,20 @@
  *     (passing the chosen agentPermissionMode + substrate) and calls
  *     setActiveQuickSession itself.
  *   - design: also gated behind {@link IdeaPickerModal} (single-select — a
- *     design session is idea-bound, design-mode.md "Idea link"), then the SAME
- *     {@link useQuickSession} hook as `quick`, but with the substrate/provider/
- *     runtime hard-coded to 'sdk'/'claude'/'claude-sdk' regardless of the
- *     wizard's agentRuntime state (a security boundary — the MCP scope
- *     mechanism that limits a design session's toolset exists only on the SDK
- *     path), the picked idea id threaded as the new `designIdeaId` param, and
- *     `DESIGN_KICKOFF_PROMPT` threaded as `kickoffPrompt` (design-mode.md
- *     v0.5 "Auto-start") so the session's first turn is sent automatically.
- *     Its `onSuccess` additionally calls `useDesignModeStore.enterDesignMode`
- *     (gated by `isDesignLaunchRef`, set by `launchDesign`) so the wizard
- *     lands directly in the fullscreen design surface.
+ *     design session is idea-bound, design-mode.md "Idea link"), then the
+ *     shared {@link useDesignLaunch} hook's OWN `useQuickSession` instance
+ *     (idea sessions plan, Stage 4/5 "useDesignLaunch extraction") — the
+ *     substrate/provider/runtime hard-coded to 'sdk'/'claude'/'claude-sdk'
+ *     regardless of the wizard's agentRuntime state (a security boundary —
+ *     the MCP scope mechanism that limits a design session's toolset exists
+ *     only on the SDK path), the picked idea id threaded as `designIdeaId`,
+ *     and `DESIGN_KICKOFF_PROMPT` threaded as `kickoffPrompt` (design-mode.md
+ *     v0.5 "Auto-start") so the session's first turn is sent automatically —
+ *     all live in the hook now. Its `onSuccess` calls
+ *     `useDesignModeStore.enterDesignMode` unconditionally (every success on
+ *     that dedicated instance is a design launch) plus, via
+ *     `overrides.onSuccess`, this wizard's own toast/telemetry/navigation —
+ *     see `launchDesign`'s doc comment.
  *   - launch ('launch', the interview-driven super-planner): gated behind
  *     {@link LaunchPromptModal} — a free-text "what are you trying to build?"
  *     answer grounds the interview's first turn; the trimmed answer is
@@ -81,13 +84,12 @@ import { useNavigationStore } from '../../../stores/navigationStore';
 import { useCyboflowStore } from '../../../stores/cyboflowStore';
 import { useConfigStore } from '../../../stores/configStore';
 import { useQuickSession } from '../../../hooks/useQuickSession';
+import { useDesignLaunch } from '../../../hooks/useDesignLaunch';
 import { useSeededSelection } from '../../../hooks/useSeededSelection';
 import {
   useSaveRunTypeDefault,
   SAVE_DEFAULT_TOAST_MS,
 } from '../../../hooks/useSaveRunTypeDefault';
-import { useDesignModeStore } from '../../../stores/designModeStore';
-import { DESIGN_KICKOFF_PROMPT } from '../design/designKickoff';
 import { ensureSessionForLaunch } from '../../../utils/ensureSessionForLaunch';
 import { IdeaPickerModal } from '../IdeaPickerModal';
 import { TaskBatchPickerModal } from '../TaskBatchPickerModal';
@@ -687,14 +689,6 @@ export default function SessionStartWizard(): React.JSX.Element {
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [isLaunching, setIsLaunching] = useState(false);
   const startInFlightRef = useRef(false);
-  // Design-launch detection for the shared useQuickSession onSuccess below
-  // (design-mode.md v0.5 "Auto-start"): launchDesign sets this synchronously,
-  // in the same tick it invokes startQuickSession, before any of the hook's
-  // awaited work resolves — so it is race-free within this component. Reset
-  // on every startQuickSession call site (not only design's own success path)
-  // so a failed design launch (onSuccess never fires) can never leak `true`
-  // into a later non-design launch.
-  const isDesignLaunchRef = useRef(false);
   // A wizard workflow launch creates a host session before runs.start can
   // validate the provider mix. Keep that session attached to the pending
   // attempt so a mixed-provider retry reuses its worktree instead of creating
@@ -727,22 +721,20 @@ export default function SessionStartWizard(): React.JSX.Element {
 
   // ── Quick session hook (bound to the locked project) ─────────────────────
   // Constructed unconditionally at top level (rules of hooks); only USED when
-  // allowQuick. setActiveQuickSession is performed inside the hook.
+  // allowQuick. setActiveQuickSession is performed inside the hook. Quick +
+  // Ultracode ONLY — Design has its own dedicated instance via useDesignLaunch
+  // below (idea sessions plan, Stage 4/5 "useDesignLaunch extraction"), so this
+  // one no longer needs an isDesignLaunchRef-style gate to tell a design
+  // success apart from a quick/ultracode one.
   const {
     start: startQuickSession,
     isStarting: isQuickStarting,
     error: quickError,
   } = useQuickSession({
     projectId: allowQuick ? selectedProjectId : null,
-    onSuccess: (sessionId) => {
+    onSuccess: () => {
       setToast(`Starting quick session on ${banner.name}`);
       notifyQuickSessionCreated({ projectId: selectedProjectId });
-      // Design-only: drop straight into the fullscreen surface (design-mode.md
-      // v0.5 "Auto-start"). See isDesignLaunchRef's declaration above.
-      if (isDesignLaunchRef.current) {
-        isDesignLaunchRef.current = false;
-        useDesignModeStore.getState().enterDesignMode(sessionId);
-      }
       // CyboflowRoot reads navigationStore.activeProjectId as its `projectId`
       // prop, and gates the WHOLE quick-session surface on it being non-null
       // (QuickSessionCanvas + TerminalDock + dock tabs). Nothing on the way into
@@ -756,6 +748,15 @@ export default function SessionStartWizard(): React.JSX.Element {
       useNavigationStore.getState().goToSession();
     },
   });
+
+  // Design's own launch hook (idea sessions plan, Stage 4/5). Same allowQuick
+  // gate as the shared instance above — DesignCard is only ever offered
+  // (below, ③) while allowQuick is true, exactly like QuickSessionCard.
+  const {
+    launchDesign: launchDesignSession,
+    isLaunching: isDesignLaunching,
+    error: designLaunchError,
+  } = useDesignLaunch(allowQuick ? selectedProjectId : null);
 
   // Auto-dismiss the launch toast (it normally outlives this component only
   // briefly, since the launch handlers navigate away — but if the wizard stays
@@ -959,7 +960,7 @@ export default function SessionStartWizard(): React.JSX.Element {
       try {
         const workflowRuntime = workflowRuntimeForLaunch(agentRuntime);
         if (workflowRuntime === null) {
-          throw new Error('Codex PTY is only available for quick sessions.');
+          throw new Error('Codex (CLI) is only available for quick sessions.');
         }
         const launchSubstrate = substrateForRuntime(workflowRuntime);
         // Ensure the run executes INSIDE a session. This wizard IS the explicit
@@ -1088,7 +1089,7 @@ export default function SessionStartWizard(): React.JSX.Element {
       try {
         const workflowRuntime = workflowRuntimeForLaunch(agentRuntime);
         if (workflowRuntime === null) {
-          throw new Error('Codex PTY is only available for quick sessions.');
+          throw new Error('Codex (CLI) is only available for quick sessions.');
         }
         const launchSubstrate = substrateForRuntime(workflowRuntime);
         // forceNew: the wizard always starts a NEW session (see launchRun).
@@ -1158,37 +1159,41 @@ export default function SessionStartWizard(): React.JSX.Element {
 
   // Design launch — fires from the idea-picker confirm callback
   // (handleIdeaPicked), never directly from the CTA (see handleStart's design
-  // arm below). Hard-pins the SDK substrate + Claude provider/runtime
-  // regardless of the wizard's agentRuntime state (design-mode.md "Session
-  // plumbing": design sessions resolve to the Claude SDK substrate
-  // unconditionally — a security boundary, since the MCP scope mechanism that
-  // limits a design session's toolset exists only on that path) and threads
-  // the picked idea id as `designIdeaId` so createQuick can validate ownership
-  // and stamp sessions.design_idea_id server-side.
+  // arm below). A thin wrapper over useDesignLaunch's `launchDesignSession`
+  // (idea sessions plan, Stage 4/5 "useDesignLaunch extraction"): this is the
+  // ONLY thing that changed in the move — the hard-pinned SDK substrate +
+  // Claude provider/runtime, the designIdeaId threading, and the actual
+  // createQuick call all now live in the shared hook. What stays HERE is
+  // exactly what is specific to the wizard's own Configure UI: reading the
+  // live Advanced-section state (permissionMode / model / fastMode /
+  // disabledMcpServers / the plugin diff / worktreeModeOverride /
+  // reasoningEffort) and the wizard's own post-launch side effects (toast +
+  // onboarding telemetry + navigation), which useDesignLaunch's dedicated
+  // instance does not — and must not — run for a caller with no wizard UI.
   const launchDesign = useCallback(
     (ideaId: string) => {
       const pluginSelection = sameStringSet(enabledPlugins, pluginBaseline) ? undefined : enabledPlugins;
-      // Set BEFORE invoking startQuickSession — see isDesignLaunchRef's
-      // declaration for the race-free reasoning.
-      isDesignLaunchRef.current = true;
-      void startQuickSession(
+      void launchDesignSession(ideaId, {
         permissionMode,
-        'sdk',
-        undefined,
         model,
         fastMode,
         disabledMcpServers,
-        pluginSelection,
-        worktreeModeOverride !== 'inherit' ? worktreeModeOverride : undefined,
-        'claude',
-        'claude-sdk',
-        reasoningEffort ?? undefined,
-        ideaId,
-        DESIGN_KICKOFF_PROMPT,
-      );
+        enabledPlugins: pluginSelection,
+        worktreeModeOverride: worktreeModeOverride !== 'inherit' ? worktreeModeOverride : undefined,
+        reasoningEffort: reasoningEffort ?? undefined,
+        // Mirrors the shared useQuickSession onSuccess above, minus
+        // enterDesignMode (the hook already calls it) — see this callback's
+        // doc comment.
+        onSuccess: () => {
+          setToast(`Starting quick session on ${banner.name}`);
+          notifyQuickSessionCreated({ projectId: selectedProjectId });
+          useNavigationStore.getState().setActiveProjectId(selectedProjectId);
+          useNavigationStore.getState().goToSession();
+        },
+      });
     },
     [
-      startQuickSession,
+      launchDesignSession,
       permissionMode,
       model,
       fastMode,
@@ -1197,6 +1202,8 @@ export default function SessionStartWizard(): React.JSX.Element {
       pluginBaseline,
       worktreeModeOverride,
       reasoningEffort,
+      banner.name,
+      selectedProjectId,
     ],
   );
 
@@ -1217,10 +1224,6 @@ export default function SessionStartWizard(): React.JSX.Element {
       const pluginSelection = sameStringSet(enabledPlugins, pluginBaseline) ? undefined : enabledPlugins;
       const quickSubstrate = substrateForRuntime(sessionRuntime);
       const quickProvider = providerForRuntime(sessionRuntime);
-      // Defensive reset: a previously FAILED design launch never reaches
-      // onSuccess (where the flag is normally cleared) — guard against it
-      // leaking into this non-design launch.
-      isDesignLaunchRef.current = false;
       void startQuickSession(
         permissionMode,
         quickSubstrate,
@@ -1248,8 +1251,6 @@ export default function SessionStartWizard(): React.JSX.Element {
       // spawn receives the model via claudeConfig and enforces the deny/plugin
       // sets. Fast mode stays QUICK-only (its toggle never shows here).
       const pluginSelection = sameStringSet(enabledPlugins, pluginBaseline) ? undefined : enabledPlugins;
-      // Defensive reset — see the 'quick' branch above.
-      isDesignLaunchRef.current = false;
       void startQuickSession(
         permissionMode,
         'interactive',
@@ -1385,7 +1386,7 @@ export default function SessionStartWizard(): React.JSX.Element {
   }, [mixedProviderPrompt, cleanupUnusedHostedSession]);
 
   // ── CTA label / disabled ─────────────────────────────────────────────────
-  const ctaBusy = isLaunching || isQuickStarting;
+  const ctaBusy = isLaunching || isQuickStarting || isDesignLaunching;
   const workflowRuntimeBlocked =
     selection?.kind === 'workflow' && workflowRuntimeForLaunch(agentRuntime) === null;
   const effectiveRuntime: LaunchAgentRuntime =
@@ -1514,7 +1515,7 @@ export default function SessionStartWizard(): React.JSX.Element {
     agentRuntime !== runtimeSeed ||
     (selection?.kind === 'quick' && reasoningEffort !== reasoningEffortSeed);
 
-  const combinedError = launchError ?? quickError;
+  const combinedError = launchError ?? quickError ?? designLaunchError;
 
   // Selected-project banner card — shared by the workflow step (②) and the
   // configure step (③).

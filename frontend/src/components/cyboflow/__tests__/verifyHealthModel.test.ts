@@ -121,13 +121,13 @@ describe('runbookLine', () => {
   });
 
   it('warns the same way for a registered but unproven draft', () => {
-    const line = runbookLine({ status: 'unproven-draft', version: 3, portableHash: 'h' });
+    const line = runbookLine({ status: 'unproven-draft', version: 3, portableHash: 'h', origin: null });
     expect(line.tone).toBe('warn');
     expect(line.text).toMatch(/v3 not proven/);
   });
 
   it('reports a proven runbook as ok', () => {
-    const line = runbookLine({ status: 'proven', version: 7, portableHash: 'h' });
+    const line = runbookLine({ status: 'proven', version: 7, portableHash: 'h', origin: null });
     expect(line.tone).toBe('ok');
     expect(line.text).toBe('runbook v7 proven');
   });
@@ -180,7 +180,7 @@ describe('hasProvenRunbook', () => {
   it('is false with no modalities, or with only unproven drafts', () => {
     expect(hasProvenRunbook([])).toBe(false);
     expect(
-      hasProvenRunbook([modality({ runbook: { status: 'unproven-draft', version: 1, portableHash: 'h' } })]),
+      hasProvenRunbook([modality({ runbook: { status: 'unproven-draft', version: 1, portableHash: 'h', origin: null } })]),
     ).toBe(false);
   });
 
@@ -188,7 +188,7 @@ describe('hasProvenRunbook', () => {
     expect(
       hasProvenRunbook([
         modality({ modality: 'web', runbook: null }),
-        modality({ modality: 'cdp-app', runbook: { status: 'proven', version: 1, portableHash: 'h' } }),
+        modality({ modality: 'cdp-app', runbook: { status: 'proven', version: 1, portableHash: 'h', origin: null } }),
       ]),
     ).toBe(true);
   });

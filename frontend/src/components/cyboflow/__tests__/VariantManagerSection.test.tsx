@@ -4,6 +4,7 @@
  *
  * Verifies:
  *   (a) create-from-current calls variants.create then invalidates the list.
+ *   (a2) create-from-current then OPENS the newly created row in the editor.
  *   (b) "Add to rotation" calls setStatus('active').
  *   (c) "Pause" calls setStatus('paused').
  *   (d) "Retire" calls setStatus('retired').
@@ -12,6 +13,11 @@
  *   (g) delete CONFLICT (run-history) surfaces the registry's own message
  *       inline (which already suggests retiring instead) rather than throwing.
  *   (h) Edit opens VariantEditorModal (stubbed) seeded with the row's variant.
+ *   (v) Archive calls variants.setArchived({ archived: true }) then invalidates.
+ *   (w) archived rows are hidden behind the "Show archived (N)" toggle, and
+ *       Unarchive calls setArchived({ archived: false }).
+ *   (x) archiving an ACTIVE arm of a running rotation goes through the
+ *       supersede-confirm modal, like pausing it would.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
@@ -23,6 +29,7 @@ const {
   mockUpdate,
   mockSetStatus,
   mockDelete,
+  mockSetArchived,
   mockSetBaseline,
   mockInvalidate,
   mockUseWorkflowVariants,
@@ -32,6 +39,7 @@ const {
   mockUpdate: vi.fn(),
   mockSetStatus: vi.fn(),
   mockDelete: vi.fn(),
+  mockSetArchived: vi.fn(),
   mockSetBaseline: vi.fn(),
   mockInvalidate: vi.fn(),
   mockUseWorkflowVariants: vi.fn(),
@@ -46,6 +54,7 @@ vi.mock('../../../trpc/client', () => ({
         update: { mutate: mockUpdate },
         setStatus: { mutate: mockSetStatus },
         delete: { mutate: mockDelete },
+        setArchived: { mutate: mockSetArchived },
         setBaselineRotation: { mutate: mockSetBaseline },
       },
       experiments: {
@@ -85,10 +94,26 @@ function makeVariant(overrides: Partial<WorkflowVariantRow> = {}): WorkflowVaria
     agent_runtime: null,
     weight: 1,
     status: 'draft',
+    archived_at: null,
     created_at: '',
     updated_at: '',
     ...overrides,
   };
+}
+
+/**
+ * Seed the mocked `useWorkflowVariants`. Defaults the archived split (migration
+ * 116) to empty so every existing case keeps describing a workflow with no
+ * archived variants without restating it.
+ */
+function setVariantsHook(result: {
+  variants: WorkflowVariantRow[];
+  baseline: { inRotation: boolean; weight: number } | null;
+  loading: boolean;
+  error: string | null;
+  archivedVariants?: WorkflowVariantRow[];
+}): void {
+  mockUseWorkflowVariants.mockReturnValue({ archivedVariants: [], ...result });
 }
 
 function makeRotation(overrides: Partial<RotationExperimentSummary> = {}): RotationExperimentSummary {
@@ -114,6 +139,7 @@ beforeEach(() => {
   mockUpdate.mockReset().mockResolvedValue({ ok: true });
   mockSetStatus.mockReset().mockResolvedValue({ ok: true });
   mockDelete.mockReset().mockResolvedValue({ ok: true });
+  mockSetArchived.mockReset().mockResolvedValue({ ok: true });
   mockSetBaseline.mockReset().mockResolvedValue({ ok: true });
   mockInvalidate.mockReset().mockResolvedValue(undefined);
   mockUseWorkflowVariants.mockReset();
@@ -122,7 +148,7 @@ beforeEach(() => {
 
 describe('VariantManagerSection', () => {
   it('(a) create-from-current calls variants.create then invalidates', async () => {
-    mockUseWorkflowVariants.mockReturnValue({ variants: [], baseline: null, loading: false, error: null });
+    setVariantsHook({ variants: [], baseline: null, loading: false, error: null });
     render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
 
     fireEvent.click(screen.getByTestId('variant-manager-create-button'));
@@ -135,8 +161,24 @@ describe('VariantManagerSection', () => {
     expect(mockInvalidate).toHaveBeenCalledWith('wf-1');
   });
 
+  it('(a2) create-from-current opens the new variant in the editor', async () => {
+    setVariantsHook({ variants: [], baseline: null, loading: false, error: null });
+    mockCreate.mockResolvedValue(makeVariant({ id: 'wfv_new', label: 'My Variant' }));
+    render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
+
+    fireEvent.click(screen.getByTestId('variant-manager-create-button'));
+    fireEvent.change(screen.getByTestId('flow-name-input'), { target: { value: 'My Variant' } });
+    fireEvent.click(screen.getByTestId('flow-name-confirm'));
+
+    // The editor is seeded from the row `create` RETURNED — not from the list,
+    // which the mocked store never repopulates.
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-variant-editor-modal')).toHaveTextContent('My Variant');
+    });
+  });
+
   it('(b) "Add to rotation" calls setStatus active', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'draft' })],
       baseline: null,
       loading: false,
@@ -153,7 +195,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(c) "Pause" calls setStatus paused for an active variant', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'active' })],
       baseline: null,
       loading: false,
@@ -169,7 +211,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(d) "Retire" calls setStatus retired', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'active' })],
       baseline: null,
       loading: false,
@@ -185,7 +227,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(e) committing a weight edit (blur) on an ACTIVE variant calls variants.update with the parsed weight', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ weight: 1, status: 'active' })],
       baseline: null,
       loading: false,
@@ -204,7 +246,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(e2) a DRAFT (not-in-rotation) variant hides the weight field entirely', () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'draft' })],
       baseline: null,
       loading: false,
@@ -217,7 +259,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(f) delete happy path calls variants.delete then invalidates', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant()],
       baseline: null,
       loading: false,
@@ -235,7 +277,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(g) delete CONFLICT (run history) surfaces the registry message inline, suggesting retire', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant()],
       baseline: null,
       loading: false,
@@ -258,7 +300,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(h) Edit opens VariantEditorModal seeded with the clicked row\'s variant', () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A' })],
       baseline: null,
       loading: false,
@@ -272,7 +314,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(h2) Rename opens the FlowNameDialog pre-filled with the current label and calls variants.update({ variantId, label })', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A' })],
       baseline: null,
       loading: false,
@@ -293,7 +335,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(h3) Rename with a duplicate label surfaces the CONFLICT error inline rather than throwing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A' })],
       baseline: null,
       loading: false,
@@ -313,7 +355,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(i) create button is DISABLED with a save-first hint when the editor is dirty', () => {
-    mockUseWorkflowVariants.mockReturnValue({ variants: [], baseline: null, loading: false, error: null });
+    setVariantsHook({ variants: [], baseline: null, loading: false, error: null });
     render(<VariantManagerSection workflowId="wf-1" projectId={1} editorDirty />);
 
     expect(screen.getByTestId('variant-manager-create-button')).toBeDisabled();
@@ -321,7 +363,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(j) create button is ENABLED with no hint when the editor is clean (default)', () => {
-    mockUseWorkflowVariants.mockReturnValue({ variants: [], baseline: null, loading: false, error: null });
+    setVariantsHook({ variants: [], baseline: null, loading: false, error: null });
     render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
 
     expect(screen.getByTestId('variant-manager-create-button')).not.toBeDisabled();
@@ -331,7 +373,7 @@ describe('VariantManagerSection', () => {
   // -- Baseline row (migration 054) -------------------------------------------
 
   it('(k) renders the baseline row (off) even with zero variants, with an "Add to rotation" CTA', () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [],
       baseline: { inRotation: false, weight: 1 },
       loading: false,
@@ -349,7 +391,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(k2) an IN-ROTATION baseline shows its weight field', () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [],
       baseline: { inRotation: true, weight: 2 },
       loading: false,
@@ -362,7 +404,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(l) baseline "Add to rotation" calls setBaselineRotation({ inRotation: true }) then invalidates', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [],
       baseline: { inRotation: false, weight: 1 },
       loading: false,
@@ -379,7 +421,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(m) an in-rotation baseline shows the pill + "Remove from rotation" → setBaselineRotation false', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'active' })],
       baseline: { inRotation: true, weight: 2 },
       loading: false,
@@ -396,7 +438,7 @@ describe('VariantManagerSection', () => {
   });
 
   it('(n) committing the baseline weight (blur) calls setBaselineRotation with the parsed weight', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [],
       baseline: { inRotation: true, weight: 1 },
       loading: false,
@@ -417,9 +459,74 @@ describe('VariantManagerSection', () => {
 
 // -- Rotation supersede-confirm modal ----------------------------------------
 
+describe('VariantManagerSection — archive (migration 116)', () => {
+  it('(v) Archive calls setArchived({ archived: true }) then invalidates', async () => {
+    setVariantsHook({ variants: [makeVariant()], baseline: null, loading: false, error: null });
+    render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
+    await flushRotationLoad();
+
+    fireEvent.click(screen.getByTestId('variant-archive-button-wfv_1'));
+
+    await waitFor(() => {
+      expect(mockSetArchived).toHaveBeenCalledWith({ variantId: 'wfv_1', archived: true });
+    });
+    expect(mockInvalidate).toHaveBeenCalledWith('wf-1');
+  });
+
+  it('(w) hides archived rows behind the toggle; Unarchive calls setArchived({ archived: false })', async () => {
+    setVariantsHook({
+      variants: [],
+      archivedVariants: [makeVariant({ id: 'wfv_old', label: 'Old', archived_at: '2026-08-01T00:00:00Z' })],
+      baseline: null,
+      loading: false,
+      error: null,
+    });
+    render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
+    await flushRotationLoad();
+
+    // Collapsed by default — only the toggle, carrying the count.
+    expect(screen.queryByTestId('variant-archived-row-wfv_old')).toBeNull();
+    const toggle = screen.getByTestId('variant-manager-show-archived-toggle');
+    expect(toggle).toHaveTextContent('Show archived (1)');
+
+    fireEvent.click(toggle);
+    expect(screen.getByTestId('variant-archived-row-wfv_old')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('variant-unarchive-button-wfv_old'));
+    await waitFor(() => {
+      expect(mockSetArchived).toHaveBeenCalledWith({ variantId: 'wfv_old', archived: false });
+    });
+  });
+
+  it('(w2) renders no toggle at all when nothing is archived', async () => {
+    setVariantsHook({ variants: [makeVariant()], baseline: null, loading: false, error: null });
+    render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
+    await flushRotationLoad();
+
+    expect(screen.queryByTestId('variant-manager-show-archived-toggle')).toBeNull();
+  });
+
+  it('(x) archiving an ACTIVE arm of a running rotation goes through the supersede modal', async () => {
+    mockGetRunningRotation.mockResolvedValue(makeRotation());
+    setVariantsHook({
+      variants: [makeVariant({ status: 'active', weight: 1 })],
+      baseline: null,
+      loading: false,
+      error: null,
+    });
+    render(<VariantManagerSection workflowId="wf-1" projectId={1} />);
+    await flushRotationLoad();
+
+    fireEvent.click(screen.getByTestId('variant-archive-button-wfv_1'));
+
+    expect(screen.getByTestId('rotation-supersede-confirm')).toBeInTheDocument();
+    expect(mockSetArchived).not.toHaveBeenCalled();
+  });
+});
+
 describe('VariantManagerSection — rotation supersede-confirm', () => {
   it('(o) no rotation running: "Add to rotation" fires setStatus directly, no modal', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ status: 'draft', weight: 1 })],
       baseline: null,
       loading: false,
@@ -437,7 +544,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(p) rotation running: activating a variant that would join the pool shows the modal instead of firing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A', status: 'draft', weight: 1 })],
       baseline: { inRotation: true, weight: 1 },
       loading: false,
@@ -456,7 +563,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(q) rotation running: pausing an active arm shows the modal instead of firing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A', status: 'active', weight: 1 })],
       baseline: null,
       loading: false,
@@ -475,7 +582,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(r) rotation running: removing the baseline from rotation shows the modal instead of firing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [],
       baseline: { inRotation: true, weight: 2 },
       loading: false,
@@ -494,7 +601,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(s) rotation running: committing a weight of 0 on an in-pool arm shows the modal instead of firing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A', status: 'active', weight: 2 })],
       baseline: null,
       loading: false,
@@ -515,7 +622,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(t) rotation running: a non-zero-to-non-zero weight edit on an in-pool arm never shows the modal', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A', status: 'active', weight: 1 })],
       baseline: null,
       loading: false,
@@ -538,7 +645,7 @@ describe('VariantManagerSection — rotation supersede-confirm', () => {
   });
 
   it('(u) confirming the modal runs the pending mutation and closes it; cancel runs nothing', async () => {
-    mockUseWorkflowVariants.mockReturnValue({
+    setVariantsHook({
       variants: [makeVariant({ id: 'wfv_1', label: 'Variant A', status: 'active', weight: 2 })],
       baseline: null,
       loading: false,

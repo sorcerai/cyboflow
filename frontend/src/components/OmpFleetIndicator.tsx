@@ -10,6 +10,14 @@
  * Clicking opens a popover with worker count / error kind / detail.
  * Read-only by construction: the renderer has no command surface; this only
  * renders the snapshot the read adapter already validated.
+ *
+ * Renders NOTHING unless Aria mode is on (Settings → Advanced Options → OMP
+ * Runtime). The dot reports FLEET health, which is meaningless on an install
+ * that runs OMP locally or not at all — and OMP ships disabled by default, so
+ * an always-present "OMP" chip in every user's status bar would label a
+ * provider most of them never enabled. The store floors `ariaMode` to false on
+ * a cold mount and on any probe failure, so the failure direction is hidden
+ * rather than an unexplainable dot.
  */
 import { useState, useRef, useEffect } from 'react';
 import { useShallow } from 'zustand/react/shallow';
@@ -39,8 +47,9 @@ const ERROR_LABEL: Record<string, string> = {
 };
 
 export function OmpFleetIndicator() {
-  const { status, workerCount, errorKind, detail } = useOmpFleetStore(
+  const { ariaMode, status, workerCount, errorKind, detail } = useOmpFleetStore(
     useShallow((s) => ({
+      ariaMode: s.ariaMode,
       status: s.status,
       workerCount: s.workerCount,
       errorKind: s.errorKind,
@@ -49,6 +58,12 @@ export function OmpFleetIndicator() {
   );
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Aria mode can flip off while the popover is open (the store re-probes every
+  // tick). Collapse it, so re-enabling later does not re-open a stale dialog.
+  useEffect(() => {
+    if (!ariaMode) setOpen(false);
+  }, [ariaMode]);
 
   useEffect(() => {
     if (!open) return;
@@ -69,6 +84,10 @@ export function OmpFleetIndicator() {
     document.addEventListener('keydown', handleKey);
     return () => document.removeEventListener('keydown', handleKey);
   }, [open]);
+
+  // After every hook — an early return above them would break the hook order on
+  // the render where Aria mode flips.
+  if (!ariaMode) return null;
 
   return (
     <div ref={containerRef} className="relative flex items-center">

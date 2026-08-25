@@ -83,6 +83,31 @@ decide whether the optional design steps run, so judge them from the idea, not f
 habit. If the user's prompt **explicitly asks** for a prototype or an architecture
 writeup, answer `yes` for that flag regardless of the heuristics below.
 
+**The design-mode call.** `DESIGN_MODE` is a **judgement**, not a derivation — the
+flag is only how you transport it. The question is not "does this have UI?" (that is
+`UI_PROTOTYPE`) but: *would this idea's design decisions be settled better by a
+conversation than by a one-shot mockup?* Design mode is a separate interactive flow
+where a human iterates on a prototype turn by turn, grounded in the real code, and
+lands both a prototype and a written design spec. It costs a whole session, so
+recommend it only when that iteration is genuinely load-bearing.
+
+Weigh, in roughly this order:
+
+- **Design uncertainty** — are there several defensible designs the human should see
+  and choose between, or is the shape already obvious from the idea?
+- **Breadth of UI surfaces touched** — one panel is a mockup; a change threading
+  through many surfaces needs the coherence pass a conversation gives.
+- **Baseline availability** — is there an existing surface to ground a
+  design-as-diff against? A dense existing surface being *modified* rewards design
+  mode far more than a small net-new view does.
+- **Unresolved probe questions** — did your own intent probe leave design-shaped
+  ambiguity that the user's answers narrowed but did not close?
+- **Overall complexity** — enough interacting parts that a static mockup would
+  paper over the hard decisions rather than expose them.
+
+A `no` is the common and correct answer. Reach for `yes` when you would otherwise be
+guessing at design decisions the human clearly holds opinions about.
+
 ## Result
 
 **Probe round** (you have questions) — return exactly:
@@ -108,6 +133,11 @@ writeup, answer `yes` for that flag regardless of the heuristics below.
   spans multiple subsystems, introduces new data models/services/seams, or has more
   than one viable architecture worth an explicit human decision; `no` for localized
   changes that follow existing patterns.
+- A line `DESIGN_MODE: yes` or `DESIGN_MODE: no`, and — when `yes` — a following
+  `DESIGN_MODE_REASON:` line giving the one-sentence case for it, in plain language
+  the human will read at the approval gate. Judge it per "The design-mode call"
+  above. Emit `DESIGN_MODE: no` whenever `UI_PROTOTYPE` is `no`: an idea with no UI
+  surface has nothing for design mode to iterate on.
 
 **EXPAND round** — return exactly:
 
@@ -115,6 +145,8 @@ writeup, answer `yes` for that flag regardless of the heuristics below.
   and solution, including an `### Assumptions` subsection plus evidence, relevant
   code touchpoints, constraints, risks/unknowns, and testable acceptance criteria.
 - The approved `SCOPE: small|large`, `UI_PROTOTYPE: yes|no`, and
-  `ARCH_DESIGN: yes|no` lines, reproduced exactly and unchanged.
+  `ARCH_DESIGN: yes|no` lines, reproduced exactly and unchanged. Do **not** reproduce
+  `DESIGN_MODE` — it is a routing recommendation consumed once at the approval gate,
+  not a property of the approved spec.
 - Only when a material change is unavoidable, a line `MATERIAL_CHANGE: yes`
   followed by one paragraph explaining why the approved stub must change.

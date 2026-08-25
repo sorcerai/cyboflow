@@ -136,6 +136,10 @@ export interface Session {
    * non-design session and for a design session whose link has been broken.
    */
   design_idea_id?: string | null;
+  /** Idea this session is the persistent home for (migration 113; idea sessions feature). NO FK. */
+  home_idea_id?: string | null;
+  /** Idea whose launch minted this session (migration 114; sidebar nesting lineage). NO FK. */
+  origin_idea_id?: string | null;
 }
 
 export interface SessionOutput {
@@ -314,7 +318,7 @@ export interface IdeaRow {
   summary: string | null;
   body: string | null;
   scope: 'small' | 'large' | null;
-  priority: 'P0' | 'P1' | 'P2';
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | 'P4' | 'P5' | 'P6'; // migration 117 widen
   category: 'feature' | 'bug' | 'chore'; // 059 ALTER appends
   repo: string | null;
   board_id: string;
@@ -338,7 +342,7 @@ export interface EpicRow {
   title: string;
   summary: string | null;
   body: string | null;
-  priority: 'P0' | 'P1' | 'P2';
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | 'P4' | 'P5' | 'P6'; // migration 117 widen
   category: 'feature' | 'bug' | 'chore'; // 059 ALTER appends
   repo: string | null;
   board_id: string;
@@ -364,7 +368,7 @@ export interface TaskRow {
   title: string;
   summary: string | null;
   body: string | null;
-  priority: 'P0' | 'P1' | 'P2';
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | 'P4' | 'P5' | 'P6'; // migration 117 widen
   category: 'feature' | 'bug' | 'chore'; // 059 ALTER appends
   repo: string | null;
   board_id: string;
@@ -486,7 +490,7 @@ export type {
 export interface TrackerConnectionRow {
   id: string;
   project_id: number;
-  provider: 'linear' | 'plane';
+  provider: 'linear' | 'plane' | 'dart';
   status: 'active' | 'paused' | 'disconnected';
   workspace_id: string | null;
   workspace_name: string | null;
@@ -503,6 +507,32 @@ export interface TrackerConnectionRow {
   pull_mode: 'auto' | 'manual';
   /** Creating a TOP-LEVEL tracker issue for a NEW cyboflow idea. */
   push_mode: 'auto' | 'manual';
+  /**
+   * 0 | 1 (migration 110) — may THIS mapping row create new tracker issues?
+   * Several sibling rows can map different tracker groups onto one cyboflow
+   * project; exactly one per provider carries a 1, or a locally filed idea
+   * would enqueue a create per sibling and duplicate remotely.
+   */
+  push_target: number; // 0 | 1
+  /**
+   * Field write-back ("Sync task fields": title/description/priority/category)
+   * for LINKED items, OUTBOUND only (migration 118). A SEPARATE three-state
+   * schema from status_sync_mode/pull_mode/push_mode above — 'off' is a real
+   * third answer here ("never"), not something those two-state columns can
+   * express — see TrackerContentSyncMode in shared/types/trackerSync.ts.
+   * Defaults 'off': an existing connection never consented to write-back.
+   */
+  content_sync_mode: 'auto' | 'manual' | 'off';
+  /** Remote trash/archive on a local archive/delete (migration 118). Same three-state shape as content_sync_mode, same default reasoning. */
+  archive_sync_mode: 'auto' | 'manual' | 'off';
+  /**
+   * The persisted OVERLAY half of priorityMapping.ts's seed-then-overlay
+   * contract (migration 118) — `{}` until the wizard's mapping table (Phase 6)
+   * writes one. See PriorityMappingOverlay / resolveEffectivePriorityMapping.
+   */
+  priority_mapping_json: string;
+  /** categoryMapping.ts's overlay, same shape and default as priority_mapping_json. */
+  category_mapping_json: string;
   mirror_subissues: number; // 0 | 1
   conflict_mode: 'auto' | 'manual';
   cursor_updated_at: string | null;
@@ -530,7 +560,7 @@ export interface EntityExternalLinkRow {
   connection_id: string;
   entity_type: 'idea' | 'epic' | 'task';
   entity_id: string;
-  provider: 'linear' | 'plane';
+  provider: 'linear' | 'plane' | 'dart';
   external_id: string;
   external_identifier: string | null;
   external_url: string | null;
@@ -555,11 +585,24 @@ export interface EntityExternalLinkRow {
  * `create_issue` (migration 094) is the PUSH kind: a TOP-LEVEL issue minted in
  * the connection's source container for a locally-created idea, as opposed to
  * `create_sub_issue`'s mirrored child of an existing issue.
+ *
+ * `update_content` / `archive_issue` (migration 118) are the field write-back
+ * and archive/trash kinds (docs/proposals/tracker-field-writeback.md Phase 5
+ * drains them; Phase 3 only widens the CHECK and the row type — a claimed row
+ * of either kind terminally fails with a "no handler until Phase 5" error
+ * rather than falling through to the state-write dispatch, per that plan's
+ * invariant 8).
  */
 export interface TrackerOutboxRow {
   id: number;
   connection_id: string;
-  kind: 'create_sub_issue' | 'create_issue' | 'update_state' | 'close_parent';
+  kind:
+    | 'create_sub_issue'
+    | 'create_issue'
+    | 'update_state'
+    | 'close_parent'
+    | 'update_content'
+    | 'archive_issue';
   entity_type: string | null;
   entity_id: string | null;
   external_id: string | null;
@@ -841,6 +884,35 @@ export interface ApprovedDesignRow {
   snapshot_path: string;
   approved_at: string;
   superseded_at: string | null;
+}
+
+/**
+ * `idea_components` row (migration 101) — one row per (idea, component) pair
+ * tracking the idea component ledger's HYBRID truth model: when present, this
+ * row is authoritative; a (idea, component) pair with NO row falls back to
+ * derivation from the DB (body headings, approved_designs, child entities),
+ * which can only ever yield 'complete'|'incomplete' — never 'skipped', since
+ * that state is unfalsifiable from absence and only ever set explicitly (see
+ * migration 101's header comment). `source` therefore only ever persists
+ * 'flow'|'manual' here; 'derived' is a read-time-only marker for a component
+ * with no row (shared/types/ideaComponents.ts `IdeaComponentSource`).
+ * `stale_at` carries "reset means re-verify, NOT discard": non-NULL means
+ * prior work exists but needs re-verification against the idea's current
+ * `built_against_version`, rather than a fourth state.
+ */
+export interface IdeaComponentRow {
+  idea_id: string;
+  project_id: number;
+  component: 'idea-spec' | 'prototype' | 'architecture' | 'epics' | 'stories';
+  state: 'complete' | 'incomplete' | 'skipped';
+  source: 'flow' | 'manual';
+  source_run_id: string | null;
+  source_session_id: string | null;
+  built_against_version: number | null;
+  stale_at: string | null;
+  stale_reason: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 /**

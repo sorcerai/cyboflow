@@ -86,7 +86,7 @@ import {
   countRotationExperimentRuns,
   setRotationLineage,
 } from '../../experimentStore';
-import { SPRINT_BATCH_MAX_TASKS } from '../../../../../shared/types/sprintBatch';
+import { resolveSprintMaxTasks, type SprintMaxTasksOverrides } from '../../../../../shared/types/sprintBatch';
 import type { EntityCategory, Priority } from '../../../../../shared/types/tasks';
 import { listRunCreatedEpicIds, listRunCreatedIdeaIds, listRunCreatedTaskIds } from '../../runEntityOwnership';
 import {
@@ -220,6 +220,15 @@ export interface ExperimentsDeps {
    * (pre-existing behavior).
    */
   hasActiveAgentTurn?: (sessionId: string) => boolean;
+  /**
+   * Optional: the user's per-substrate sprint task-cap override
+   * (ConfigManager.getSprintMaxTasks), already clamped. Layered over the built-in
+   * defaults by resolveSprintMaxTasks when validating a sprint experiment's seed
+   * tasks, so an arm accepts exactly what `runs.start` and the batch picker do.
+   * Absent ⇒ the built-in per-substrate defaults (pre-setting behavior), which is
+   * what keeps every fixture that omits it passing unchanged.
+   */
+  getSprintMaxTasks?: () => SprintMaxTasksOverrides;
 }
 
 let experimentsDeps: ExperimentsDeps | null = null;
@@ -702,7 +711,7 @@ export async function startExperiment(deps: ExperimentsDeps, input: StartInput):
   let seedTasks: SeedTaskFields[] | null = null;
   if (hasSeedTasks) {
     const requested = input.seedTaskIds as string[];
-    const cap = SPRINT_BATCH_MAX_TASKS[input.substrate ?? 'sdk'];
+    const cap = resolveSprintMaxTasks(deps.getSprintMaxTasks?.(), input.substrate ?? 'sdk');
     if (requested.length > cap) {
       throw new TRPCError({
         code: 'BAD_REQUEST',

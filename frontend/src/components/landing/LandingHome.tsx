@@ -46,6 +46,7 @@ import { QuickSessionsTable } from './QuickSessionsTable';
 import { ActiveAgents } from './ActiveAgents';
 import { IdleStartList } from './IdleStartList';
 import { CaughtUpHero } from './CaughtUpHero';
+import { ProviderUsageCards } from '../ReviewQueue/ProviderUsageCards';
 import { EndCta } from './EndCta';
 
 /**
@@ -182,6 +183,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
           <div className="mx-auto w-full max-w-[860px] px-7 py-10 font-mono">
             <CaughtUpHero />
             <div className="mt-8">
+              <ProviderUsageCards />
               <QuickSessionsTable />
             </div>
           </div>
@@ -210,6 +212,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
             idleCount={idleCount}
             allActive={!anyIdle}
           />
+          <ProviderUsageCards />
           <div ref={queueRef}>
             <TypeGroupedQueue />
           </div>
@@ -233,6 +236,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
           idleCount={idleCount}
           allActive={allActive}
         />
+        <ProviderUsageCards />
         <ActiveAgents />
         <QuickSessionsTable />
         {!allActive && <IdleStartList />}

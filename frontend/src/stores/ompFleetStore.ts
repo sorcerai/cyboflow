@@ -18,6 +18,14 @@
  *
  * Cold-mount guarantee: status starts 'absent', never 'available', until a real
  * snapshot returns ok.
+ *
+ * Aria gating: the indicator is fleet awareness, so it only means anything on a
+ * fleet install. Each tick probes `availability` FIRST and reads the registry
+ * only when `ariaMode` is on — a local-OMP or non-OMP install pays one cheap
+ * in-memory query per interval instead of a filesystem read for a dot nobody
+ * sees. Probing every tick (rather than once at subscribe) is what lets the
+ * indicator appear and disappear as the Settings toggle flips, without the
+ * relaunch the fleet MANAGER needs.
  */
 import { create } from 'zustand';
 import type { OmpFleetViewResult } from '../../../shared/types/omp';
@@ -26,6 +34,13 @@ import { trpc } from '../trpc/client';
 export type OmpFleetUiStatus = 'available' | 'absent' | 'error' | 'checking';
 
 export interface OmpFleetState {
+  /**
+   * Whether this install supervises a remote fleet (Settings → Advanced Options
+   * → Aria mode). Starts false so the indicator is hidden on a cold mount and
+   * on any probe failure — a dot that cannot explain itself is worse than no
+   * dot, and OMP ships disabled by default.
+   */
+  ariaMode: boolean;
   status: OmpFleetUiStatus;
   /** Worker count when ok, else null. */
   workerCount: number | null;
@@ -39,6 +54,7 @@ export interface OmpFleetState {
 export interface OmpFleetActions {
   setSnapshot: (result: OmpFleetViewResult) => void;
   setTransportError: () => void;
+  setAriaMode: (ariaMode: boolean) => void;
   /** Start polling; returns an unsubscribe function. */
   subscribeToOmpFleet: () => () => void;
 }
@@ -46,6 +62,7 @@ export interface OmpFleetActions {
 const POLL_INTERVAL_MS = 10000;
 
 export const useOmpFleetStore = create<OmpFleetState & OmpFleetActions>()((set, get) => ({
+  ariaMode: false,
   status: 'absent',
   workerCount: null,
   errorKind: null,
@@ -72,6 +89,17 @@ export const useOmpFleetStore = create<OmpFleetState & OmpFleetActions>()((set, 
     });
   },
 
+  setAriaMode(ariaMode) {
+    // Leaving a fleet install resets the snapshot fields: keeping a stale worker
+    // count around would let the indicator flash last week's fleet health if
+    // Aria mode is switched back on.
+    set((prev) =>
+      prev.ariaMode === ariaMode
+        ? { ariaMode }
+        : { ariaMode, status: 'absent', workerCount: null, errorKind: null, detail: null },
+    );
+  },
+
   setTransportError() {
     // Keep the last-known worker count/detail for context, but mark the
     // snapshot stale — the UI must not show it as current.
@@ -88,6 +116,21 @@ export const useOmpFleetStore = create<OmpFleetState & OmpFleetActions>()((set, 
     let intervalId: ReturnType<typeof setInterval> | undefined;
 
     const poll = async () => {
+      // Aria first: on a non-fleet install this is the only query per tick, and
+      // the registry is never read.
+      let ariaMode: boolean;
+      try {
+        const availability = await trpc.cyboflow.omp.availability.query();
+        ariaMode = availability.ariaMode === true;
+      } catch {
+        // Cannot prove this is a fleet install ⇒ hide, don't guess.
+        if (alive) get().setAriaMode(false);
+        return;
+      }
+      if (!alive) return;
+      get().setAriaMode(ariaMode);
+      if (!ariaMode) return;
+
       try {
         const result: OmpFleetViewResult = await trpc.cyboflow.omp.fleetSnapshot.query();
         if (alive) get().setSnapshot(result);

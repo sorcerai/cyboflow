@@ -1,0 +1,45 @@
+-- Migration 110: tracker_connections.push_target — which mapping row may CREATE
+-- new tracker issues.
+--
+-- Numbering: originally minted as 109 while the verification-runbook bootstrap
+-- worktree still held 107/108 in flight; that work landed on main claiming
+-- 107-109, so this file was renumbered to 110 at rebase time — the same
+-- next-free-prefix convention 093 and 105 record in their own headers.
+--
+-- WHY THE COLUMN EXISTS. Multi-project mapping (docs/proposals/
+-- tracker-sync-integration.md → "Multi-project mapping (rev 4)") persists one
+-- tracker_connections row per (tracker group → cyboflow project) pair, so N
+-- SIBLING rows sharing one set of credentials can target the SAME cyboflow
+-- project. Pull, status write-back and the deletion sweep are all per-row and
+-- stay correct under that fan-out because each row owns its own source scope.
+-- PUSH does not: handleIdeaPush walks the PROJECT's connections, so one locally
+-- filed idea would enqueue a create_issue per sibling row and appear N times in
+-- the tracker — a duplicate no later pass can undo, since each create mints its
+-- own link. `push_target` names the one row per provider that may push; the
+-- siblings stay read + write-back mappings.
+--
+-- DEFAULT 1 is what makes this a no-op for every connection that already exists:
+-- a project with one connection per provider IS the "exactly one push target"
+-- shape already, which is rev 4's argument for N sibling rows over a join table
+-- (existing rows need no data migration — they already are the new model with a
+-- single mapping). Only the wizard's multi-mapping pass writes a 0.
+--
+-- REPLAY SAFETY (a ledger-wiped DB re-runs every file end to end — see 088/093).
+-- The file is ONE `ALTER TABLE ... ADD COLUMN` and deliberately nothing else: a
+-- replay throws "duplicate column name: push_target", the runner rolls the
+-- transaction back and records the ledger marker under its idempotent-ALTER
+-- tolerance — the only failure shape that tolerance covers, so any second
+-- statement here would have to be replay-convergent on its own (094's header
+-- makes the same argument for its ALTER-first ordering).
+--
+-- WHAT A REPLAY DOES *NOT* PRESERVE, stated because it is not this file's to
+-- fix: 105 recreates tracker_connections from a hardcoded 093+094 column list
+-- and runs BEFORE this file on any full replay, so the recreate drops
+-- push_target and the ALTER below re-adds it at its DEFAULT. A ledger-wiped
+-- replay therefore resets every sibling mapping's 0 back to 1. Nothing this
+-- file can do reaches values 105 already dropped inside the same pass; the
+-- durable fix is that a later recreate of this table must carry push_target
+-- forward, exactly as 105 carried 094's three mode columns forward.
+
+ALTER TABLE tracker_connections
+  ADD COLUMN push_target INTEGER NOT NULL DEFAULT 1;

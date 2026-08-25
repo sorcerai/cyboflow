@@ -56,9 +56,11 @@ import type {
   IdeaAttachment,
   TaskDependencyRef,
 } from '../../../shared/types/tasks';
+import type { IdeaComponentState } from '../../../shared/types/ideaComponents';
 import { resolveStepAgentKey } from '../../../shared/types/agentIdentity';
 import { listRunOwnedOrBatchIdeaIds } from './runEntityOwnership';
 import { TERMINAL_RUN_STATUSES } from '../../../shared/types/cyboflow';
+import { resolveIdeaComponents, resolveIdeaComponentsBatch } from './ideaComponents/resolveIdeaComponents';
 import type { DatabaseLike } from './types';
 
 /** The board stage position considered "done" — a blocking prereq is satisfied here. */
@@ -156,7 +158,7 @@ interface TaskDbRow {
   title: string;
   summary: string | null;
   body: string | null;
-  priority: 'P0' | 'P1' | 'P2';
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | 'P4' | 'P5' | 'P6'; // migration 117 widen
   /** Entity classification (migration 059); NOT NULL DEFAULT 'feature' on every table. */
   category: EntityCategory;
   repo: string | null;
@@ -582,6 +584,51 @@ function applyDependencyOverlay(item: BacklogTaskItem, overlay: DependencyOverla
   item.readyToWork = overlay.readyToWork;
 }
 
+/**
+ * Attach the idea component ledger overlay (migration 101) to a projected IDEA
+ * item. Same batch-overlay shape as {@link applyDependencyOverlay}: the caller
+ * resolves the ledger for a whole batch of idea ids in ONE
+ * `resolveIdeaComponentsBatch` call, then applies each idea's slice here —
+ * never a per-item resolver call inside `projectTaskItem` (that would issue a
+ * fistful of queries per card). Epics/tasks never call this, so `components`
+ * stays `undefined` for them, per the shared type's "not computed" contract.
+ */
+function applyIdeaComponentsOverlay(item: BacklogTaskItem, components: IdeaComponentState[]): void {
+  item.components = components;
+}
+
+/**
+ * Fail-soft `resolveIdeaComponentsBatch` wrapper — mirrors `isLiveExperimentSeed`
+ * above. `idea_components`/`approved_designs` (migrations 098/082) are recent
+ * additions; a schema predating them (an older on-disk DB mid-migration, or one
+ * of this repo's many hand-rolled test fixtures that hasn't been updated for
+ * 098 yet) degrades PERMISSIVELY to an empty map — every idea then reads back
+ * `components: undefined` ("not computed") instead of throwing 'no such table'
+ * on every backlog read.
+ */
+function resolveIdeaComponentsBatchSafe(
+  db: DatabaseLike,
+  ideaIds: readonly string[],
+): Map<string, IdeaComponentState[]> {
+  if (ideaIds.length === 0) return new Map();
+  try {
+    return resolveIdeaComponentsBatch(db, ideaIds);
+  } catch (err) {
+    if (err instanceof Error && /no such (column|table)/i.test(err.message)) return new Map();
+    throw err;
+  }
+}
+
+/** Single-idea sibling of {@link resolveIdeaComponentsBatchSafe}, same degrade contract. */
+function resolveIdeaComponentsSafe(db: DatabaseLike, ideaId: string): IdeaComponentState[] | undefined {
+  try {
+    return resolveIdeaComponents(db, ideaId);
+  } catch (err) {
+    if (err instanceof Error && /no such (column|table)/i.test(err.message)) return undefined;
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Backlog projection
 // ---------------------------------------------------------------------------
@@ -649,6 +696,11 @@ export function selectTaskById(db: DatabaseLike, taskId: string): BacklogTaskIte
 
   if (row.type === 'task') {
     applyDependencyOverlay(item, loadTaskDependencyOverlay(db, row.id));
+  }
+
+  if (row.type === 'idea') {
+    const components = resolveIdeaComponentsSafe(db, row.id);
+    if (components) applyIdeaComponentsOverlay(item, components);
   }
 
   if (row.type === 'epic') {
@@ -719,6 +771,8 @@ export function selectIdeaDecomposition(db: DatabaseLike, ideaId: string): Backl
   if (!ideaRow) return null;
 
   const idea = projectTaskItem(db, ideaRow);
+  const ideaComponents = resolveIdeaComponentsSafe(db, ideaId);
+  if (ideaComponents) applyIdeaComponentsOverlay(idea, ideaComponents);
 
   // Epics decomposed from this idea (ASC by created_at, ref tiebreak).
   const epicRows = db
@@ -904,6 +958,13 @@ export function selectProjectBacklog(
   // query and map them onto each task item as we project.
   const depOverlays = loadProjectDependencyOverlays(db, projectId);
 
+  // Idea component ledger (migration 101) is ideas-only — resolve the WHOLE
+  // batch's ledger in ONE resolveIdeaComponentsBatch call (mirroring the
+  // dependency-overlay precedent above), never a per-item resolver call inside
+  // projectTaskItem.
+  const ideaIds = rows.filter((row) => row.type === 'idea').map((row) => row.id);
+  const componentsByIdea = resolveIdeaComponentsBatchSafe(db, ideaIds);
+
   // First pass: project every row to a BacklogTaskItem keyed by id.
   const itemsById = new Map<string, BacklogTaskItem>();
   for (const row of rows) {
@@ -913,6 +974,10 @@ export function selectProjectBacklog(
         item,
         depOverlays.get(row.id) ?? { blockedBy: [], relatedTo: [], readyToWork: true },
       );
+    }
+    if (row.type === 'idea') {
+      const components = componentsByIdea.get(row.id);
+      if (components) applyIdeaComponentsOverlay(item, components);
     }
     itemsById.set(row.id, item);
   }

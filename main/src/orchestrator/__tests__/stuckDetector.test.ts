@@ -4,8 +4,9 @@
  * Test targets per the task plan:
  *
  * 1. Scheduling: 60s interval fires scan; stop() cancels it.
- * 2. 5-minute filter: only approvals older than 5 min reach classifyStaleApproval.
- * 3. Classification variants: orphan_pty, stale_socket, self_deadlock, cross_run_deadlock.
+ * 2. Staleness filter: only approvals past STALE_THRESHOLD_MS reach classifyStaleApproval.
+ * 3. Classification variants: orphan_pty, self_deadlock, cross_run_deadlock
+ *    (stale_socket is retired — its suite pins that it can no longer fire).
  * 4. Status guard: run already canceled — no stuck transition fires.
  * 5. Idempotency: three scan ticks, only one 'runs:stuck' event.
  * 6. Error isolation: classifier throws on tick 1, scan continues on tick 2.
@@ -28,7 +29,6 @@ import { EventEmitter } from 'node:events';
 import {
   StuckDetector,
   type ClaudeManagerLike,
-  type PermissionServerLike,
   type StuckDetectorDeps,
 } from '../stuckDetector';
 import type { StuckDetectedEvent } from '../../../../shared/types/stuckDetection';
@@ -67,6 +67,32 @@ function seedRun(
 /** Convert an age in milliseconds to an ISO timestamp relative to now. */
 const ageMsToIso = (ageMs: number): string => new Date(Date.now() - ageMs).toISOString();
 
+/**
+ * The SAME instant in SQLite's `DEFAULT CURRENT_TIMESTAMP` spelling:
+ * 'YYYY-MM-DD HH:MM:SS' — space separator, no fractional seconds, no zone.
+ * transitions.ts used to leave created_at to that default while the detector
+ * compared it as a STRING against a toISOString() cutoff. ' ' (0x20) sorts
+ * below 'T' (0x54), so any same-date row in this spelling compared as older
+ * than the cutoff no matter the clock time, and a fresh approval was stamped
+ * stale on its first scan. Rows in this format still exist in databases
+ * written before the fix, which is why the detector normalizes rather than
+ * merely trusting the writer.
+ */
+const ageMsToSqliteDatetime = (ageMs: number): string =>
+  new Date(Date.now() - ageMs).toISOString().replace('T', ' ').slice(0, 19);
+
+/**
+ * Mirror of the production STALE_THRESHOLD_MS (stuckDetector.ts). Ages below
+ * are expressed RELATIVE to it so a future threshold change fails loudly here
+ * instead of silently making every "stale" fixture young again — which is
+ * exactly what a hardcoded 6-minute age did when the threshold moved 5 -> 45.
+ */
+const STALE_THRESHOLD_MS = 45 * 60 * 1000;
+/** Comfortably past the boundary. */
+const STALE_AGE_MS = STALE_THRESHOLD_MS + 60 * 1000;
+/** Comfortably short of it. */
+const FRESH_AGE_MS = STALE_THRESHOLD_MS - 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Fake implementations
 // ---------------------------------------------------------------------------
@@ -77,11 +103,6 @@ function makeClaudeManager(activeRunIds: Set<string> = new Set()): ClaudeManager
   };
 }
 
-function makePermissionServer(connectedRunIds: Set<string> = new Set()): PermissionServerLike {
-  return {
-    hasClientForRun: (runId) => connectedRunIds.has(runId),
-  };
-}
 
 // ---------------------------------------------------------------------------
 // TEST 1: Scheduling — 60s interval fires scan; stop() cancels it
@@ -178,11 +199,11 @@ describe('StuckDetector scheduling', () => {
 });
 
 // ---------------------------------------------------------------------------
-// TEST 2: 5-minute filter
+// TEST 2: staleness filter
 // ---------------------------------------------------------------------------
 
-describe('StuckDetector 5-minute filter', () => {
-  it('only evaluates approvals older than 5 minutes', async () => {
+describe('StuckDetector staleness filter', () => {
+  it('only evaluates approvals older than STALE_THRESHOLD_MS', async () => {
     const rawDb = createTestDb({ includeStuckDetectedAt: true });
     const db = dbAdapter(rawDb);
     const emitter = new EventEmitter();
@@ -192,10 +213,10 @@ describe('StuckDetector 5-minute filter', () => {
     seedRun(rawDb, 'run-young', 'awaiting_review');
     seedRun(rawDb, 'run-old', 'awaiting_review');
 
-    // young approval: 4 minutes old — should NOT be evaluated
-    seedApproval(rawDb, { id: 'approval-young', runId: 'run-young', toolName: 'Bash', createdAt: ageMsToIso(4 * 60 * 1000) });
-    // old approval: 6 minutes old — SHOULD be evaluated
-    seedApproval(rawDb, { id: 'approval-old', runId: 'run-old', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    // young approval: short of the threshold — should NOT be evaluated
+    seedApproval(rawDb, { id: 'approval-young', runId: 'run-young', toolName: 'Bash', createdAt: ageMsToIso(FRESH_AGE_MS) });
+    // old approval: past the threshold — SHOULD be evaluated
+    seedApproval(rawDb, { id: 'approval-old', runId: 'run-old', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // claudeManager: run-old is active (so orphan_pty doesn't fire),
     // cross_run_deadlock will match because run-young is in awaiting_review
@@ -210,7 +231,6 @@ describe('StuckDetector 5-minute filter', () => {
     const detector = new StuckDetector({
       db,
       claudeManager: makeClaudeManager(activeRuns),
-      permissionServer: makePermissionServer(connectedRuns),
       emitter,
       logger,
     });
@@ -221,6 +241,88 @@ describe('StuckDetector 5-minute filter', () => {
     expect(classifySpy).toHaveBeenCalledTimes(1);
     const calledWith = classifySpy.mock.calls[0][0] as { id: string };
     expect(calledWith.id).toBe('approval-old');
+
+    classifySpy.mockRestore();
+    detector.stop();
+    rawDb.close();
+  });
+
+  it('does not treat a fresh CURRENT_TIMESTAMP-format approval as stale', async () => {
+    // REGRESSION: the stale predicate was a raw string compare
+    // (`created_at < ?`) against a toISOString() cutoff, which silently assumed
+    // every writer stamps the same format. transitions.ts did not — it left the
+    // column to DEFAULT CURRENT_TIMESTAMP. Because ' ' < 'T', this row compared
+    // as older than the cutoff on identical calendar dates whatever the times
+    // were, so a seconds-old approval was classified stale and its run stamped
+    // 'stuck'. The 45-minute threshold never applied to that writer at all.
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+
+    seedRun(rawDb, 'run-fresh-sqlite-fmt', 'awaiting_review');
+    seedApproval(rawDb, {
+      id: 'approval-fresh-sqlite-fmt',
+      runId: 'run-fresh-sqlite-fmt',
+      toolName: 'Bash',
+      createdAt: ageMsToSqliteDatetime(FRESH_AGE_MS),
+    });
+
+    // Pin the premise: this fixture really is in the format that used to break
+    // the compare, so the test cannot quietly pass by seeding an ISO string.
+    const stored = rawDb
+      .prepare(`SELECT created_at FROM approvals WHERE id = 'approval-fresh-sqlite-fmt'`)
+      .get() as { created_at: string };
+    expect(stored.created_at).not.toContain('T');
+    expect(stored.created_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+
+    const classifySpy = vi.spyOn(StuckDetector.prototype, 'classifyStaleApproval');
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set(['run-fresh-sqlite-fmt'])),
+      emitter: new EventEmitter(),
+      logger: makeSpyLogger(),
+    });
+
+    await detector.scan();
+
+    expect(classifySpy).not.toHaveBeenCalled();
+    const row = rawDb
+      .prepare(`SELECT status, stuck_reason FROM workflow_runs WHERE id = 'run-fresh-sqlite-fmt'`)
+      .get() as { status: string; stuck_reason: string | null };
+    expect(row.status).toBe('awaiting_review');
+    expect(row.stuck_reason).toBeNull();
+
+    classifySpy.mockRestore();
+    detector.stop();
+    rawDb.close();
+  });
+
+  it('still evaluates a genuinely stale CURRENT_TIMESTAMP-format approval', async () => {
+    // The normalization must not overshoot into ignoring the old format: a row
+    // in the space spelling that really is past the threshold stays detectable.
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+
+    seedRun(rawDb, 'run-stale-sqlite-fmt', 'awaiting_review');
+    seedApproval(rawDb, {
+      id: 'approval-stale-sqlite-fmt',
+      runId: 'run-stale-sqlite-fmt',
+      toolName: 'Bash',
+      createdAt: ageMsToSqliteDatetime(STALE_AGE_MS),
+    });
+
+    const classifySpy = vi.spyOn(StuckDetector.prototype, 'classifyStaleApproval');
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set(['run-stale-sqlite-fmt'])),
+      emitter: new EventEmitter(),
+      logger: makeSpyLogger(),
+    });
+
+    await detector.scan();
+
+    expect(classifySpy).toHaveBeenCalledTimes(1);
+    const calledWith = classifySpy.mock.calls[0][0] as { id: string };
+    expect(calledWith.id).toBe('approval-stale-sqlite-fmt');
 
     classifySpy.mockRestore();
     detector.stop();
@@ -240,13 +342,12 @@ describe('StuckDetector classification: orphan_pty', () => {
     const logger = makeSpyLogger();
 
     seedRun(rawDb, 'run-orphan', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-orphan', runId: 'run-orphan', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-orphan', runId: 'run-orphan', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // No active runs — triggers orphan_pty
     const detector = new StuckDetector({
       db,
       claudeManager: makeClaudeManager(new Set()), // empty — no active runs
-      permissionServer: makePermissionServer(new Set(['run-orphan'])),
       emitter,
       logger,
     });
@@ -263,24 +364,33 @@ describe('StuckDetector classification: orphan_pty', () => {
 });
 
 // ---------------------------------------------------------------------------
-// TEST 3b: Classification — stale_socket
+// TEST 3b: Classification — stale_socket is RETIRED
 // ---------------------------------------------------------------------------
 
-describe('StuckDetector classification: stale_socket', () => {
-  it('returns stale_socket when permissionServer has no connected client', () => {
+describe('StuckDetector classification: stale_socket (retired)', () => {
+  it('never returns stale_socket — a live run with no other evidence classifies null', () => {
+    // Formerly rung 2. It asked whether a permission-socket client was still
+    // connected, was never wired, and never fired in any build. It is retired
+    // rather than wired because the condition cannot survive to be observed:
+    // the socket's own disconnect handler already settles the approval
+    // (abandonPendingForRun on the shell lane) or keeps it pending on purpose
+    // (orphanPendingForRun on the OMP lane), and the claude-sdk lane never
+    // opens a socket at all, so "no client" is the healthy state there.
+    //
+    // This pins the retirement: the exact fixture that used to yield
+    // stale_socket — a live run, stale awaited approval, no socket, nothing
+    // else wrong — must now yield null.
     const rawDb = createTestDb({ includeStuckDetectedAt: true });
     const db = dbAdapter(rawDb);
     const emitter = new EventEmitter();
     const logger = makeSpyLogger();
 
     seedRun(rawDb, 'run-socket', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-socket', runId: 'run-socket', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-socket', runId: 'run-socket', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
-    // Run is active (no orphan_pty), but no socket client (stale_socket)
     const detector = new StuckDetector({
       db,
       claudeManager: makeClaudeManager(new Set(['run-socket'])),
-      permissionServer: makePermissionServer(new Set()), // no connected clients
       emitter,
       logger,
     });
@@ -289,8 +399,7 @@ describe('StuckDetector classification: stale_socket', () => {
       .prepare("SELECT id, run_id, status, created_at FROM approvals WHERE id = 'approval-socket'")
       .get() as { id: string; run_id: string; status: string; created_at: string };
 
-    const reason = detector.classifyStaleApproval(row);
-    expect(reason).toEqual({ kind: 'stale_socket' });
+    expect(detector.classifyStaleApproval(row)).toBeNull();
 
     rawDb.close();
   });
@@ -309,14 +418,13 @@ describe('StuckDetector classification: self_deadlock', () => {
 
     seedRun(rawDb, 'run-self', 'awaiting_review');
     // Two pending approvals for the same run
-    seedApproval(rawDb, { id: 'approval-self-1', runId: 'run-self', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
-    seedApproval(rawDb, { id: 'approval-self-2', runId: 'run-self', toolName: 'Bash', createdAt: ageMsToIso(7 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-self-1', runId: 'run-self', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
+    seedApproval(rawDb, { id: 'approval-self-2', runId: 'run-self', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS + 60 * 1000) });
 
     // Run is active and socket is connected — only self_deadlock should match
     const detector = new StuckDetector({
       db,
       claudeManager: makeClaudeManager(new Set(['run-self'])),
-      permissionServer: makePermissionServer(new Set(['run-self'])),
       emitter,
       logger,
     });
@@ -337,7 +445,7 @@ describe('StuckDetector classification: self_deadlock', () => {
 // ---------------------------------------------------------------------------
 
 describe('StuckDetector classification: cross_run_deadlock', () => {
-  it('returns cross_run_deadlock when another run is awaiting_review', () => {
+  it('returns cross_run_deadlock when another run is awaiting_review with its OWN stale approval', () => {
     const rawDb = createTestDb({ includeStuckDetectedAt: true });
     const db = dbAdapter(rawDb);
     const emitter = new EventEmitter();
@@ -345,13 +453,15 @@ describe('StuckDetector classification: cross_run_deadlock', () => {
 
     seedRun(rawDb, 'run-cross-1', 'awaiting_review');
     seedRun(rawDb, 'run-cross-2', 'awaiting_review'); // conflicting run
-    seedApproval(rawDb, { id: 'approval-cross', runId: 'run-cross-1', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-cross', runId: 'run-cross-1', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
+    // The conflicting run must itself be blocked on a stale approval — the
+    // condition rung 4's docstring always described.
+    seedApproval(rawDb, { id: 'approval-cross-2', runId: 'run-cross-2', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // Both runs active, both have sockets, no self_deadlock on run-cross-1
     const detector = new StuckDetector({
       db,
       claudeManager: makeClaudeManager(new Set(['run-cross-1', 'run-cross-2'])),
-      permissionServer: makePermissionServer(new Set(['run-cross-1', 'run-cross-2'])),
       emitter,
       logger,
     });
@@ -366,6 +476,121 @@ describe('StuckDetector classification: cross_run_deadlock', () => {
     if (reason !== null && reason.kind === 'cross_run_deadlock') {
       expect(reason.conflictingRunId).toBe('run-cross-2');
     }
+
+    rawDb.close();
+  });
+
+  it('does NOT stamp when the other awaiting_review run holds no stale approval (86d3fd1e shape)', () => {
+    // Regression pin for the 2026-08-21 incident: awaiting_review is ALSO the
+    // rest state of a finished run waiting on Merge/Dismiss, so a bare
+    // "another run exists" test stamped a healthy run whose human was simply
+    // still deciding. The conflicting run here is at rest with no approval of
+    // its own — there is no deadlock to report.
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+    const emitter = new EventEmitter();
+    const logger = makeSpyLogger();
+
+    seedRun(rawDb, 'run-live', 'awaiting_review');
+    seedRun(rawDb, 'run-at-rest', 'awaiting_review'); // finished, awaiting Merge/Dismiss
+    seedApproval(rawDb, { id: 'approval-live', runId: 'run-live', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
+
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set(['run-live', 'run-at-rest'])),
+      emitter,
+      logger,
+    });
+
+    const row = rawDb
+      .prepare("SELECT id, run_id, status, created_at FROM approvals WHERE id = 'approval-live'")
+      .get() as { id: string; run_id: string; status: string; created_at: string };
+
+    expect(detector.classifyStaleApproval(row)).toBeNull();
+
+    rawDb.close();
+  });
+
+  it('does NOT stamp when the only other blocked run holds an UN-AWAITED ask', () => {
+    // Migration 111 shape: the omp-sdk gate hung up, the row is still
+    // answerable, but nobody is blocked on it. It is not evidence of a wedge.
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+    const emitter = new EventEmitter();
+    const logger = makeSpyLogger();
+
+    seedRun(rawDb, 'run-x', 'awaiting_review');
+    seedRun(rawDb, 'run-y', 'awaiting_review');
+    seedApproval(rawDb, { id: 'approval-x', runId: 'run-x', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
+    seedApproval(rawDb, { id: 'approval-y', runId: 'run-y', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS), awaited: false });
+
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set(['run-x', 'run-y'])),
+      emitter,
+      logger,
+    });
+
+    const row = rawDb
+      .prepare("SELECT id, run_id, status, created_at FROM approvals WHERE id = 'approval-x'")
+      .get() as { id: string; run_id: string; status: string; created_at: string };
+
+    expect(detector.classifyStaleApproval(row)).toBeNull();
+
+    rawDb.close();
+  });
+
+  it('scan() ignores an UN-AWAITED stale approval entirely', () => {
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+    const emitter = new EventEmitter();
+    const logger = makeSpyLogger();
+
+    seedRun(rawDb, 'run-detached', 'awaiting_review');
+    seedApproval(rawDb, { id: 'approval-detached', runId: 'run-detached', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS), awaited: false });
+
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set()),
+      emitter,
+      logger,
+    });
+
+    void detector.scan();
+
+    const after = rawDb
+      .prepare("SELECT status FROM workflow_runs WHERE id = 'run-detached'")
+      .get() as { status: string };
+    expect(after.status).toBe('awaiting_review');
+
+    rawDb.close();
+  });
+
+  it('does NOT stamp when the other run\'s approval is NOT yet stale', () => {
+    // The conflicting run is genuinely blocked, but only just — it has not
+    // crossed the staleness boundary, so it is not evidence of a deadlock.
+    const rawDb = createTestDb({ includeStuckDetectedAt: true });
+    const db = dbAdapter(rawDb);
+    const emitter = new EventEmitter();
+    const logger = makeSpyLogger();
+
+    seedRun(rawDb, 'run-a', 'awaiting_review');
+    seedRun(rawDb, 'run-b', 'awaiting_review');
+    seedApproval(rawDb, { id: 'approval-a', runId: 'run-a', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
+    seedApproval(rawDb, { id: 'approval-b', runId: 'run-b', toolName: 'Bash', createdAt: ageMsToIso(FRESH_AGE_MS) });
+
+    const detector = new StuckDetector({
+      db,
+      claudeManager: makeClaudeManager(new Set(['run-a', 'run-b'])),
+      emitter,
+      logger,
+    });
+
+    const row = rawDb
+      .prepare("SELECT id, run_id, status, created_at FROM approvals WHERE id = 'approval-a'")
+      .get() as { id: string; run_id: string; status: string; created_at: string };
+
+    expect(detector.classifyStaleApproval(row)).toBeNull();
 
     rawDb.close();
   });
@@ -392,7 +617,7 @@ describe('StuckDetector status guard', () => {
       .run();
 
     // Approval is stale — 6 minutes old
-    seedApproval(rawDb, { id: 'approval-canceled', runId: 'run-canceled', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-canceled', runId: 'run-canceled', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // claudeManager: run not active — orphan_pty would fire classification
     const detector = new StuckDetector({
@@ -432,7 +657,7 @@ describe('StuckDetector idempotency', () => {
     emitter.on('runs:stuck', (e: StuckDetectedEvent) => stuckEvents.push(e));
 
     seedRun(rawDb, 'run-idempotent', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-idempotent', runId: 'run-idempotent', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-idempotent', runId: 'run-idempotent', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // No active run — orphan_pty classification
     const detector = new StuckDetector({
@@ -474,7 +699,7 @@ describe('StuckDetector seam-error telemetry (seam B)', () => {
     const logger = makeSpyLogger();
 
     seedRun(rawDb, 'run-seam-stuck', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-seam-stuck', runId: 'run-seam-stuck', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-seam-stuck', runId: 'run-seam-stuck', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     const detector = new StuckDetector({
       db,
@@ -506,7 +731,7 @@ describe('StuckDetector error isolation', () => {
     const logger = makeSpyLogger();
 
     seedRun(rawDb, 'run-error', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-error', runId: 'run-error', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-error', runId: 'run-error', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     let callCount = 0;
     // Classifier throws on first call, returns a reason on subsequent calls
@@ -560,7 +785,7 @@ describe('StuckDetector event emission shape', () => {
     emitter.on('runs:stuck', (e: StuckDetectedEvent) => stuckEvents.push(e));
 
     seedRun(rawDb, 'run-event', 'awaiting_review');
-    seedApproval(rawDb, { id: 'approval-event', runId: 'run-event', toolName: 'Bash', createdAt: ageMsToIso(6 * 60 * 1000) });
+    seedApproval(rawDb, { id: 'approval-event', runId: 'run-event', toolName: 'Bash', createdAt: ageMsToIso(STALE_AGE_MS) });
 
     // No active run — orphan_pty
     const detector = new StuckDetector({
@@ -627,7 +852,7 @@ describe('StuckDetector awaiting_input exemption', () => {
         `INSERT INTO approvals (id, run_id, tool_name, tool_input_json, tool_use_id, status, created_at)
          VALUES ('a-stale', 'run-ai', 'Bash', '{}', 'tu-1', 'pending', ?)`,
       )
-      .run(ageMsToIso(10 * 60_000));
+      .run(ageMsToIso(STALE_AGE_MS));
 
     // claudeManager: hasActiveRunForId returns false → orphan_pty classification.
     // But the UPDATE `WHERE id = ? AND status = 'awaiting_review'` won't match

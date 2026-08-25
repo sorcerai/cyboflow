@@ -415,6 +415,12 @@ export interface SeedApprovalOverrides {
   status?: 'pending' | 'approved' | 'rejected' | 'timed_out';
   /** The created_at ISO string. Defaults to the current time. */
   createdAt?: string;
+  /**
+   * Migration 111's `awaited`. Defaults to true (a blocked requester), which
+   * matches the column default and every non-OMP transport. Pass false to seed
+   * the omp-sdk detached shape: still-answerable, nobody waiting.
+   */
+  awaited?: boolean;
 }
 
 /**
@@ -434,11 +440,24 @@ export function seedApproval(db: Database.Database, overrides: SeedApprovalOverr
   const status = overrides.status ?? 'pending';
   const createdAt = overrides.createdAt ?? new Date().toISOString();
 
-  db.prepare(
-    `INSERT INTO approvals
-       (id, run_id, tool_name, tool_input_json, tool_use_id, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, overrides.runId, toolName, toolInputJson, toolUseId, status, createdAt);
+  // `awaited` is named ONLY when the caller asks for a specific value. Naming
+  // it unconditionally would break fixtures built from migration 006 alone
+  // (cyboflowSchema.test.ts), which predate 111 and have no such column — and
+  // omitting it is equivalent anyway wherever the column exists, since its
+  // DEFAULT is 1.
+  if (overrides.awaited === undefined) {
+    db.prepare(
+      `INSERT INTO approvals
+         (id, run_id, tool_name, tool_input_json, tool_use_id, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, overrides.runId, toolName, toolInputJson, toolUseId, status, createdAt);
+  } else {
+    db.prepare(
+      `INSERT INTO approvals
+         (id, run_id, tool_name, tool_input_json, tool_use_id, status, created_at, awaited)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, overrides.runId, toolName, toolInputJson, toolUseId, status, createdAt, overrides.awaited ? 1 : 0);
+  }
 
   return id;
 }

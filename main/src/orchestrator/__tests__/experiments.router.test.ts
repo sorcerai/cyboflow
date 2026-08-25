@@ -110,6 +110,7 @@ function buildDb(): Database.Database {
     id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, label TEXT NOT NULL,
     spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT,
     execution_model TEXT, weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+    archived_at TEXT,  -- migration 116
     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')));`);
   db.exec(`CREATE TABLE experiment_comparisons (
     id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, run_id_a TEXT NOT NULL, run_id_b TEXT NOT NULL,
@@ -147,7 +148,7 @@ function variant(id: string): WorkflowVariantRow {
   return {
     id, workflow_id: workflowId, label: id, spec_json: '{}', agent_overrides_json: null,
     model: null, execution_model: null, agent_provider: null, agent_runtime: null,
-    weight: 1, status: 'draft', created_at: '', updated_at: '',
+    weight: 1, status: 'draft', archived_at: null, created_at: '', updated_at: '',
   };
 }
 
@@ -1156,6 +1157,7 @@ describe('experiments router orchestration (slice B)', () => {
       agent_runtime: null,
       weight: 1,
       status: 'draft',
+      archived_at: null,
       created_at: '',
       updated_at: '',
       ...overrides,

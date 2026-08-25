@@ -47,6 +47,17 @@ approved subset to materialize. Do not lose track of them between phases. Before
 creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
 `cyboflow_get_task` so you don't mint a duplicate of something already there.
 
+**Stamp the component ledger as you go.** Every idea carries the same five-piece
+component ledger Planner uses (`idea-spec` / `prototype` / `architecture` /
+`epics` / `stories` — see `planner.md` "The component ledger" for the full state
+model). Ship always plans an idea fresh in one continuous run, so it does not
+need Planner's resume-gate machinery — but it still writes the ledger, so a
+LATER planner or design-mode run that picks the idea back up sees ship's work as
+done instead of redoing it. Stamp each component with `cyboflow_set_idea_component`
+**after** the body write that completes it, never before, and stamp `skipped` for
+a step you deliberately do not run — an unstamped component looks exactly like
+work never done. The per-step stamps are called out below.
+
 ### Phase 1 — Plan
 
 1. **context** → delegate to `cyboflow-context` with `MODE: STUB`. Pass the `# Selected idea` block
@@ -76,6 +87,14 @@ creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
    `Approve idea`, options Approve / Revise / Reject; put the full short stub and
    its scope/design flags in the option markdown preview). Do **not** proceed to
    expansion until the user answers Approve.
+   - **No design fork here.** `cyboflow-context` is the SAME subagent Planner
+     uses, so it may return a `DESIGN_MODE: yes` judgement with a
+     `DESIGN_MODE_REASON:` line — **ignore it.** Ship never offers a
+     design-mode option at this gate; present only the plain Approve / Revise /
+     Reject options above. Ship runs straight through to sprinting in one
+     continuous session, and handing the idea to an interactive design-mode
+     session mid-flow would fork the same idea into two divergent runs instead
+     of shipping it.
 
 ### Phase 2 — Refine
 
@@ -88,6 +107,7 @@ creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
    scope/design flag lines via
    `cyboflow_update_task`, preserving any research notes already present. This step
    is ungated.
+   - **Stamp** `idea-spec` `complete` after the body write lands.
    - **Research as needed — no standalone research step.** Judge the idea's scope and
      complexity: when it needs external context (a novel domain, unfamiliar
      libraries/APIs, external prior art) spin up `cyboflow-research` and fold its
@@ -104,6 +124,8 @@ creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
    `atype: 'ui-prototype'`, a short label, and `payload_json`
    `{"fileName": "prototype/index.html"}` — the static mockup renders in a
    sandboxed frame from that file. Skip this step entirely when the flag is `no`.
+   **Stamp** `prototype` `complete` once the artifact is reported — or `skipped`
+   when you skip the step.
 5. **architecture** (optional) → run ONLY when context returned `ARCH_DESIGN: yes`
    (or the user explicitly asked for an architecture writeup). Report the step,
    then delegate to `cyboflow-architecture` with the spec (plus prototype notes
@@ -112,6 +134,8 @@ creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
    design` section, REPLACE that section (never stack a second copy); otherwise
    append it. The arch-design deliverable tab derives from the body automatically,
    so you do **not** report an artifact for this step. Skip when the flag is `no`.
+   **Stamp** `architecture` `complete` after the fold — or `skipped` whenever the
+   step does not run.
 6. **adversarial-review** (optional) → run ONLY when `ui-prototype` OR
    `architecture` ran — the exact same condition as `approve-design`. Delegate to
    `cyboflow-adversarial-review` with the full spec, prototype URL/notes when
@@ -163,6 +187,9 @@ creating a new idea, check the existing backlog with `cyboflow_list_tasks` /
    approved subset to materialize. The idea is NOT retired here; the backend
    removes it from the board (stamps `decomposed_at`) the moment the plan is approved
    at `approve-plan` (step 10) — see that step.
+   **Stamp** `stories` `complete` once its tasks are created, and `epics` per step
+   8 (`complete` when the idea ended up with an epic, `skipped` for a single-task
+   idea that correctly got none).
 10. **approve-plan** → **human gate, inline. This gate doubles as the
    pre-execution gate.** Use **AskUserQuestion** (header `Approve plan`):
    - Present the **FULL list** of tasks the run created — by ref/title — in the
@@ -403,6 +430,16 @@ Run steps 14-16 normally ONLY when every lane is `integrated`.
   UI prototype or architecture ran. Auto-revise each must-fix once, never loop,
   and report every remaining issue with `blocking: false` for the existing design
   gate preview.
+- **No design fork.** `cyboflow-context` may return `DESIGN_MODE: yes` (it is the
+  same subagent Planner uses) — ignore it. Ship never offers a design-mode option
+  at `approve-idea`; forking to an interactive design session mid-flow would split
+  one idea into two divergent runs instead of shipping it.
+- **Stamp the ledger as you go.** Stamp each of the five components
+  (`idea-spec` / `prototype` / `architecture` / `epics` / `stories`) with
+  `cyboflow_set_idea_component` as you finish it, *after* the body write that
+  completes it, and stamp `skipped` for a step you deliberately do not run. An
+  unstamped component looks exactly like work never done to whoever picks the
+  idea up next.
 - **Re-fetch entity bodies after every gate.** While you are parked at a human
   gate, the user can send in-artifact feedback that revises the idea's spec or
   `## Architecture design` section through a host-side revision agent — the body
