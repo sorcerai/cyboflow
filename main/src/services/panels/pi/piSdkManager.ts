@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
+import type { Writable, Readable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import type { AgentProvider } from '../../../../../shared/types/agentRuntime';
 import type { ConversationMessage } from '../../../database/models';
@@ -253,11 +254,17 @@ export class PiSdkManager extends AbstractCliManager {
     await new Promise<void>((resolve) => {
       let buffer = '';
       let sawAgentEnd = false;
-      const child = spawn(executable, args, {
-        cwd: worktreePath,
-        env: { ...process.env, PATH: getShellPath() },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // stdin must be a PIPE (the prompt rides it); typing the tuple gives a
+      // non-null `stdin` instead of the `Writable | null` default.
+      const child: ChildProcessByStdio<Writable, Readable, Readable> = spawn(
+        executable,
+        args,
+        {
+          cwd: worktreePath,
+          env: { ...process.env, PATH: getShellPath() },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
       state.child = child;
       child.stdin.write(prompt);
       child.stdin.end();
