@@ -30,7 +30,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
       primary: 'bg-interactive text-text-on-interactive hover:bg-interactive-hover focus:ring-interactive shadow-button hover:shadow-button-hover',
       secondary: 'bg-surface-secondary text-text-secondary hover:bg-surface-hover focus:ring-border-primary',
       ghost: 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover focus:ring-border-primary',
-      danger: 'bg-status-error text-white hover:bg-status-error-hover focus:ring-status-error',
+      danger: 'bg-status-error text-text-on-status-error hover:bg-status-error-hover focus:ring-status-error',
     };
     
     const sizes = {
@@ -105,7 +105,7 @@ export const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>(
       primary: 'bg-interactive text-text-on-interactive hover:bg-interactive-hover focus:ring-interactive',
       secondary: 'bg-surface-secondary text-text-secondary hover:bg-surface-hover focus:ring-border-primary',
       ghost: 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover focus:ring-border-primary',
-      danger: 'bg-status-error text-white hover:bg-status-error-hover focus:ring-status-error',
+      danger: 'bg-status-error text-text-on-status-error hover:bg-status-error-hover focus:ring-status-error',
     };
     
     const sizes = {

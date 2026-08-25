@@ -30,12 +30,20 @@ import { listApproveIdeasBatchRows, listRunOwnedOrBatchIdeaIds } from './runEnti
 import type { DatabaseLike, LoggerLike } from './types';
 import { resolveWorkflowDefinition, type WorkflowStep } from '../../../shared/types/workflows';
 import { resolveRunFrozenSpec } from './runFrozenSpec';
-import { extractArchDesignSection } from '../../../shared/types/artifacts';
+import {
+  COMBINED_BATCH_PAYLOAD_JSON,
+  extractArchDesignSection,
+} from '../../../shared/types/artifacts';
 import { TERMINAL_RUN_STATUSES } from '../../../shared/types/cyboflow';
 import type {
   ApproveIdeasArtifactPayload,
   ApproveDesignsArtifactPayload,
 } from '../../../shared/types/artifacts';
+import {
+  resolveIdeaComponents,
+  resolveIdeaComponentsBatch,
+} from './ideaComponents/resolveIdeaComponents';
+import type { IdeaComponentState } from '../../../shared/types/ideaComponents';
 
 // ---------------------------------------------------------------------------
 // Terminal-status gate (finding H-automint-1)
@@ -180,6 +188,7 @@ const ENTITY_WRITE_STEP_ORIGIN = {
   archDesign: 'Refine · architecture design',
   approveIdeas: 'Plan · approve ideas',
   approveDesigns: 'Refine · approve designs',
+  ideaSummary: 'Plan · idea summary',
 } as const;
 
 /**
@@ -189,6 +198,30 @@ const ENTITY_WRITE_STEP_ORIGIN = {
  * are planner + launch, mirroring TEMPLATED_ATYPE_WORKFLOWS.
  */
 const BATCH_GATE_WORKFLOWS = new Set<string>(['planner', 'launch']);
+
+/**
+ * Workflows whose runs auto-mint the templated 'idea-summary' hub artifact —
+ * the per-idea ledger-status surface (idea spec / prototype / architecture /
+ * epics / stories) that links out to each real sibling deliverable tab.
+ * Deliberately its OWN set (NOT a reuse of BASELINE_RUN_START_WORKFLOWS or
+ * CONTENT_DRIVEN_WORKFLOWS, even though its membership happens to equal the
+ * former today) so a future change to either set does not silently change
+ * idea-summary's mint surface. Minted at TWO seams:
+ *   - handleRunStart, for every member here (planner, sprint, ship) — so a
+ *     re-entered idea's hub is visible immediately even for a run that never
+ *     edits the idea again (a standalone sprint purely executing an
+ *     already-decomposed idea's tasks never calls handleEntityWrite
+ *     meaningfully — see CONTENT_DRIVEN_WORKFLOWS below — so run-start is its
+ *     ONLY mint opportunity).
+ *   - handleEntityWrite, for CONTENT_DRIVEN_WORKFLOWS (planner, ship) only —
+ *     refreshes the content gate as the idea's own components (spec,
+ *     architecture) and its epics/stories fill in mid-run. A sprint's hub is
+ *     therefore fixed at its run-start snapshot; the TAB CONTENT still stays
+ *     live regardless (useArtifactData re-derives the ledger + idea on every
+ *     read and subscribes to onTaskChanged/onComponentsChanged) — only the
+ *     row's identity/label needs a mint, and sprint gets exactly one.
+ */
+const IDEA_SUMMARY_WORKFLOWS = new Set<string>(['planner', 'sprint', 'ship']);
 
 // ---------------------------------------------------------------------------
 // Step-origin labels (human-readable provenance shown on the artifact tab)
@@ -423,7 +456,7 @@ async function mintIdeaSpecForOwnedIdeas(
     label: 'Idea specs · ' + pluralize(withContent, 'idea'),
     sourceRef: ideaIds[0],
     stepOrigin,
-    payloadJson: JSON.stringify({ combined: true }),
+    payloadJson: COMBINED_BATCH_PAYLOAD_JSON,
     isNew: true,
     actor: 'orchestrator',
   });
@@ -524,6 +557,164 @@ async function mintArchDesignForOwnedIdeas(
   for (const ideaId of ideaIds) {
     await mintArchDesignForIdea(db, runId, projectId, ideaId, stepOrigin, logger);
   }
+}
+
+/** Fixed label for the SINGLE-idea idea-summary hub tab (mirrors arch-design's fixed label). */
+const IDEA_SUMMARY_LABEL = 'Idea summary';
+
+/**
+ * Label STEM for the COMBINED multi-idea hub tab; the idea count is appended
+ * ('Idea summaries · 4 ideas'). Its own constant rather than a pluralization of
+ * IDEA_SUMMARY_LABEL because 'summary' → 'summaries' is not the suffix rule
+ * `pluralize` implements.
+ */
+const IDEA_SUMMARIES_LABEL = 'Idea summaries';
+
+/**
+ * CONTENT GATE for idea-summary: true when at least one of the idea's five
+ * ledger components carries REAL state — complete, explicitly skipped, or
+ * incomplete-but-needs-review (staleAt !== null, prior work exists that just
+ * needs re-verification). False only when every component is the untouched
+ * "not started" default (state='incomplete', staleAt=null) — a hub summarizing
+ * a totally blank ledger has nothing useful to show, mirroring every other
+ * templated atype's content gate in this file.
+ */
+function hasMeaningfulComponentState(states: IdeaComponentState[]): boolean {
+  return states.some((s) => s.state !== 'incomplete' || s.staleAt !== null);
+}
+
+/**
+ * idea-summary mint for a KNOWN idea: label = the fixed IDEA_SUMMARY_LABEL;
+ * sourceRef = ideaId. Content (the ledger snapshot + links to sibling
+ * deliverables) is entirely re-derived on read (mode 'template') by the
+ * frontend's useArtifactData (idea + `cyboflow.ideaComponents.get`), so
+ * payloadJson stays null here. Missing idea row -> fail-soft. Reached ONLY via
+ * mintIdeaSummaryForOwnedIdeas's SINGLE-idea branch (a multi-idea batch mints
+ * one combined tab instead — see that function).
+ *
+ * CONTENT GATE: only minted when resolveIdeaComponents finds at least one
+ * component with real state (hasMeaningfulComponentState) — see that
+ * function's doc.
+ */
+async function mintIdeaSummaryForIdea(
+  db: DatabaseLike,
+  runId: string,
+  projectId: number,
+  ideaId: string,
+  stepOrigin: string | null,
+  logger?: LoggerLike,
+): Promise<void> {
+  const ideaRow = db.prepare('SELECT id AS id FROM ideas WHERE id = ?').get(ideaId) as
+    | { id: string }
+    | undefined;
+  if (!ideaRow) {
+    logger?.debug('[autoMintArtifacts] idea-summary skipped — idea row not found', { runId, ideaId });
+    return;
+  }
+
+  const states = resolveIdeaComponents(db, ideaId);
+  if (!hasMeaningfulComponentState(states)) {
+    logger?.debug('[autoMintArtifacts] idea-summary skipped — ledger has no meaningful component yet', {
+      runId,
+      ideaId,
+    });
+    return;
+  }
+
+  await ArtifactRouter.getInstance().apply(projectId, {
+    op: 'create',
+    runId,
+    atype: 'idea-summary',
+    label: IDEA_SUMMARY_LABEL,
+    sourceRef: ideaId,
+    stepOrigin,
+    isNew: true,
+    actor: 'orchestrator',
+  });
+}
+
+/**
+ * idea-summary mint for the ideas the run OWNS.
+ *
+ * SINGLE-idea run: one per-idea hub tab, sourceRef = the idea, label = the fixed
+ * IDEA_SUMMARY_LABEL — unchanged since migration 102.
+ *
+ * MULTI-idea batch: ONE run-scoped COMBINED tab (the mintIdeaSpecForOwnedIdeas
+ * pattern) instead of N per-idea tabs that all carry the SAME fixed label and are
+ * therefore indistinguishable in the tab strip. sourceRef anchors on the FIRST
+ * owned idea so the row minted while the batch was still size 1 is ADOPTED in
+ * place by the (run_id, atype, source_ref) UPSERT — the single→multi transition
+ * converts that row rather than orphaning it. `payload_json.combined = true` is
+ * the renderer's branch marker (it re-derives the batch's ideas from the live
+ * entity model via tasks.runDecomposition + ideaComponents.getMany, exactly like
+ * the combined idea-spec tab).
+ *
+ * CONTENT GATE (batch): mirrors the per-idea gate across the batch — the tab is
+ * minted once at least ONE owned idea's ledger carries real state
+ * (hasMeaningfulComponentState). Ideas whose ledger is still the untouched
+ * "not started" default DO get a row on the combined tab (five "not started"
+ * cells is real information about the batch, unlike a lone hub over a blank
+ * ledger), so the label counts every non-archived owned idea rather than only
+ * the state-bearing ones.
+ *
+ * No resolvable idea → fail-soft (logs + returns).
+ */
+async function mintIdeaSummaryForOwnedIdeas(
+  db: DatabaseLike,
+  runId: string,
+  projectId: number,
+  stepOrigin: string | null,
+  logger?: LoggerLike,
+): Promise<void> {
+  const ideaIds = listRunOwnedOrBatchIdeaIds(db, runId);
+  if (ideaIds.length === 0) {
+    logger?.debug('[autoMintArtifacts] idea-summary skipped — run owns no resolvable idea', { runId });
+    return;
+  }
+
+  if (ideaIds.length === 1) {
+    await mintIdeaSummaryForIdea(db, runId, projectId, ideaIds[0], stepOrigin, logger);
+    return;
+  }
+
+  // CONTENT GATE + label count: `withState` gates the tab (at least one real
+  // ledger state anywhere in the batch), `rendered` is the row count the renderer
+  // will show (non-archived owned ideas) and so the count in the label. The
+  // ledgers come from the GROUPED resolveIdeaComponentsBatch rather than a
+  // resolve per idea — this runs on every entity write of a planner run.
+  const ledgers = resolveIdeaComponentsBatch(db, ideaIds);
+  let withState = 0;
+  let rendered = 0;
+  for (const ideaId of ideaIds) {
+    const row = db.prepare('SELECT archived_at AS archivedAt FROM ideas WHERE id = ?').get(ideaId) as
+      | { archivedAt: unknown }
+      | undefined;
+    if (!row) continue;
+    if (row.archivedAt === null || row.archivedAt === undefined) rendered += 1;
+    if (hasMeaningfulComponentState(ledgers.get(ideaId) ?? [])) withState += 1;
+  }
+  if (withState === 0) {
+    logger?.debug('[autoMintArtifacts] combined idea-summary skipped — no idea has a meaningful ledger yet', {
+      runId,
+    });
+    return;
+  }
+  if (rendered === 0) {
+    logger?.debug('[autoMintArtifacts] combined idea-summary skipped — every owned idea is archived', { runId });
+    return;
+  }
+
+  await ArtifactRouter.getInstance().apply(projectId, {
+    op: 'create',
+    runId,
+    atype: 'idea-summary',
+    label: IDEA_SUMMARIES_LABEL + ' · ' + pluralize(rendered, 'idea'),
+    sourceRef: ideaIds[0],
+    stepOrigin,
+    payloadJson: COMBINED_BATCH_PAYLOAD_JSON,
+    isNew: true,
+    actor: 'orchestrator',
+  });
 }
 
 /** Narrow projection for a batch-gate payload row (one per owned idea). */
@@ -997,6 +1188,13 @@ export async function handleRunStart(
       await mintApproveIdeasForBatch(db, runId, projectId, stepOrigin, logger);
       await mintApproveDesignsForBatch(db, runId, projectId, stepOrigin, logger);
     }
+    // idea-summary: minted for EVERY IDEA_SUMMARY_WORKFLOWS member (planner,
+    // sprint, ship) — see that set's header for why sprint needs this run-start
+    // mint (it never calls handleEntityWrite meaningfully, so this is its only
+    // chance to get a hub tab at all). Content-gated inside the helper.
+    if (IDEA_SUMMARY_WORKFLOWS.has(meta.workflowName)) {
+      await mintIdeaSummaryForOwnedIdeas(db, runId, projectId, stepOrigin, logger);
+    }
   } catch (err) {
     const msg = `[autoMintArtifacts] run-start baseline failed for runId=${runId} (fail-soft): ${
       err instanceof Error ? err.message : String(err)
@@ -1112,6 +1310,19 @@ export async function handleEntityWrite(
           logger,
         );
       }
+      // idea-summary refreshes the run's hub — the idea's own spec/architecture
+      // components just changed (or a bare stub idea's ledger finally became
+      // meaningful). One per-idea tab on a single-idea run, one combined tab on
+      // a batch.
+      if (IDEA_SUMMARY_WORKFLOWS.has(meta.workflowName)) {
+        await mintIdeaSummaryForOwnedIdeas(
+          db,
+          runId,
+          projectId,
+          ENTITY_WRITE_STEP_ORIGIN.ideaSummary,
+          logger,
+        );
+      }
     } else {
       await mintDecomposedStoriesForIdea(
         db,
@@ -1121,6 +1332,18 @@ export async function handleEntityWrite(
         ENTITY_WRITE_STEP_ORIGIN.decomposition,
         logger,
       );
+      // epics/stories are two of the five ledger components, and an epic/task
+      // write can change either for ANY idea the run owns (not just `ideaId`,
+      // the first) — refresh over the whole owned set rather than a single idea.
+      if (IDEA_SUMMARY_WORKFLOWS.has(meta.workflowName)) {
+        await mintIdeaSummaryForOwnedIdeas(
+          db,
+          runId,
+          projectId,
+          ENTITY_WRITE_STEP_ORIGIN.ideaSummary,
+          logger,
+        );
+      }
     }
   } catch (err) {
     const msg = `[autoMintArtifacts] entity-write mint failed for runId=${runId} entityType=${entityType} (fail-soft): ${

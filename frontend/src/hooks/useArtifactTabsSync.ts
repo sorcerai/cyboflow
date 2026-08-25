@@ -120,6 +120,12 @@ export function useArtifactTabsSync(sessionKey: string, artifacts: Artifact[], l
     if (!session) return;
     for (const tab of session.tabs) {
       if (tab.kind !== 'artifact') continue;
+      // An EXTERNAL tab (TabItem.external — a cross-run, idea-scoped artifact
+      // opened from the idea-session canvas) is resolved by the pane via
+      // `artifacts.get` against the tab's OWN runId, never from this session's
+      // list. It is absent from `artifacts` by construction, so pruning it here
+      // would close it the instant it opened.
+      if (tab.external === true) continue;
       // A tab with NO artifactId was chip-opened for a not-yet-minted artifact
       // ("creates ⟨artifact⟩" opens eagerly) — it renders the not-created-yet
       // state and must NOT be pruned; auto-open stamps the id once it mints.

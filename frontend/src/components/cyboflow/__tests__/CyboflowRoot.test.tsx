@@ -194,6 +194,13 @@ vi.mock('../../../utils/api', () => ({
       delete: vi.fn().mockResolvedValue({ success: true }),
       squashAndRebaseToMain: vi.fn().mockResolvedValue({ success: true }),
       rebaseToMain: vi.fn().mockResolvedValue({ success: true }),
+      // Dismiss-dialog delivery probe fires when it opens; default "not
+      // delivered" keeps the plain confirm path (see SessionDismissDialog).
+      getDeliveryState: vi.fn().mockResolvedValue({
+        success: true,
+        data: { delivered: false, landed: false, ownCommits: 0 },
+      }),
+      markComplete: vi.fn().mockResolvedValue({ success: true, data: { stamped: 1 } }),
       // Merge-dialog prefill probe fires when the dialog opens.
       getBranchCommitSubjects: vi.fn().mockResolvedValue({ success: true, data: { subjects: [] } }),
       gitPush: vi.fn().mockResolvedValue({ success: true }),
@@ -699,13 +706,15 @@ describe('CyboflowRoot — lifecycle dialog wiring (TASK-796)', () => {
     expect(await screen.findByText('Create pull request')).toBeInTheDocument();
   });
 
-  it('clicking Dismiss opens the SessionDismissDialog', () => {
+  it('clicking Dismiss opens the SessionDismissDialog', async () => {
     activateQuickSession();
     render(<CyboflowRoot projectId={1} />);
 
     expect(screen.queryByText('Dismiss session?')).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId('session-action-dismiss'));
-    expect(screen.getByText('Dismiss session?')).toBeInTheDocument();
+    // The dialog's own delivery-state probe resolves async (default mock:
+    // not delivered) before the plain confirm renders.
+    expect(await screen.findByText('Dismiss session?')).toBeInTheDocument();
   });
 
   it('renders the action bar for an opened workflow run whose session.runId matches activeRunId', () => {
@@ -728,6 +737,84 @@ describe('CyboflowRoot — lifecycle dialog wiring (TASK-796)', () => {
     render(<CyboflowRoot projectId={1} />);
 
     expect(screen.queryByTestId('session-lifecycle-action-bar')).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idea HOME session close-out: Close instead of Merge/PR/Dismiss (idea sessions)
+// ---------------------------------------------------------------------------
+
+describe('CyboflowRoot — idea home session Close', () => {
+  afterEach(() => {
+    act(() => {
+      useCyboflowStore.getState().clearActiveRun();
+      useCyboflowStore.getState().clearActiveQuickSession();
+      useSessionStore.setState({ sessions: [] });
+      useActiveRunsStore.setState({ runsByProject: {} });
+    });
+  });
+
+  const activateHomeSession = (extraSessions: ReturnType<typeof makeQuickSession>[] = []) => {
+    const home = makeQuickSession({
+      id: 'sess-home-1',
+      homeIdeaId: 'idea-1',
+      inPlace: true,
+      status: 'stopped',
+    });
+    act(() => {
+      useSessionStore.setState({ sessions: [home, ...extraSessions] });
+      useCyboflowStore.getState().setActiveQuickSession(home.id);
+    });
+    return home;
+  };
+
+  it('shows Close instead of Merge / Create PR / Dismiss', () => {
+    activateHomeSession();
+    render(<CyboflowRoot projectId={1} />);
+
+    expect(screen.getByTestId('session-action-close')).toBeInTheDocument();
+    expect(screen.queryByTestId('session-action-merge')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('session-action-create-pr')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('session-action-dismiss')).not.toBeInTheDocument();
+  });
+
+  it('hides the whole bar while a launched child session is running', () => {
+    const child = makeQuickSession({
+      id: 'sess-child-1',
+      originIdeaId: 'idea-1',
+      status: 'running',
+    });
+    activateHomeSession([child]);
+    render(<CyboflowRoot projectId={1} />);
+
+    expect(screen.queryByTestId('session-lifecycle-action-bar')).not.toBeInTheDocument();
+  });
+
+  it('a settled child session brings Close back', () => {
+    const child = makeQuickSession({
+      id: 'sess-child-1',
+      originIdeaId: 'idea-1',
+      status: 'stopped',
+    });
+    activateHomeSession([child]);
+    render(<CyboflowRoot projectId={1} />);
+
+    expect(screen.getByTestId('session-action-close')).toBeInTheDocument();
+  });
+
+  it('Close archives the session directly — no merge-warning dialog', async () => {
+    activateHomeSession();
+    render(<CyboflowRoot projectId={1} />);
+
+    fireEvent.click(screen.getByTestId('session-action-close'));
+
+    await waitFor(() => {
+      expect(vi.mocked(API.sessions.delete)).toHaveBeenCalledWith('sess-home-1');
+    });
+    // Neither dismiss-dialog variant ever appears (no delivery probe, no confirm).
+    expect(screen.queryByText('Dismiss session?')).not.toBeInTheDocument();
+    expect(screen.queryByText('Checking session...')).not.toBeInTheDocument();
+    expect(await screen.findByText('Session closed')).toBeInTheDocument();
   });
 });
 

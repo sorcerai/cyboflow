@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import type { Event, Breadcrumb } from '@sentry/electron/main';
-import { scrubSentryEvent, scrubBreadcrumb, isBenignStreamWriteEpipe } from '../scrub';
+import type { Event, Breadcrumb, StackFrame } from '@sentry/electron/main';
+import {
+  scrubSentryEvent,
+  scrubBreadcrumb,
+  isBenignStreamWriteEpipe,
+  tagCrashSource,
+} from '../scrub';
 
 describe('scrubSentryEvent', () => {
   function makeEvent(): Event {
@@ -40,6 +45,34 @@ describe('scrubSentryEvent', () => {
     // Windows-style separators also collapse to basename.
     expect(frames?.[1].filename).toBe('index.ts');
     expect(frames?.[1].abs_path).toBe('index.ts');
+  });
+
+  // Native minidump frames carry their path on `package` and leave
+  // filename/abs_path unset, so the basename rules for JS frames never saw
+  // them: real events shipped '/Users/<name>/.nvm/.../bin/node' to Sentry.
+  it('reduces native frame package paths to basenames', () => {
+    // The SDK's StackFrame type omits `package`; the event protocol defines it
+    // for native frames and that is what a minidump actually sends.
+    type FrameWithPackage = StackFrame & { package?: string };
+    const nativeFrames: FrameWithPackage[] = [
+      { package: '/Users/alice/.nvm/versions/node/v22.15.1/bin/node' },
+      { package: '/usr/lib/system/libdispatch.dylib' },
+      { package: '/Applications/Cyboflow.app/Contents/Resources/bin/peekaboo' },
+    ];
+    const event: Event = {
+      platform: 'native',
+      exception: {
+        values: [{ type: 'Error', stacktrace: { frames: nativeFrames } }],
+      },
+    };
+    const scrubbed = scrubSentryEvent(event)?.exception?.values?.[0]?.stacktrace
+      ?.frames as FrameWithPackage[] | undefined;
+    // The binary name survives — it is what identifies the crashing process
+    // and what server-side grouping rules match on.
+    expect(scrubbed?.[0].package).toBe('node');
+    expect(scrubbed?.[1].package).toBe('libdispatch.dylib');
+    expect(scrubbed?.[2].package).toBe('peekaboo');
+    expect(scrubbed?.[0].package).not.toContain('alice');
   });
 
   it('redacts absolute home paths in message and exception value', () => {
@@ -132,5 +165,57 @@ describe('scrubBreadcrumb', () => {
     const breadcrumb: Breadcrumb = { category: 'ui.click' };
     const result = scrubBreadcrumb(breadcrumb);
     expect(result).toBe(breadcrumb);
+  });
+});
+
+describe('tagCrashSource', () => {
+  function nativeCrash(processTag?: string): Event {
+    return {
+      platform: 'native',
+      level: 'fatal',
+      tags: {
+        'event.environment': 'native',
+        ...(processTag === undefined ? {} : { 'event.process': processTag }),
+      },
+    };
+  }
+
+  // The crash families that motivated the tag: a vitest worker an agent forked
+  // and the bundled peekaboo binary both land here with no crashpad
+  // `process_type`, so the SDK stamps the literal 'unknown'.
+  it("marks a minidump with no identified process type as external", () => {
+    expect(tagCrashSource(nativeCrash('unknown')).tags?.crash_source).toBe('external-process');
+  });
+
+  it('marks a minidump missing the process tag entirely as external', () => {
+    expect(tagCrashSource(nativeCrash()).tags?.crash_source).toBe('external-process');
+  });
+
+  it.each(['browser', 'renderer', 'gpu', 'utility'])(
+    "marks a '%s' process crash as the app's own",
+    (processTag) => {
+      expect(tagCrashSource(nativeCrash(processTag)).tags?.crash_source).toBe('app');
+    },
+  );
+
+  // Ambiguity fails TOWARD the app: a renderer named via getRendererName, or a
+  // process type a future Electron adds, must never be filed as external noise.
+  it('treats an unrecognized but named process type as the app', () => {
+    expect(tagCrashSource(nativeCrash('main-window')).tags?.crash_source).toBe('app');
+  });
+
+  it('preserves the tags the SDK already set', () => {
+    const tagged = tagCrashSource(nativeCrash('unknown'));
+    expect(tagged.tags?.['event.environment']).toBe('native');
+  });
+
+  it('leaves non-native events untagged', () => {
+    const jsError: Event = { platform: 'javascript', tags: { 'event.process': 'browser' } };
+    expect(tagCrashSource(jsError).tags?.crash_source).toBeUndefined();
+  });
+
+  it('tags a native crash when it flows through beforeSend alongside scrubbing', () => {
+    const scrubbed = scrubSentryEvent(tagCrashSource(nativeCrash('unknown')));
+    expect(scrubbed?.tags?.crash_source).toBe('external-process');
   });
 });

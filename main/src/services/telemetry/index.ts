@@ -1,7 +1,12 @@
 import * as Sentry from '@sentry/electron/main';
 import { initialize as aptabaseInitialize, trackEvent as aptabaseTrack } from '@aptabase/electron/main';
 import { app } from 'electron';
-import { scrubSentryEvent, scrubBreadcrumb, isBenignStreamWriteEpipe } from './scrub';
+import {
+  scrubSentryEvent,
+  scrubBreadcrumb,
+  isBenignStreamWriteEpipe,
+  tagCrashSource,
+} from './scrub';
 import { resolveTelemetryCredentials } from './credentials';
 import { recordLocalError } from './diagnostics';
 import type { TelemetryEventMap, TelemetryEventName } from '../../../../shared/types/telemetry';
@@ -49,7 +54,12 @@ export function initTelemetry(cfg: {
         // Drop benign broken-pipe writes before scrubbing — the app already
         // swallows EPIPE at the process level, so these are duplicate noise
         // (see isBenignStreamWriteEpipe). Everything else is scrubbed + kept.
-        beforeSend: (event) => (isBenignStreamWriteEpipe(event) ? null : scrubSentryEvent(event)),
+        // Native crashes are additionally tagged by provenance first: the
+        // crashpad handler catches processes spawned BENEATH the app too, so a
+        // minidump is not self-evidently ours (see tagCrashSource). Scrubbing
+        // stays the outermost step — nothing leaves without passing it.
+        beforeSend: (event) =>
+          isBenignStreamWriteEpipe(event) ? null : scrubSentryEvent(tagCrashSource(event)),
         beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
       });
       // Default integrations capture uncaught exceptions / unhandled

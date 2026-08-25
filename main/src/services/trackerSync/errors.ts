@@ -41,6 +41,24 @@ export class TrackerConnectionNotFoundError extends Error {
 }
 
 /**
+ * The push-target role was offered to a PAUSED row while an active sibling is
+ * carrying it. A paused row enqueues nothing (write-back skips on status before
+ * push_target), and a locally-created idea is pushed exactly once, at creation
+ * — never back-filled — so accepting the swap would drop every idea filed until
+ * the row is reconnected. Refused with the actionable fix in the message; the
+ * tRPC router maps it to CONFLICT by NAME (it may not import this module).
+ */
+export class TrackerConnectionPausedError extends Error {
+  constructor(connectionId: string) {
+    super(
+      `tracker connection ${connectionId} is paused — reconnect it with a fresh key before ` +
+        'making it the push target',
+    );
+    this.name = 'TrackerConnectionPausedError';
+  }
+}
+
+/**
  * A credential rotation was offered a key that authorizes a DIFFERENT workspace
  * than the connection is bound to. Storing it would silently repoint every one
  * of the connection's links at issue ids belonging to another workspace, so the

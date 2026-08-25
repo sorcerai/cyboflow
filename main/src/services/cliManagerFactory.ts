@@ -92,17 +92,20 @@ export function isCodexPtyManagerLike(manager: AbstractCliManager): manager is C
 /**
  * The seams an OMP RPC manager must expose BEYOND AbstractCliManager.
  *
- * Shorter than {@link CodexSdkSeams} because OMP needs less injected: its
- * approval dialogs are answered in-process by `OmpApprovalBridge` (there is no
- * router provider to hand it), and it has no vendor-account probe. What remains
- * is the MCP runtime config boot injects, plus the catalogue accessor — which
+ * Shorter than {@link CodexSdkSeams} because OMP needs less injected: its tool
+ * approval dialogs are answered in-process by `OmpApprovalBridge`, while content
+ * dialogs use the shared question router. It has no vendor-account probe. What remains
+ * is the MCP runtime config and question router boot injects, plus the catalogue accessor — which
  * the model picker does NOT route through (`ipc/models.ts` reads the shared
  * probe directly, because the picker can be opened in Settings before any OMP
  * session exists) but which belongs in the contract anyway: it is the one seam
  * that must reach the vendor binary, so demo mode has to refuse it.
  * Derived with `Pick` for the same anti-drift reason.
  */
-type OmpSdkSeams = Pick<OmpSdkManager, 'setCyboflowMcpRuntimeConfig' | 'getOmpModelCatalog'>;
+type OmpSdkSeams = Pick<
+  OmpSdkManager,
+  'setCyboflowMcpRuntimeConfig' | 'setQuestionRouterProvider' | 'getOmpModelCatalog'
+>;
 
 /** The OMP PTY seams beyond AbstractCliManager — the Codex PTY pair exactly. */
 type OmpPtySeams = Pick<OmpPtyManager, 'startPanel' | 'relayUserTurn'>;
@@ -118,6 +121,7 @@ export function isOmpSdkManagerLike(manager: AbstractCliManager): manager is Omp
   const seams = manager as Partial<OmpSdkSeams>;
   return (
     typeof seams.setCyboflowMcpRuntimeConfig === 'function' &&
+    typeof seams.setQuestionRouterProvider === 'function' &&
     typeof seams.getOmpModelCatalog === 'function'
   );
 }
@@ -168,6 +172,7 @@ function codexPtyDemoSeams(): Omit<CodexPtySeams, 'startPanel'> {
 function ompSdkDemoSeams(): OmpSdkSeams {
   return {
     setCyboflowMcpRuntimeConfig: () => {},
+    setQuestionRouterProvider: () => {},
     getOmpModelCatalog: demoSeamUnavailable('getOmpModelCatalog'),
   };
 }

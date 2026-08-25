@@ -32,11 +32,17 @@
 import { loadSdkQuery } from '../../utils/lazyAgentSdk';
 import type { LoggerLike } from '../types';
 import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
+import { EvalJudgeMaxTurnsError, EvalJudgeTimeoutError } from './judgeErrors';
 
 /** Default per-sample deadline. A hung claude binary must not stall the worker. */
-// Deliberately NOT raised alongside EVAL_JUDGE_TIMEOUT_MS (300s): the pairwise
-// judge is diff-only with maxTurns 8 — no worktree exploration loop to budget
-// for — and its timer likewise starts only after lane admission. 180s is ample.
+// Deliberately NOT raised alongside EVAL_JUDGE_TIMEOUT_MS (600_000ms, i.e. 10 min —
+// see evalJudgeQuery.ts) or CODEX_EVAL_JUDGE_TIMEOUT_MS
+// (services/panels/codex/codexEvalJudgeQuery.ts:35, also 600_000ms): the Claude
+// pairwise judge is diff-only with maxTurns 8 — no worktree exploration loop to
+// budget for — and its timer likewise starts only after lane admission, so 180s
+// is ample. The Codex pairwise slot deliberately keeps inheriting the 600s
+// deadline instead, since its app-server juror is exposed to the same
+// host-contention risk the longer Claude/Codex eval-jury deadlines exist for.
 export const PAIRWISE_JUDGE_TIMEOUT_MS = 180_000;
 
 /** Read-only tools the judge may use (diff-only grading needs none, kept for parity). */
@@ -93,9 +99,11 @@ function makeDeadline(
 
 /**
  * Build the production `PairwiseStructuredQueryFn`. Bounded structured query: the
- * judge emits the structured verdict enforced by `schema`. On timeout/error:
- * aborts and THROWS (the worker treats a throw as a malformed sample → retry once,
- * then drop).
+ * judge emits the structured verdict enforced by `schema`. On error: aborts and
+ * THROWS. DETERMINISTIC exhaustion is typed — a spent deadline throws
+ * `EvalJudgeTimeoutError` and a spent turn budget throws `EvalJudgeMaxTurnsError`
+ * — so the worker drops that slot without a guaranteed-wasted identical retry;
+ * every other failure stays a plain `Error` and keeps its one retry.
  */
 export function makePairwiseJudgeQuery(
   logger?: LoggerLike,
@@ -118,21 +126,45 @@ export function makePairwiseJudgeQuery(
       });
 
       let structured: unknown = null;
+      let hitMaxTurns = false;
       for await (const msg of q) {
-        if (msg.type === 'result' && msg.subtype === 'success') {
-          structured = msg.structured_output ?? null;
+        if (msg.type === 'result') {
+          if (msg.subtype === 'success') {
+            structured = msg.structured_output ?? null;
+          } else if (msg.subtype === 'error_max_turns') {
+            hitMaxTurns = true;
+          }
         }
       }
-      if (didTimeOut()) throw new Error(`pairwise judge query timed out after ${timeoutMs}ms`);
+      if (didTimeOut()) {
+        throw new EvalJudgeTimeoutError(`pairwise judge query timed out after ${timeoutMs}ms`);
+      }
+      // Surface turn exhaustion as its OWN typed error (parity with
+      // evalJudgeQuery): draining to `return null` made it masquerade downstream
+      // as "pairwise judge sample is not an object" — a parse-shaped failure the
+      // worker classifies as retryable — so a slot that had already spent its
+      // whole turn budget drew a guaranteed-wasted identical retry, and could
+      // then draw further whole-comparison attempts on the concurrency-1 'ab'
+      // lane. The worker treats this class as deterministic (no slot retry,
+      // errorCode 'max-turns') — see judgeErrors.isDeterministicJudgeFailure.
+      if (structured === null && hitMaxTurns) {
+        throw new EvalJudgeMaxTurnsError(
+          `pairwise judge hit the ${PAIRWISE_MAX_TURNS}-turn budget before emitting structured output`,
+        );
+      }
       return structured;
     } catch (err) {
+      if (err instanceof EvalJudgeTimeoutError || err instanceof EvalJudgeMaxTurnsError) {
+        logger?.warn('[pairwiseJudgeQuery] structured query failed', { error: err.message });
+        throw err; // keep the typed class — the worker's retry policy branches on it
+      }
       const message = didTimeOut()
         ? `pairwise judge query timed out after ${timeoutMs}ms`
         : err instanceof Error
           ? err.message
           : String(err);
       logger?.warn('[pairwiseJudgeQuery] structured query failed', { error: message });
-      throw new Error(message);
+      throw didTimeOut() ? new EvalJudgeTimeoutError(message) : new Error(message);
     } finally {
       cleanup();
     }

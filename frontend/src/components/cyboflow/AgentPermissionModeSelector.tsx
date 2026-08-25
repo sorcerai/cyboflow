@@ -43,9 +43,18 @@ const CODEX_PTY_PERMISSION_MODE_OPTIONS: ReadonlyArray<PermissionModeOption> = [
 ];
 
 /**
- * OMP's structured lane has no per-mode approval policy of its own to describe:
- * Cyboflow's own PreToolUse gate is what decides, so the first three modes
- * differ only in what that gate auto-allows and all three route the same way.
+ * OMP's structured lane has no approval classifier of its own, so Cyboflow's own
+ * PreToolUse gate is what decides and all four modes route the same way; they
+ * differ in what that gate auto-allows.
+ *
+ * `auto` is the one that inverts the gate's posture — allow unless the call
+ * trips a hazard list, rather than ask unless it is provably safe — which is
+ * what makes it the stand-in for Claude's native auto classifier. The hint says
+ * "allow unless risky" rather than the old "Same routing · fewer prompts",
+ * which described the routing accurately and the ALLOWANCE not at all: `auto`
+ * used to be `acceptEdits` plus permission rules, so every ordinary build
+ * command still prompted.
+ *
  * `dontAsk` is the one mode that hands the decision to OMP — whose own default
  * is approval-free ("yolo"), which is why it is spelled out rather than sharing
  * Claude's milder "No prompts · skip permissions".
@@ -53,7 +62,7 @@ const CODEX_PTY_PERMISSION_MODE_OPTIONS: ReadonlyArray<PermissionModeOption> = [
 const OMP_SDK_PERMISSION_MODE_OPTIONS: ReadonlyArray<PermissionModeOption> = [
   { id: 'default', label: 'Ask before edits', hint: 'Prompt for each edit' },
   { id: 'acceptEdits', label: 'Allow edits', hint: 'Auto-allow edits, safe reads & git' },
-  { id: 'auto', label: 'Auto', hint: 'Same routing · fewer prompts' },
+  { id: 'auto', label: 'Auto', hint: 'Allow unless risky · asks for hazards' },
   { id: 'dontAsk', label: "Don't ask", hint: 'OMP runs approval-free (yolo)' },
 ];
 

@@ -1109,117 +1109,93 @@ function AgentConfigSection({
 
   return (
     <div style={sectionContainerStyle} data-testid={sectionTestId}>
-      {/* ── Model pin ─────────────────────────────────────────────────────── */}
+      {/* ── Runtime pin + model pin ────────────────────────────────────────── */}
       {claudeOnly ? (
-        <>
-          <div>
-            <label style={labelStyle}>runtime</label>
-            <p style={hintStyle} data-testid={`${runtimeTestId}-claude-only`}>
-              <b>Always runs on Claude.</b> Another provider&apos;s runtime isn&apos;t available for
-              this agent.
-            </p>
-          </div>
-          <div>
-            <label style={labelStyle} htmlFor={modelId}>model</label>
-            <select
-              id={modelId}
-              value={selectedModel}
-              onChange={(e) =>
-                dispatch({
-                  type: 'SET_AGENT_MODEL',
-                  agentKey,
-                  model: e.target.value === '' ? null : (e.target.value as AgentModelAlias),
-                })
-              }
-              style={inputStyle}
-              data-testid={modelTestId}
-            >
-              <option value="">(inherit)</option>
-              {AGENT_MODEL_ALIASES.map((alias) => (
-                <option key={alias} value={alias}>{AGENT_MODEL_LABELS[alias]}</option>
-              ))}
-            </select>
-            <p style={hintStyle} data-testid={hintTestId}>
-              {inheriting ? `${inheritSentence} ` : ''}Applies to every step using <b>{agentKey}</b> in this flow.
-            </p>
-          </div>
-        </>
-      ) : agentProvider !== 'claude' ? (
-        // A non-Claude run is single-model (no per-agent model overlay), so a
-        // per-agent pin could never apply — show the run-level guidance instead
-        // of a picker.
+        <div>
+          <label style={labelStyle}>runtime</label>
+          <p style={hintStyle} data-testid={`${runtimeTestId}-claude-only`}>
+            <b>Always runs on Claude.</b> Another provider&apos;s runtime isn&apos;t available for
+            this agent.
+          </p>
+        </div>
+      ) : (
+        <div>
+          <label style={labelStyle} htmlFor={runtimeId}>runtime</label>
+          <select
+            id={runtimeId}
+            value={selectedRuntime}
+            onChange={(e) =>
+              dispatch({
+                type: 'SET_AGENT_RUNTIME',
+                agentKey,
+                runtime: e.target.value === '' ? null : (e.target.value as WorkflowAgentRuntime),
+              })
+            }
+            style={inputStyle}
+            data-testid={runtimeTestId}
+          >
+            <option value="">(inherit{agentProvider === 'claude' ? '' : ` — ${AGENT_PROVIDER_LABELS[agentProvider]}`})</option>
+            {runtimeOptions.map((runtime) => (
+              <option key={runtime} value={runtime}>
+                {WORKFLOW_AGENT_RUNTIME_LABELS[runtime]}
+                {isRuntimeProviderEnabled(providerAccess, runtime) ? '' : ' — provider off'}
+              </option>
+            ))}
+          </select>
+          <p style={hintStyle} data-testid={runtimeHintTestId}>
+            Runs every step using <b>{agentKey}</b> on this runtime. A per-step non-Claude
+            runtime applies to programmatic runs.
+          </p>
+        </div>
+      )}
+
+      {/* The model control follows the runtime this agent ACTUALLY deploys on.
+          The one case with no per-agent model pin at all is an UNPINNED agent on
+          a non-Claude run: it inherits the run's single model, and a
+          providerModel written without a runtime pin would be dropped by the
+          deploy seam (resolveStepAgent ignores providerModel unless some other
+          field is pinned) — so the run-level guidance is shown instead. */}
+      {!claudeOnly && pinnedNonClaude && selectedRuntime === '' ? (
         <div>
           <label style={labelStyle}>model</label>
           <p style={hintStyle} data-testid={`${modelTestId}-codex-note`}>
             {AGENT_PROVIDER_LABELS[agentProvider]} runs use a single model per run — set the run
-            model above. Per-agent model pins apply to Claude runtimes only.
+            model above, or pin a runtime here to give <b>{agentKey}</b> its own.
           </p>
         </div>
+      ) : !claudeOnly && pinnedNonClaude ? (
+        <ProviderAgentModelSelect
+          agentKey={agentKey}
+          provider={pinnedProvider}
+          providerModel={config?.providerModel ?? config?.codexModel}
+          isInner={isInner}
+          dispatch={dispatch}
+        />
       ) : (
-        <>
-          <div>
-            <label style={labelStyle} htmlFor={runtimeId}>runtime</label>
-            <select
-              id={runtimeId}
-              value={selectedRuntime}
-              onChange={(e) =>
-                dispatch({
-                  type: 'SET_AGENT_RUNTIME',
-                  agentKey,
-                  runtime: e.target.value === '' ? null : (e.target.value as WorkflowAgentRuntime),
-                })
-              }
-              style={inputStyle}
-              data-testid={runtimeTestId}
-            >
-              <option value="">(inherit)</option>
-              {runtimeOptions.map((runtime) => (
-                <option key={runtime} value={runtime}>
-                  {WORKFLOW_AGENT_RUNTIME_LABELS[runtime]}
-                  {isRuntimeProviderEnabled(providerAccess, runtime) ? '' : ' — provider off'}
-                </option>
-              ))}
-            </select>
-            <p style={hintStyle} data-testid={runtimeHintTestId}>
-              Runs every step using <b>{agentKey}</b> on this runtime. A per-step non-Claude
-              runtime applies to programmatic runs.
-            </p>
-          </div>
-          {pinnedNonClaude ? (
-            <ProviderAgentModelSelect
-              agentKey={agentKey}
-              provider={pinnedProvider}
-              providerModel={config?.providerModel ?? config?.codexModel}
-              isInner={isInner}
-              dispatch={dispatch}
-            />
-          ) : (
-            <div>
-              <label style={labelStyle} htmlFor={modelId}>model</label>
-              <select
-                id={modelId}
-                value={selectedModel}
-                onChange={(e) =>
-                  dispatch({
-                    type: 'SET_AGENT_MODEL',
-                    agentKey,
-                    model: e.target.value === '' ? null : (e.target.value as AgentModelAlias),
-                  })
-                }
-                style={inputStyle}
-                data-testid={modelTestId}
-              >
-                <option value="">(inherit)</option>
-                {AGENT_MODEL_ALIASES.map((alias) => (
-                  <option key={alias} value={alias}>{AGENT_MODEL_LABELS[alias]}</option>
-                ))}
-              </select>
-              <p style={hintStyle} data-testid={hintTestId}>
-                {inheriting ? `${inheritSentence} ` : ''}Applies to every step using <b>{agentKey}</b> in this flow.
-              </p>
-            </div>
-          )}
-        </>
+        <div>
+          <label style={labelStyle} htmlFor={modelId}>model</label>
+          <select
+            id={modelId}
+            value={selectedModel}
+            onChange={(e) =>
+              dispatch({
+                type: 'SET_AGENT_MODEL',
+                agentKey,
+                model: e.target.value === '' ? null : (e.target.value as AgentModelAlias),
+              })
+            }
+            style={inputStyle}
+            data-testid={modelTestId}
+          >
+            <option value="">(inherit)</option>
+            {AGENT_MODEL_ALIASES.map((alias) => (
+              <option key={alias} value={alias}>{AGENT_MODEL_LABELS[alias]}</option>
+            ))}
+          </select>
+          <p style={hintStyle} data-testid={hintTestId}>
+            {inheriting ? `${inheritSentence} ` : ''}Applies to every step using <b>{agentKey}</b> in this flow.
+          </p>
+        </div>
       )}
 
       {/* ── Reasoning effort (per-agent, provider-scoped) ───────────────────── */}

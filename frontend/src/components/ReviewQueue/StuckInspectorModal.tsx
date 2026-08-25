@@ -27,7 +27,7 @@ import type { StuckInspectionResult } from '../../../../shared/types/stuckInspec
 const STUCK_REASON_LABELS: Record<string, string> = {
   self_deadlock: 'Self-deadlock — this run has multiple pending approvals stacked up',
   cross_run_deadlock: 'Cross-run deadlock — another run is also awaiting review',
-  orphan_pty: 'Orphan PTY — the Claude process for this run is no longer running',
+  orphan_pty: 'Orphan CLI — the Claude process for this run is no longer running',
   stale_socket: 'Stale socket — the permission socket client has disconnected',
 };
 

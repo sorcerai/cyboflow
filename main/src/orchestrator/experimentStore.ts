@@ -716,7 +716,8 @@ export function setRotationLineage(db: DatabaseLike, experimentId: string, rerun
  * ⚠️ LOCKSTEP with VariantResolver.resolveForLaunch's pool predicate — the two
  * MUST admit exactly the same members or a run could be attributed to a rotation
  * whose snapshot does not contain the picked arm (or vice versa). The predicate:
- * `workflow_variants` where `status='active' AND weight>0` (ORDER BY id), plus the
+ * `workflow_variants` where `status='active' AND weight>0 AND archived_at IS NULL`
+ * (migration 116; ORDER BY id), plus the
  * live BASELINE when `workflows.baseline_in_rotation=1 AND baseline_rotation_weight>0`
  * (migration 054). The `__quick__` sentinel never rotates → []. If you change this
  * predicate, change resolveForLaunch's in the same edit.
@@ -735,7 +736,7 @@ export function computeRotationArmSet(db: DatabaseLike, workflowId: string): Rot
   const variants = db
     .prepare(
       `SELECT id AS id, label AS label, weight AS weight FROM workflow_variants
-        WHERE workflow_id = ? AND status = 'active' AND weight > 0
+        WHERE workflow_id = ? AND status = 'active' AND weight > 0 AND archived_at IS NULL
         ORDER BY id`,
     )
     .all(workflowId) as Array<{ id: string; label: string; weight: number }>;

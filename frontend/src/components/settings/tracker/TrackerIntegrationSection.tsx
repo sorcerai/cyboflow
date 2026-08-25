@@ -2,11 +2,15 @@
  * TrackerIntegrationSection — the issue-tracker catalog inside
  * Settings → Integrations, rendered below the Claude/Codex provider rows.
  *
- * Exactly two provider rows (Linear, Plane). A connection is project-scoped and
- * the wizard can target ANY cyboflow project, so each row lists EVERY project's
- * connection for that provider (project chip + status + Manage) — not just the
- * active project's. The Connect button stays visible while the ACTIVE project
- * has no connection for that provider (it seeds the wizard's Project step).
+ * One row per entry in TRACKER_PROVIDERS (Linear, Plane, Dart) — the catalog is
+ * data-driven, so a new provider is one row in that table and nothing here.
+ * A connection is one (tracker group -> cyboflow project) mapping, so a single
+ * wizard run can mint several sibling connections at once; each row lists
+ * EVERY project's connection for that provider (project chip + status +
+ * Manage) — not just the active project's. Connect renders only while the
+ * provider has NO live connection: once one exists, further mappings are added
+ * through Manage (the connected view's mappings card opens the wizard in
+ * add-mapping mode against the existing authorization).
  *
  * Connections are read across all projects and re-read on every
  * `onTrackerChanged` notification (one subscription per project): the event is
@@ -59,6 +63,13 @@ export function TrackerIntegrationSection(): React.JSX.Element {
   /** Which sub-modal is open: the wizard for a provider, or one connection's manage view. */
   const [wizardProvider, setWizardProvider] = useState<TrackerProvider | null>(null);
   const [manageConnectionId, setManageConnectionId] = useState<string | null>(null);
+  /**
+   * The connection whose authorization the ADD-MAPPING wizard is extending —
+   * opened from the manage view's mappings card. Non-null is the only state
+   * that mounts the second wizard, and it stacks ON TOP of the manage view
+   * rather than replacing it, so closing it returns to the card that opened it.
+   */
+  const [addMappingSource, setAddMappingSource] = useState<TrackerConnectionSummary | null>(null);
 
   const refresh = useCallback((): void => {
     void (async () => {
@@ -144,9 +155,6 @@ export function TrackerIntegrationSection(): React.JSX.Element {
       <div className="divide-y divide-border-primary overflow-hidden rounded-none border border-border-primary bg-surface-primary">
         {TRACKER_PROVIDERS.map((meta) => {
           const providerConnections = connections.filter((c) => c.provider === meta.provider);
-          const activeConnected =
-            activeProjectId !== null &&
-            providerConnections.some((c) => c.projectId === activeProjectId);
           return (
             <div key={meta.provider} className="flex items-start gap-3 px-4 py-4">
               <ProviderTile mark={meta.mark} />
@@ -160,6 +168,28 @@ export function TrackerIntegrationSection(): React.JSX.Element {
               <div className="flex flex-shrink-0 flex-col items-end gap-2">
                 {providerConnections.length === 0 && (
                   <span className="text-xs text-text-tertiary">Not connected</span>
+                )}
+                {/*
+                  Connect renders only while the provider has NO live connection:
+                  once one exists, adding a mapping goes through Manage (the
+                  connected view's mappings card + add-mapping wizard), and a
+                  standing Connect here would mint a SECOND workspace
+                  authorization when the user almost always means "another
+                  mapping". Connecting a genuinely different workspace of the
+                  same provider means disconnecting first — the deliberate
+                  trade-off of this rule.
+                */}
+                {providerConnections.length === 0 && (
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    className="rounded-none"
+                    disabled={activeProjectId === null}
+                    onClick={() => setWizardProvider(meta.provider)}
+                  >
+                    Connect
+                  </Button>
                 )}
                 {providerConnections.map((connection) => {
                   const status = STATUS_META[connection.status];
@@ -191,25 +221,18 @@ export function TrackerIntegrationSection(): React.JSX.Element {
                     </div>
                   );
                 })}
-                {!activeConnected && (
-                  <Button
-                    type="button"
-                    variant="primary"
-                    size="sm"
-                    className="rounded-none"
-                    disabled={activeProjectId === null}
-                    onClick={() => setWizardProvider(meta.provider)}
-                  >
-                    Connect
-                  </Button>
-                )}
               </div>
             </div>
           );
         })}
       </div>
 
-      {/* Nested sub-modals — mounted only while open, so each opens with fresh state. */}
+      {/*
+        Nested sub-modals — each mounted only while open, so it opens with fresh
+        state. The add-mapping wizard is the one deliberate STACK: it mounts over
+        a manage view that stays mounted underneath, because dismissing it must
+        land back on the mappings card it was launched from.
+      */}
       {wizardProvider !== null && activeProjectId !== null && (
         <TrackerWizardModal
           isOpen
@@ -224,8 +247,23 @@ export function TrackerIntegrationSection(): React.JSX.Element {
         <TrackerConnectedView
           isOpen
           connection={managed}
+          projectName={projectName}
+          onAddMapping={() => setAddMappingSource(managed)}
           onClose={() => setManageConnectionId(null)}
           onChanged={refresh}
+        />
+      )}
+
+      {addMappingSource !== null && (
+        <TrackerWizardModal
+          isOpen
+          provider={addMappingSource.provider}
+          // The Map step pre-selects the active project where there is one; the
+          // source connection's own project is the honest fallback when none is.
+          projectId={activeProjectId ?? addMappingSource.projectId}
+          sourceConnection={addMappingSource}
+          onClose={() => setAddMappingSource(null)}
+          onConnected={refresh}
         />
       )}
     </SettingsSection>

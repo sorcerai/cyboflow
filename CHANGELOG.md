@@ -6,6 +6,85 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-08-24
+
+### Added
+
+- **Idea home sessions.** A backlog idea card now has an **Open** entry that finds-or-creates a persistent, in-place SDK "home" session for that idea (`IdeaSessionCanvas` surface with external-artifact tabs, sidebar nesting under its idea, `home_idea_id` partial-unique so re-opening lands on the same session). Sprints can be launched from the canvas with `originIdeaId` lineage even when the idea isn't a seed, artifacts resolve per-idea, and the home session gets **Close** instead of Dismiss (migrations 113–115).
+- **Tracker field write-back.** Entity priority widens to the full **P0–P6** range (migration 117); priority and category now sync **inbound** from the tracker, and content/archive changes sync **outbound** to it, with per-connection content/archive sync modes, mapping overlays, and new outbox kinds (migration 118). The wizard gains mapping tables and content/archive toggles. Outbound writes carry a lost-update guard (pre-send divergence check) and the removal ruling dialog discloses every linked provider and its real action (archive vs cancelled-state fallback).
+- **Provider usage meters.** A provider-usage store captures Claude `rate_limit_event` at the SDK chokepoint and Codex account/rate-limit snapshots, exposes them over tRPC, and renders live Claude/Codex subscription-quota meters in the human review queue — each usage window counting down on its own row, with direct polling and stale-reading flags when a stream can't be wired.
+- **Assistant long-term memory + flow advisor.** `cyboflow_history` gives the assistant durable recall over its own past transcripts, and a flow advisor recommends the right built-in flow and surfaces compound pressure.
+- **Per-lane sprint rewind.** A confirm-gated monitor action (`rewind_lane_to_step`) un-sticks a *single* sprint lane — validated per-lane business logic, a `RunExecutor` mutator, and honoring in the fan-out inner loop — without disturbing its siblings or bumping the attempt cap.
+- **Workflow variant archiving.** Variants can be archived behind a "Show archived" toggle (migration 116); creating a variant opens its editor immediately, a draft variant reads "Not in rotation", and a step's non-Claude model pin shows on the editor card.
+- **Renderer security hardening.** A production CSP for the packaged renderer (build-time meta injection), centralized IPC-sender validation on every `ipcMain.handle` channel, a channel allowlist gating the generic preload invoke bridges, scheme-allowlisted `shell.openExternal`, realpath containment + an argv git allowlist in project file handlers, and migration of all shell-string git execution to argv-based `runGit`.
+
+### Changed
+
+- **E2E smoke tier is now a blocking PR gate** (and a release gate), joined by real-API canaries.
+- Plain-language idea tile labels and captions.
+- Cyboflow no longer honors `allow` rules from repo-controlled `.claude` settings, and no longer trusts repo-supplied allow rules over the repo-trust model.
+
+### Fixed
+
+- **OMP dispatch and turn accounting.** OMP subagent dispatch is allowed (the hook-scope premise having been tested false), the 30-minute turn ceiling no longer reports itself as a user interrupt, auto-mode bash may redirect to a plain path inside the working tree, and the `xd://` MCP dispatch wrapper is decided by the tool it targets.
+- A fresh approval no longer reads as 45 minutes stale.
+- A failed summarizer run now salvages a complete session summary instead of losing it.
+- The updater no longer advertises an older feed version as an available update.
+- Epics/stories `complete` stamps are downgraded when their underlying entities were deleted.
+- The outbox drain stops when its connection is no longer active; an inbound unset-priority resolves against the canonical seed; overlay tokens are validated live.
+- The `stale_socket` liveness rung was retired rather than wired.
+
+## [0.2.5] — 2026-08-21
+
+### Added
+
+- **Multi-project tracker mapping.** A tracker connection can now map several tracker projects/spaces to their own cyboflow projects through sibling connection rows, each with an independent push target. The connected view gains a Project mappings card, and the wizard's Map step becomes a full mapping editor — linked rows with staged unlink, add-mapping mode that defers to the incumbent push target, and Connect surfaced only when a source is unconnected. Push-target identity is the full source scope and is enforced across runs (migration 110).
+- **Pairwise evaluation judge panel.** The pairwise judge is now an ordered 3-slot panel that classifies slot failures and backfills degraded ballots instead of collapsing, with a `CodexPairwiseJudge` implementation alongside the Claude one.
+- **Lane runbook bootstrap.** A verification lane derives, commits, and *proves* its own verification runbook — the harness exports the runbook's declared levers, and a committed config edit is always surfaced even when the bootstrap refuses (migrations 106–109).
+- **PTY fan-out dynamic-workflow dispatch**, shipped on by default for interactive runs: a fan-out step dispatches its lanes as a dynamic workflow.
+- **Configurable per-substrate sprint task cap.**
+- **Daily `sessions.db` backups** with 7-day retention, pruning WAL sidecars alongside stale backups.
+- **Main-process CPU/memory instrumentation** and a profiling harness.
+- Pending-approval cards now say **who is asking**, and gate log lines are tagged with the agent that produced them.
+
+### Changed
+
+- **Multi-idea idea summaries collapse into one tab.** A planner run owning several ideas minted one idea-summary artifact per idea, all labelled "Idea summary", so the tab strip carried N indistinguishable tabs and each screen covered a single idea. A batch now mints one combined tab — following the same pattern the combined "Idea specs" tab already used — rendering a compact matrix: one row per idea against the five ledger components as columns, each row expanding to that idea's own deliverable links. Status is carried by shape as well as colour, with a legend. Single-idea runs are unchanged. Also fixes the per-idea "Idea spec" link, which pointed at a live tab for the batch's first idea only and read "not yet" for every other idea.
+
+### Fixed
+
+- **OMP approval reliability.** A human's answer now revives a run that was marked stuck while they were deciding (migration 111); a parked OMP verdict expires instead of standing for the whole run; humans get more than 25 seconds to answer; the OMP gate classifies `hub` calls by argument (no longer gating pure coordination), stops reading file bodies as remote targets, and stamps the approval's inbox row with the OMP substrate. A standing approval can no longer claim a blocked agent.
+- **Eval jury no longer starves on large diffs** — more diff is inlined and the juror deadline scales with diff size, so the panel grades from the change instead of collapsing to a single ballot.
+- **Dart recovery** — a create whose marker line the normalizer reflowed is recovered; the parent-scoped recovery arm is guarded against a trashed parent; a local body is aligned with what the create actually stored.
+- Native crash reports are scrubbed of absolute paths and tagged by process provenance.
+- The SDK path never auto-allows a tool call the user asked to be asked about, and stamps `origin { kind: 'human' }` on user turns.
+- `tailwind-merge` no longer drops Button text colors at `size=md`; the idea-summary matrix scrolls instead of clipping when narrow.
+- Escape closes only the top-most modal in a nested stack.
+- A busy local entity defers one item instead of wedging inbound sync; a throttled subscription tears down when its source goes idle.
+- **Auto-mode command classification hardening.** Auto mode no longer escalates on discards, bare environment assignments, or value substitutions; it resolves the real program past assignment, keyword, and wrapper prefixes and matches its hazard tables on the program basename.
+- **Stuck-run and cross-run-deadlock detection.** A cross-run deadlock is stamped only on a real conflict; only approvals someone is actually blocked on count as stuck evidence; the stale clock no longer outruns the humans it measures; the stuck-run event bridge is now wired; and `orphan_pty` gets a real liveness probe instead of a silent no-op.
+- **`raw_events` integrity.** A `tool_result` carrying image blocks (e.g. base64 screenshots) is now narrowed and kept instead of falling to `__unknown__` and being dropped from the transcript; superseded Codex snapshot notifications collapse to last-write-wins (migration 112); and missing `run_usage` rollups are materialized at boot.
+
+> **Upgrade note.** Migration 112 runs a one-time cleanup on first launch that removes *superseded* Codex snapshot rows from `raw_events` — each is a cumulative snapshot whose successor already restates its full value, so no information is lost. It is idempotent; on a large history (~1.6 GB database) it clears tens of thousands of rows and adds roughly 20 seconds to that first boot. The database file itself will not shrink (the space returns to SQLite's freelist), but its growth stops.
+
+## [0.2.4] — 2026-08-19
+
+### Added
+
+- **Idea component ledger**: ideas now carry a first-class component ledger (schema + shared types, a hybrid resolver, and a write chokepoint with a tRPC surface). Components render as chips with inline expand on backlog cards, an idea-summary artifact acts as the per-idea hub, and the planner reads the ledger to skip finished work and offer a design fork — launching a design session straight from the approve-idea fork, reopening any prototype in design mode, and stamping ledger components complete/incomplete as work moves. Body-change staleness is scoped to the section that moved. Migrations 101 and 102.
+- **Dart tracker provider**: a third tracker-sync provider (`DartAdapter`) surfaced in the tracker integrations settings, filing sub-issues on the parent's dartboard, paginating off count, and guarding creates/client-key recovery with a container check. Adds an outbound-only "in-development" mapping target. Migration 105 (widen the tracker-provider CHECK to admit `dart`).
+- **Mark complete**, for work that landed by a path the app never saw (the agent merged it in chat). Dismissing a session whose commits are already in the main branch now offers it instead of discarding the session outright, and a merge that finds nothing left to merge offers it in place of a "Merge failed" error. Creating a pull request no longer closes the session out on its own — it asks whether to mark it complete or keep it open.
+
+### Changed
+
+- Renamed the user-facing **"PTY" to "CLI"** across every runtime surface.
+- **OMP polish**: `auto` now allows unless hazardous (matching Auto elsewhere), OMP models are offered in Settings rather than the Claude list, the model-override card opens under a non-Claude runtime, OMP inline questions are bridged (the ask-tool caveat is gone), and `cyboflow_set_idea_component` is admitted through the OMP gate.
+
+### Fixed
+
+- **Findings no longer die with the session that produced them.** Archiving a session dismissed every pending review item it had filed — and the merge and create-PR dialogs archive the session the moment the work is away, so a successful merge destroyed its own findings milliseconds later. Since the Insights compounding surface only offers findings from a session that landed its work, and landing the work was exactly what deleted them, the surface was unreachable by construction. The archive sweeps (live and the boot backfill) now keep the findings of a session whose work was delivered, and migration 106 restores the rows already lost. Gates are still dismissed: a permission prompt on an archived session can never be actioned.
+- Stop the verify agent from inheriting the `auto` model sentinel; let the onboarding tour scroll on a short window; fix stuck pending-send reconciliation; compensate a mid-create design-session failure.
+
 ## [0.2.3] — 2026-08-15
 
 ### Added

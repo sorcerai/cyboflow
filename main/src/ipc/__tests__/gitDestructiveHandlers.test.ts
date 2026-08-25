@@ -43,9 +43,12 @@ vi.mock('../claudePanel', () => ({
   claudePanelManager: { registerPanel: vi.fn(), startPanel: vi.fn(async () => {}) },
 }));
 
-// execSync (src/utils/commandExecutor) is only reached by abort-rebase's status probe.
-const execSyncMock = vi.fn((..._args: unknown[]): string => '');
-vi.mock('../../utils/commandExecutor', () => ({ execSync: (...args: unknown[]) => execSyncMock(...args) }));
+// The sync runGit (src/utils/runGit) is only reached by abort-rebase's status probe.
+const runGitMock = vi.fn((..._args: unknown[]): string => '');
+vi.mock('../../utils/runGit', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/runGit')>()),
+  runGit: (...args: unknown[]) => runGitMock(...args),
+}));
 
 import { registerGitHandlers } from '../git';
 import type { AppServices } from '../types';
@@ -127,8 +130,8 @@ function register(services: AppServices) {
 const SESSION = { id: 's1', worktreePath: '/proj/wt', projectId: 7, name: 'sess' };
 
 beforeEach(() => {
-  execSyncMock.mockReset();
-  execSyncMock.mockReturnValue('');
+  runGitMock.mockReset();
+  runGitMock.mockReturnValue('');
 });
 
 describe('sessions:rebase-main-into-worktree — conflict short-circuit', () => {
@@ -214,7 +217,7 @@ describe('sessions:git-push — failure surfacing + success passthrough', () => 
 describe('sessions:abort-rebase-and-use-claude — no-op when not mid-rebase', () => {
   it('does NOT call abortRebase and does not throw when git status shows no rebase', async () => {
     // Status probe with no "rebase" token -> the abort branch is skipped.
-    execSyncMock.mockReturnValue('?? untracked.txt\n');
+    runGitMock.mockReturnValue('?? untracked.txt\n');
     const { services, worktreeManager } = makeServices(SESSION);
     const handlers = register(services);
 
@@ -231,7 +234,7 @@ describe('sessions:abort-rebase-and-use-claude — no-op when not mid-rebase', (
     // The destructive abortRebase is NOT invoked — nothing to abort.
     expect(worktreeManager.abortRebase).not.toHaveBeenCalled();
     // A status probe ran to decide there was no rebase to abort.
-    expect(execSyncMock).toHaveBeenCalled();
+    expect(runGitMock).toHaveBeenCalled();
     // Resolved to a well-formed response object rather than throwing.
     expect(typeof result.success).toBe('boolean');
   });

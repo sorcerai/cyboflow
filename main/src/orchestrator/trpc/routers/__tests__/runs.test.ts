@@ -64,6 +64,7 @@ import { setStartRunDeps, setRunCloseoutDeps, setNudgeRunDeps, setRelayDeps, set
 import type { RunWorktreeManagerLike, RelayDeps } from '../runs';
 import type { SessionAgentPermissionModeDeps } from '../../../sessionPermissionMode';
 import type { PermissionMode } from '../../../../../../shared/types/workflows';
+import { SPRINT_BATCH_MAX_TASKS_DEFAULTS } from '../../../../../../shared/types/sprintBatch';
 import type { CancelRunDeps, CancelRunResult } from '../../../cancelRunHandler';
 import type { PauseRunDeps, PauseRunResult } from '../../../pauseRunHandler';
 import type { ResumeRunDeps, ResumeRunResult } from '../../../resumeRunHandler';
@@ -3805,6 +3806,50 @@ describe('cyboflow.runs.start — double-pull guards (Fix 1 + Fix 6a)', () => {
     const caller = appRouter.createCaller(createContext({ db: adapter }));
     await caller.cyboflow.runs.start({ workflowId: 'wf', projectId: 1, sessionId: 'sess-1', taskId: 'epc_1' });
     expect(launchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('caps the seed selection at the built-in per-substrate default when nothing is configured', async () => {
+    const caller = appRouter.createCaller(createContext({ db: adapter }));
+    const overCap = Array.from({ length: SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk + 1 }, (_, i) => `tsk_${i}`);
+    await expect(
+      caller.cyboflow.runs.start({ workflowId: 'wf', projectId: 1, sessionId: 'sess-1', taskIds: overCap }),
+    ).rejects.toThrow(/too many tasks for the sdk substrate/);
+    expect(launchMock).not.toHaveBeenCalled();
+  });
+
+  it("honors the user's RAISED cap override — the same selection now launches", async () => {
+    const overDefault = Array.from(
+      { length: SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk + 1 },
+      (_, i) => `tsk_${i}`,
+    );
+    for (const id of overDefault) {
+      db.prepare('INSERT INTO tasks (id, project_id) VALUES (?, 1)').run(id);
+    }
+    const caller = appRouter.createCaller(
+      createContext({ db: adapter, getSprintMaxTasks: () => ({ sdk: 40 }) }),
+    );
+    await caller.cyboflow.runs.start({
+      workflowId: 'wf',
+      projectId: 1,
+      sessionId: 'sess-1',
+      taskIds: overDefault,
+    });
+    expect(launchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors a LOWERED cap override — a selection under the built-in default is rejected', async () => {
+    const caller = appRouter.createCaller(
+      createContext({ db: adapter, getSprintMaxTasks: () => ({ sdk: 2 }) }),
+    );
+    await expect(
+      caller.cyboflow.runs.start({
+        workflowId: 'wf',
+        projectId: 1,
+        sessionId: 'sess-1',
+        taskIds: ['tsk_a', 'tsk_b', 'tsk_c'],
+      }),
+    ).rejects.toThrow(/too many tasks for the sdk substrate: 3 > 2/);
+    expect(launchMock).not.toHaveBeenCalled();
   });
 
   it('(Fix 6a) rejects a launch that passes BOTH taskId and taskIds', async () => {

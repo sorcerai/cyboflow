@@ -44,6 +44,7 @@ const LEGACY_RENDER_MODE: Record<ArtifactType, 'template' | 'canvas'> = {
   'approve-designs': 'template',
   'eval-report': 'template',
   'verify-runbook': 'template',
+  'idea-summary': 'template',
 };
 const LEGACY_COLORS: Record<ArtifactType, string> = {
   'idea-spec': '#3b6dd6',
@@ -59,6 +60,7 @@ const LEGACY_COLORS: Record<ArtifactType, string> = {
   'approve-designs': '#8a7326',
   'eval-report': '#f59e0b',
   'verify-runbook': '#1f8f7a',
+  'idea-summary': '#6b6b6b',
 };
 const LEGACY_GLYPHS: Record<ArtifactType, string> = {
   'idea-spec': '▤',
@@ -74,6 +76,7 @@ const LEGACY_GLYPHS: Record<ArtifactType, string> = {
   'approve-designs': '⊡',
   'eval-report': '◎',
   'verify-runbook': '▨',
+  'idea-summary': '◈',
 };
 
 const ALL_ATYPES = Object.keys(LEGACY_RENDER_MODE) as ArtifactType[];
@@ -102,10 +105,11 @@ describe('ARTIFACT_POLICIES registry', () => {
     expect(ARTIFACT_GLYPHS).toEqual(LEGACY_GLYPHS);
   });
 
-  it('derives PER_ENTITY_ARTIFACT_ATYPES as exactly {idea-spec, arch-design}', () => {
-    expect([...PER_ENTITY_ARTIFACT_ATYPES].sort()).toEqual(['arch-design', 'idea-spec']);
+  it('derives PER_ENTITY_ARTIFACT_ATYPES as exactly {idea-spec, arch-design, idea-summary}', () => {
+    expect([...PER_ENTITY_ARTIFACT_ATYPES].sort()).toEqual(['arch-design', 'idea-spec', 'idea-summary']);
     expect(isPerEntityArtifact('idea-spec')).toBe(true);
     expect(isPerEntityArtifact('arch-design')).toBe(true);
+    expect(isPerEntityArtifact('idea-summary')).toBe(true);
     expect(isPerEntityArtifact('interactive-prototype')).toBe(false);
     expect(isPerEntityArtifact('ui-prototype')).toBe(false);
   });
@@ -129,10 +133,12 @@ describe('ARTIFACT_POLICIES registry', () => {
       'verify-runbook',
     ]);
     // arch-design / approve-designs are auto-mint-only (never agent-reportable);
-    // eval-report is likewise system-minted only (EvalWorker).
+    // eval-report is likewise system-minted only (EvalWorker); idea-summary is
+    // likewise auto-mint-only (autoMintArtifacts).
     expect(REPORTABLE_ARTIFACT_ATYPES).not.toContain('arch-design');
     expect(REPORTABLE_ARTIFACT_ATYPES).not.toContain('approve-designs');
     expect(REPORTABLE_ARTIFACT_ATYPES).not.toContain('eval-report');
+    expect(REPORTABLE_ARTIFACT_ATYPES).not.toContain('idea-summary');
     // reportable flag agrees with the derived list.
     for (const atype of ALL_ATYPES) {
       expect(ARTIFACT_POLICIES[atype].reportable).toBe(REPORTABLE_ARTIFACT_ATYPES.includes(atype));
@@ -150,6 +156,20 @@ describe('ARTIFACT_POLICIES registry', () => {
       requiresPrototypeBytes: true,
       reportable: true,
       perEntity: false,
+    });
+  });
+
+  it('the idea-summary policy carries the intended hub flags (templated, per-entity, non-reportable)', () => {
+    const p = ARTIFACT_POLICIES['idea-summary'];
+    expect(p).toMatchObject({
+      renderMode: 'template',
+      canvasKind: null,
+      htmlLoadable: false,
+      csp: null,
+      blessing: 'none',
+      requiresPrototypeBytes: false,
+      reportable: false,
+      perEntity: true,
     });
   });
 

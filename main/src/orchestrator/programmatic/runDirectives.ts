@@ -14,6 +14,13 @@
  * skip set, read at the controller loop head) and a resolver thunk (the steer
  * guidance, read by SpawnStepRunner exactly like `agentPermissionMode`).
  *
+ * The per-LANE rewind directive (`laneRewinds`) follows the same live-read shape
+ * one level down: the fan-out inner loop consumes it per lane, so the monitor can
+ * pull ONE stuck sprint lane back to an earlier inner step without rewinding the
+ * whole run. Its sibling `laneInterrupts` is the inverse direction — the
+ * controller registers an unpark hook there so a lane parked on the async visual
+ * merge-gate can be woken without firing the run-wide abort signal.
+ *
  * The registry lives in RunExecutor (a `Map<runId, RunDirectives>`): a run's entry
  * persists ACROSS execute() re-drives (a steer set before a retry survives) and is
  * cleared at TERMINAL close-out alongside the monitor inject plumbing
@@ -37,9 +44,51 @@ export interface RunDirectives {
    * next time it spawns (via SpawnStepRunner's per-step `stepGuidance` thunk).
    */
   readonly stepGuidance: Map<string, string>;
+  /**
+   * PER-LANE rewind requests: fan-out item id (the sprint task's opaque id) → the
+   * INNER step id that lane must resume at. Written by the monitor's
+   * `rewind_lane_to_step` action (laneRewindHandler), CONSUMED — and deleted — by
+   * the controller's fan-out inner loop (`runFanOut`'s driveItem), which then
+   * jumps that lane's chain index back to the target and continues.
+   *
+   * Deliberately NOT the whole-run `rewindRunHandler`: that aborts the walk,
+   * purges `step_results`, and re-drives EVERY step from an OUTER target. A lane
+   * rewind touches ONE lane's in-memory position inside a LIVE fan-out — sibling
+   * lanes, the outer walk, the run status, and step_results are all untouched.
+   *
+   * Consumed at three points in the lane loop, so it lands whether the lane is
+   * idle between inner steps, mid-agent-turn (the handler kills that lane's spawn
+   * to force the step to return — the pending request is what stops the resulting
+   * failure from failing the lane), or parked at the visual merge-gate (unparked
+   * via `laneInterrupts`).
+   *
+   * An operator rewind deliberately does NOT bump the lane's attempt counter: it
+   * must not consume the automatic loopback budget (FAN_OUT_LANE_ATTEMPT_CAP) the
+   * lane still needs for genuine code-review / task-verify failures — the same
+   * reasoning that makes an operator skip of a REQUIRED step advance the walk
+   * instead of failing the run.
+   */
+  readonly laneRewinds: Map<string, string>;
+  /**
+   * Fan-out item id → an UNPARK hook the controller registers while that lane is
+   * blocked on something no spawn abort can break (today: awaiting the async
+   * visual merge-gate verdict at `awaiting-verify`). Written BY the controller
+   * (registered on park, removed on unpark), fired BY the lane-rewind handler
+   * after it records the request in `laneRewinds`.
+   *
+   * This is the one entry in this object written by the controller rather than by
+   * an operator action — a lane parked on an async verdict has no other seam that
+   * can wake it without canceling the whole run's walk signal.
+   */
+  readonly laneInterrupts: Map<string, () => void>;
 }
 
-/** A fresh, empty directives object (every step runs, no guidance). */
+/** A fresh, empty directives object (every step runs, no guidance, no lane rewinds). */
 export function createRunDirectives(): RunDirectives {
-  return { userSkippedStepIds: new Set<string>(), stepGuidance: new Map<string, string>() };
+  return {
+    userSkippedStepIds: new Set<string>(),
+    stepGuidance: new Map<string, string>(),
+    laneRewinds: new Map<string, string>(),
+    laneInterrupts: new Map<string, () => void>(),
+  };
 }

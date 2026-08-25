@@ -1,11 +1,12 @@
-import { Bot, Cpu, FileText, FolderOpen, ShieldCheck, SlidersHorizontal, Terminal, Zap } from 'lucide-react';
+import { Bot, Cpu, FileText, FolderOpen, Layers, ShieldCheck, SlidersHorizontal, Terminal, Zap } from 'lucide-react';
 import { Checkbox, Textarea } from '../ui/Input';
 import { CollapsibleCard } from '../ui/CollapsibleCard';
 import { SettingsSection } from '../ui/SettingsSection';
 import { PERMISSION_MODE_OPTIONS } from '../cyboflow/AgentPermissionModeSelector';
 import { MODEL_OPTIONS } from '../cyboflow/unified/ModelPill';
+import { ModelSelector } from '../cyboflow/ModelSelector';
 import { RunTypeOverridesSection } from './RunTypeOverridesSection';
-import { coerceGlobalLaunchModel, globalRuntimeUsesCodex, runTypeValueLabel } from './runTypeOverrides';
+import { coerceGlobalLaunchModel, globalRuntimeProvider, runTypeValueLabel } from './runTypeOverrides';
 import { useCodexModelCatalog } from '../../stores/codexModelCatalogStore';
 import { trackEvent } from '../../utils/telemetry';
 import {
@@ -18,6 +19,12 @@ import {
 import { isRuntimeSelectableInPickers } from '../../../../shared/types/agentCapabilities';
 import type { ExecutionModel } from '../../../../shared/types/executionModel';
 import type { CliSubstrate } from '../../../../shared/types/substrate';
+import {
+  SPRINT_BATCH_CAP,
+  SPRINT_BATCH_MAX_TASKS_DEFAULTS,
+  SPRINT_MAX_TASKS_MAX,
+  SPRINT_MAX_TASKS_MIN,
+} from '../../../../shared/types/sprintBatch';
 import type { PermissionMode } from '../../../../shared/types/workflows';
 import type { QuickSessionWorktreeMode } from '../../../../shared/types/worktreeMode';
 
@@ -64,6 +71,17 @@ export interface SessionSettingsProps {
   onQuickSessionWorktreeModeChange: (mode: QuickSessionWorktreeMode) => void;
   quickSessionDefaultSubstrate: CliSubstrate;
   onQuickSessionDefaultSubstrateChange: (substrate: CliSubstrate) => void;
+  /**
+   * `config.sprintMaxTasks.sdk` / `.interactive` — how many tasks may be
+   * multi-selected into ONE sprint batch, per substrate. `number | ''` so
+   * clearing the field renders empty rather than `NaN`; the save path in
+   * `Settings.tsx` floors an empty/invalid entry back to the built-in default and
+   * clamps to [SPRINT_MAX_TASKS_MIN, SPRINT_MAX_TASKS_MAX].
+   */
+  sprintMaxTasksSdk: number | '';
+  onSprintMaxTasksSdkChange: (value: number | '') => void;
+  sprintMaxTasksInteractive: number | '';
+  onSprintMaxTasksInteractiveChange: (value: number | '') => void;
   codeReviewEvalEnabled: boolean;
   onCodeReviewEvalEnabledChange: (enabled: boolean) => void;
   autoGradeVariantRuns: boolean;
@@ -86,6 +104,10 @@ export function SessionSettings({
   onQuickSessionWorktreeModeChange,
   quickSessionDefaultSubstrate,
   onQuickSessionDefaultSubstrateChange,
+  sprintMaxTasksSdk,
+  onSprintMaxTasksSdkChange,
+  sprintMaxTasksInteractive,
+  onSprintMaxTasksInteractiveChange,
   codeReviewEvalEnabled,
   onCodeReviewEvalEnabledChange,
   autoGradeVariantRuns,
@@ -114,18 +136,20 @@ export function SessionSettings({
 
   /**
    * The two global launch defaults are ONE setting in two halves: a model from
-   * the other provider's family cannot launch on the chosen runtime, and this
-   * rung feeds every launch that has no per-run-type override. The per-type
-   * editor (`RunTypeOverrideDetail`) already refuses that pair the same two ways
-   * — scope the offered options to the effective runtime, AND coerce on every
-   * edit path so no edit ORDER can reassemble it — so the global rung does the
-   * same, through the same `coerceModelForRuntime`.
+   * another provider's family cannot launch on the chosen runtime, and this rung
+   * feeds every launch that has no per-run-type override. The per-type editor
+   * (`RunTypeOverrideDetail`) already refuses that pair the same two ways —
+   * scope the offered options to the effective runtime, AND coerce on every edit
+   * path so no edit ORDER can reassemble it — so the global rung does the same,
+   * through the same `coerceModelForRuntime`.
    *
-   * Codex options come from the same `model/list` catalog the launch pickers
-   * render (`ModelSelector` / `ModelPill` via `useCodexModelCatalog`), never a
-   * second hardcoded list, so Settings cannot offer a model a launch would not.
+   * Every provider's options come from the SAME catalog its launch pickers
+   * render (`ModelSelector` / `ModelPill`), never a second hardcoded list, so
+   * Settings cannot offer a model a launch would not.
    */
-  const usesCodex = globalRuntimeUsesCodex(defaultAgentRuntime);
+  const globalProvider = globalRuntimeProvider(defaultAgentRuntime);
+  const usesCodex = globalProvider === 'codex';
+  const usesOmp = globalProvider === 'omp';
   const {
     options: codexModelOptions,
     loading: codexCatalogLoading,
@@ -301,7 +325,7 @@ export function SessionSettings({
             <p className="text-xs text-text-tertiary mt-2">
               Seeds both quick sessions and flow runs; a per-session-type override (below) or a runtime
               picked at launch still wins. Choosing a Claude runtime also decides that launch's
-              substrate — "Claude interactive" runs on the terminal and "Claude SDK" in-process — which
+              substrate — "Claude Interactive (CLI)" runs on the terminal and "Claude SDK" in-process — which
               outranks the "Quick Session Runtime" setting below. Leave this on "Built-in default" for
               that setting to decide the substrate.
             </p>
@@ -312,13 +336,33 @@ export function SessionSettings({
               (DEFAULT_RUN_TYPE_MODEL_FLOORS). Absent must stay distinguishable
               from a set value, hence the explicit choice rather than preselecting
               a model. Options come from the launch pickers' own lists — the
-              Claude aliases (MODEL_OPTIONS) or, under a Codex global runtime,
-              the Codex catalog — never a second hand-written list. */}
+              Claude aliases (MODEL_OPTIONS), the Codex catalog, or the OMP
+              catalog — never a second hand-written list.
+
+              OMP gets the shared grouped <ModelSelector> rather than this button
+              list because it is a fundamentally different SIZE of catalog: OMP
+              fronts many vendors (495 models on the author's host, across
+              anthropic / openai-codex / openrouter), so a button per model would
+              be an unusable wall. The button list stays for Claude (6 pinned
+              aliases) and Codex (~7). */}
           <SettingsSection
             title="Default Launch Model"
             description="Which model a new quick session or flow run starts on"
             icon={<Cpu className="w-4 h-4" />}
           >
+            {usesOmp ? (
+              <div data-testid="default-launch-model-omp">
+                <ModelSelector
+                  id="default-launch-model-omp-select"
+                  label="Model"
+                  value={defaultLaunchModel}
+                  onChange={handleLaunchModelPick}
+                  agentProvider="omp"
+                  {...(defaultAgentRuntime ? { agentRuntime: defaultAgentRuntime } : {})}
+                  allowDefaultOption={{ label: 'Built-in default — OMP picks' }}
+                />
+              </div>
+            ) : (
             <div className="flex flex-col gap-1.5">
               <button
                 type="button"
@@ -378,12 +422,14 @@ export function SessionSettings({
                 </p>
               )}
             </div>
+            )}
             <p className="text-xs text-text-tertiary mt-2">
               Seeds both quick sessions and flow runs. A per-session-type override (below) still wins,
               and so does a model picked in the launch wizard. On "Built-in default" nothing is stored:
-              quick sessions and flow runs each fall back to their own built-in model. The list follows
-              the agent runtime above — switching to a Codex runtime offers Codex models and moves a
-              Claude model off, since a model can only start on its own provider.
+              quick sessions and flow runs each fall back to their own built-in model
+              {usesOmp ? ', and OMP starts on its own default' : ''}. The list follows the agent
+              runtime above — switching to a Codex or OMP runtime offers that provider's models and
+              moves a Claude model off, since a model can only start on its own provider.
             </p>
           </SettingsSection>
 
@@ -422,6 +468,62 @@ export function SessionSettings({
               run always includes a chat supervisor you can query mid-run; escalations always go to
               the human review queue and are also surfaced in chat. Only affects SDK runs started
               after you save — the interactive terminal substrate always runs orchestrated.
+            </p>
+          </SettingsSection>
+
+          <SettingsSection
+            title="Sprint Batch Size"
+            description="How many tasks may be selected into a single sprint run, per runtime"
+            icon={<Layers className="w-4 h-4" />}
+          >
+            <div className="flex flex-wrap gap-4">
+              {([
+                {
+                  id: 'sprintMaxTasksSdk',
+                  label: 'SDK',
+                  value: sprintMaxTasksSdk,
+                  onChange: onSprintMaxTasksSdkChange,
+                  substrate: 'sdk',
+                },
+                {
+                  id: 'sprintMaxTasksInteractive',
+                  label: 'Interactive terminal',
+                  value: sprintMaxTasksInteractive,
+                  onChange: onSprintMaxTasksInteractiveChange,
+                  substrate: 'interactive',
+                },
+              ] as const).map(({ id, label, value, onChange, substrate }) => (
+                <div key={id} className="flex flex-col">
+                  <label htmlFor={id} className="block text-sm text-text-secondary mb-1">
+                    {label}
+                  </label>
+                  <input
+                    id={id}
+                    data-testid={id}
+                    type="number"
+                    step={1}
+                    /* Deliberately NO min/max attributes: native constraint
+                       validation would block the WHOLE Settings form (every tab)
+                       on an out-of-range entry in this one field. The save path
+                       clamps instead, and the IPC boundary clamps again. */
+                    value={value}
+                    onChange={(e) => onChange(e.target.value === '' ? '' : e.target.valueAsNumber)}
+                    className="w-28 px-3 py-2 border border-border-primary rounded-md focus:outline-none focus:ring-2 focus:ring-interactive text-text-primary bg-surface-secondary"
+                  />
+                  <span className="text-xs text-text-tertiary mt-1">
+                    Default {SPRINT_BATCH_MAX_TASKS_DEFAULTS[substrate]}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="text-xs text-text-tertiary mt-2">
+              The cap the sprint task picker enforces (and the launch seams re-check) when you
+              multi-select tasks for one sprint run. It bounds how much ONE run takes on, not how many
+              tasks execute at once — parallel task agents stay capped at {SPRINT_BATCH_CAP}. Raise it
+              when context pressure is not the limiting factor (programmatic runs walk the DAG in the
+              host loop rather than through a single orchestrator's context). Values are clamped to{' '}
+              {SPRINT_MAX_TASKS_MIN}–{SPRINT_MAX_TASKS_MAX}; leaving a field empty restores its
+              default.
             </p>
           </SettingsSection>
 
@@ -470,7 +572,7 @@ export function SessionSettings({
           >
             <div className="flex flex-col gap-1.5">
               {([
-                { substrate: 'interactive', label: 'Interactive terminal (default)', hint: 'Live PTY — full REPL' },
+                { substrate: 'interactive', label: 'Interactive terminal (default)', hint: 'Live CLI — full REPL' },
                 { substrate: 'sdk', label: 'SDK', hint: 'In-process Agent SDK' },
               ] as const).map(({ substrate, label, hint }) => (
                 <button
@@ -495,7 +597,7 @@ export function SessionSettings({
             <p className="text-xs text-text-tertiary mt-2">
               Sets which runtime a new quick session starts on. The interactive terminal is the default —
               a full live REPL. This seeds the launch wizard's substrate picker; you can still switch it
-              per session. The global "Interactive PTY only" lock and demo mode override this. Workflow
+              per session. The global "Interactive CLI only" lock and demo mode override this. Workflow
               runs use the separate default above and are unaffected.
             </p>
           </SettingsSection>

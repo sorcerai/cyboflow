@@ -1,0 +1,40 @@
+-- Migration 116: archive a workflow variant without destroying its history.
+--
+-- Numbered 116 after a renumber: this file was authored as 115 against a main
+-- that ended at 112, and 113/114/115 (the idea-session trio) landed on main
+-- while it was in flight. The ledger is filename-keyed so nothing is lost when
+-- two files share a prefix — both apply — but their relative order then falls
+-- out of readdir rather than being stated, which is only safe for as long as
+-- nobody looks. Renumbering on collision is the repo's standing practice; the
+-- integrator MUST verify no other 116_*.sql exists at merge time.
+--
+-- The ALTER below is idempotent (see the note at the bottom), so a database
+-- that already ran this file under its old number re-runs it harmlessly and the
+-- runner records the new ledger key.
+--
+-- The variants list only ever grew. 'retired' hides a variant from pickers and
+-- rotation but keeps it on the management list forever, which is correct — the
+-- list is where you retire things from — and also why a workflow that has been
+-- A/B'd for a few months shows a wall of dead rows above the live ones.
+--
+-- WHY NOT A FIFTH STATUS. Archived-ness is ORTHOGONAL to lifecycle: "where is
+-- this variant in the rotation lifecycle" and "do I still want to look at it"
+-- are different questions, and folding them into one column would force an
+-- archive to overwrite (and so LOSE) the status it had. Every surface that
+-- enumerates the four WorkflowVariantStatus values also stays untouched. So:
+-- a nullable timestamp, mirroring workflows.archived_at (migration 024) and
+-- the same archive/unarchive pair on the registry.
+--
+-- WHAT IT EXCLUDES. An archived variant drops out of the management list, the
+-- launch pickers, and the weighted-rotation pool (the LOCKSTEP predicate pair
+-- in VariantResolver.resolveForLaunch + computeRotationArmSet both gain
+-- `archived_at IS NULL`, so archiving an ACTIVE arm reconciles the rotation
+-- experiment exactly like pausing it would). It stays readable BY ID: an
+-- explicit pin — a restart reproducing a historical run — still resolves it,
+-- and per-variant stats still join against it.
+--
+-- NOTE: No explicit BEGIN/COMMIT — runFileBasedMigrations() wraps every file in
+-- a this.transaction(...) call. A re-run raises "duplicate column name:
+-- archived_at", which the runner treats as an idempotent no-op.
+
+ALTER TABLE workflow_variants ADD COLUMN archived_at TEXT;

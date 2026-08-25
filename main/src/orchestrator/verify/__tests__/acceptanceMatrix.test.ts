@@ -186,6 +186,7 @@ const CONFIG: ResolvedVisualVerifyConfig = {
   simulatorDevices: [],
   queuedAgeCeilingMs: 15 * 60 * 1000,
   agentSlots: 2,
+  autoBootstrapRunbook: false,
 };
 
 /** The leased pair every row's request gets: the pool's first slot and its driver sidecar. */
@@ -614,7 +615,11 @@ function initScheduler(
     ...(runbookStore
       ? {
           runbookStore,
-          runbookStatus: async (projectId, modality) => runbookStore.status(projectId, probePath, modality),
+          // Honors the CALLER's probe path (the gate now passes the run's
+          // worktree) and falls back to the harness's — which is the same
+          // ladder production runs, just with the fallback stubbed.
+          runbookStatus: async (projectId, modality, callerProbePath) =>
+            runbookStore.statusDetail(projectId, callerProbePath ?? probePath, modality),
         }
       : {}),
     ...(opts.capabilityFinding ? { capabilityFinding: opts.capabilityFinding } : {}),

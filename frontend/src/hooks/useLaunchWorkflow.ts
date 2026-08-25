@@ -42,12 +42,18 @@ import type { PermissionMode } from '../../../shared/types/workflows';
  * (planner, multi-select batch, IDEA-009 — a 1-element batch should be
  * normalized to the singular `ideaId` by the caller) / taskIds (sprint) /
  * seedPrompt (launch).
+ *
+ * `originIdeaId` is NOT a seed — it composes WITH taskIds (the idea canvas's
+ * "Launch sprint" tile) to stamp the host session's origin_idea_id lineage
+ * (sidebar nesting + busy guard) without any `# Selected idea` prompt block.
+ * Redundant next to `ideaId`, whose seed path already stamps.
  */
 export interface LaunchSeed {
   ideaId?: string;
   ideaIds?: string[];
   taskIds?: string[];
   seedPrompt?: string;
+  originIdeaId?: string;
 }
 
 export interface UseLaunchWorkflowResult {
@@ -194,8 +200,8 @@ export function useLaunchWorkflow(
           model: resolved.model,
           ...(agentRuntime !== undefined ? { agentRuntime } : {}),
         };
-        const result = await trpc.cyboflow.runs.start.mutate(
-          seed?.ideaIds !== undefined
+        const result = await trpc.cyboflow.runs.start.mutate({
+          ...(seed?.ideaIds !== undefined
             ? { ...base, ideaIds: seed.ideaIds }
             : seed?.ideaId !== undefined
               ? { ...base, ideaId: seed.ideaId }
@@ -203,8 +209,10 @@ export function useLaunchWorkflow(
                 ? { ...base, taskIds: seed.taskIds }
                 : seed?.seedPrompt !== undefined
                   ? { ...base, seedPrompt: seed.seedPrompt }
-                  : base,
-        );
+                  : base),
+          // Composes with (not instead of) the seed above — see LaunchSeed.
+          ...(seed?.originIdeaId !== undefined ? { originIdeaId: seed.originIdeaId } : {}),
+        });
         useCyboflowStore.getState().setActiveRun(result.runId, sessionId);
         trackEvent('workflow_run_started', {
           launch_surface: 'in_session',

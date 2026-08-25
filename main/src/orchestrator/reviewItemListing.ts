@@ -320,6 +320,64 @@ export function resolvePermissionReviewItem(
 }
 
 /**
+ * Flip the `blocking` flag on the pending permission review item linked to
+ * `approvalId`, so the inbox stops claiming an agent is halted when none is.
+ *
+ * The counterpart of {@link coWritePermissionReviewItem}, which folds every
+ * permission gate in as `blocking = 1` — correct for every transport that holds
+ * its requester for the whole decision window, and wrong for the omp-sdk lane
+ * the moment its gate hangs up at ~25s (OMP's uncapped-handler ceiling) and the
+ * model stops waiting. The ask stays pending because a later retry can still
+ * collect the verdict; what changes is only whether anything is BLOCKED on it.
+ *
+ * Lives here, beside the fold and the resolve, for the same reason they do:
+ * this is the sanctioned synchronous folded-gate co-write path (see
+ * docs/CODE-PATTERNS.md), not a second way to mutate review items behind
+ * ReviewItemRouter's back.
+ *
+ * IDEMPOTENT and guarded on `status='pending'`: re-flipping to the current
+ * value writes nothing and emits nothing, so a retry storm cannot spam the
+ * event channel or the audit trail. No-op when the table is absent.
+ *
+ * @returns the review-item id whose flag actually changed, or null.
+ */
+export function setPermissionReviewItemBlocking(
+  db: DatabaseLike,
+  approvalId: string,
+  blocking: boolean,
+  now: string,
+): string | null {
+  if (!hasReviewItemsTable(db)) return null;
+
+  const row = db
+    .prepare(
+      `SELECT id, run_id AS runId, blocking FROM review_items
+        WHERE kind = 'permission' AND status = 'pending'
+          AND json_extract(payload_json, '$.approvalId') = ?
+        LIMIT 1`,
+    )
+    .get(approvalId) as { id?: string; runId?: string | null; blocking?: number } | undefined;
+  if (!row?.id) return null;
+
+  const current = row.blocking !== 0;
+  if (current === blocking) return null;
+
+  db.prepare('UPDATE review_items SET blocking = ?, updated_at = ? WHERE id = ? AND status = \'pending\'')
+    .run(blocking ? 1 : 0, now, row.id);
+
+  insertReviewEvent(
+    db,
+    row.id,
+    'mutated',
+    row.runId ?? null,
+    [{ field: 'blocking', from: current, to: blocking }],
+    now,
+  );
+
+  return row.id;
+}
+
+/**
  * Resolve a pending review item by id (idempotent). Used by the human-gate
  * manager and the decision/question resolve path. No-op when the table is absent
  * or the row is not pending.

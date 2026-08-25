@@ -24,11 +24,20 @@ import { type CliSubstrate, DEFAULT_SUBSTRATE, isCliSubstrate } from '../../../s
 import type { PermissionMode } from '../../../shared/types/workflows';
 import { type ExecutionModel, isExecutionModel } from '../../../shared/types/executionModel';
 import {
+  INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT,
+  isFanOutDispatch,
+  type FanOutDispatch,
+} from '../../../shared/types/fanOutDispatch';
+import {
   type QuickSessionWorktreeMode,
   DEFAULT_QUICK_SESSION_WORKTREE_MODE,
   isQuickSessionWorktreeMode,
 } from '../../../shared/types/worktreeMode';
 import { DEFAULT_ARTIFACT_COMMIT_DIR } from '../../../shared/types/artifacts';
+import {
+  clampSprintMaxTasks,
+  type SprintMaxTasksOverrides,
+} from '../../../shared/types/sprintBatch';
 import {
   VISUAL_VERIFY_DEFAULTS,
   type ResolvedVisualVerifyConfig,
@@ -517,6 +526,16 @@ export class ConfigManager extends EventEmitter {
   }
 
   /**
+   * Aria mode: this install supervises a REMOTE OMP fleet rather than running
+   * OMP locally (see `AppConfig.ariaMode`). Absent ⇒ false, so an install that
+   * never touched the toggle keeps the local runtimes and grants no supervise
+   * capability — the same absent⇒off policy `agentProviderAccess` uses.
+   */
+  getAriaMode(): boolean {
+    return this.config.ariaMode === true;
+  }
+
+  /**
    * True when `provider` may be used for a run/session. The authoritative read
    * for the launch seams (WorkflowRegistry.createRun, the quick-session IPC
    * handler, the per-step agent resolver) — the renderer's pickers mirror this
@@ -611,6 +630,47 @@ export class ConfigManager extends EventEmitter {
   }
 
   /**
+   * Global fan-out dispatch mode for orchestrated INTERACTIVE runs: whether a
+   * fan-out step's inner chain is driven by the agent as prose, or dispatched
+   * stage-by-stage to pre-installed dynamic-workflow scripts.
+   *
+   * Floors to INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT ('workflow' — shipped ON) when unset OR when
+   * the persisted value is not a valid mode (config.json is user-editable). The
+   * resolved value is snapshotted ONCE per spawn and threaded to both prompt
+   * composition and bundle installation, so a mid-run config flip can never
+   * leave a run whose prompt and on-disk scripts disagree. NOT seeded into the
+   * constructor defaults, so existing config.json files stay byte-identical.
+   */
+  getFanOutDispatch(): FanOutDispatch {
+    const value = this.config.fanOutDispatch;
+    return isFanOutDispatch(value) ? value : INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT;
+  }
+
+  /**
+   * The user's per-substrate sprint task-selection cap override, SANITIZED: each
+   * member is clamped to [SPRINT_MAX_TASKS_MIN, SPRINT_MAX_TASKS_MAX] and a
+   * non-numeric member (config.json is hand-editable) is DROPPED rather than
+   * coerced, so the consumer falls back to the built-in default for that
+   * substrate. Returns `{}` when the block is absent — which is the byte-identical
+   * default, since `sprintMaxTasks` is deliberately NOT seeded into the
+   * constructor defaults.
+   *
+   * Consumers must not read this map directly for a decision: pass it to
+   * `resolveSprintMaxTasks(overrides, substrate)`, the one place the override and
+   * the built-in default are layered.
+   */
+  getSprintMaxTasks(): SprintMaxTasksOverrides {
+    const stored = this.config.sprintMaxTasks;
+    if (!stored || typeof stored !== 'object') return {};
+    const out: SprintMaxTasksOverrides = {};
+    for (const substrate of ['sdk', 'interactive'] as const) {
+      const clamped = clampSprintMaxTasks(stored[substrate]);
+      if (clamped !== null) out[substrate] = clamped;
+    }
+    return out;
+  }
+
+  /**
    * Global default for where QUICK sessions work: 'worktree' (dedicated git
    * worktree, the isolation every other feature assumes) or 'in-place' (work
    * directly in the project checkout — sessions.in_place, migration 047).
@@ -697,6 +757,8 @@ export class ConfigManager extends EventEmitter {
         : [...VISUAL_VERIFY_DEFAULTS.simulatorDevices],
       queuedAgeCeilingMs: vv?.queuedAgeCeilingMs ?? VISUAL_VERIFY_DEFAULTS.queuedAgeCeilingMs,
       agentSlots: vv?.agentSlots ?? VISUAL_VERIFY_DEFAULTS.agentSlots,
+      autoBootstrapRunbook:
+        vv?.autoBootstrapRunbook ?? VISUAL_VERIFY_DEFAULTS.autoBootstrapRunbook,
     };
   }
 

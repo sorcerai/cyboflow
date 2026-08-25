@@ -3348,6 +3348,77 @@ describe('RunExecutor — event-driven rest (persistent interactive substrate)',
     expect(restAwaitingReview).toHaveBeenCalledWith(run.id);
   });
 
+  it('does NOT rest on a turn-end that merely yields to a live dynamic workflow; rests on the next turn-end once it is terminal', async () => {
+    const { mock: lt, restAwaitingReview } = makeLifecycleTransitions();
+
+    const run = makeWorkflowRunRow({ worktree_path: '/my/worktree', status: 'running', substrate: 'interactive' });
+    const workflow = makeWorkflowRow({ id: run.workflow_id });
+    const registry: WorkflowRegistryLike = {
+      getRunById: vi.fn().mockReturnValue(run),
+      getById: vi.fn().mockReturnValue(workflow),
+    };
+
+    const source = new EventEmitter();
+    const { spawner, resolveSpawn, spawnStarted } = makeControllableSpawner();
+
+    // The liveness probe: true while the background Workflow task is running.
+    let workflowRunning = true;
+    const hasRunningDynamicWorkflow = vi.fn((_runId: string) => workflowRunning);
+
+    const executor = new TestableRunExecutor(
+      spawner, registry, makeSpyLogger(), undefined, lt, undefined, undefined, source,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      hasRunningDynamicWorkflow, // 17th arg: the dynamic-workflow liveness probe
+    );
+
+    const executePromise = executor.execute(run.id);
+    await spawnStarted;
+
+    // The agent launched a Workflow and yielded — this turn-end must NOT rest.
+    source.emit('turn-end', { panelId: run.id, sessionId: run.id, runId: run.id });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hasRunningDynamicWorkflow).toHaveBeenCalledWith(run.id);
+    expect(restAwaitingReview).not.toHaveBeenCalled();
+
+    // The workflow completes; the CLI re-invokes the agent, whose turn ends normally.
+    workflowRunning = false;
+    source.emit('turn-end', { panelId: run.id, sessionId: run.id, runId: run.id });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(restAwaitingReview).toHaveBeenCalledTimes(1);
+    expect(restAwaitingReview).toHaveBeenCalledWith(run.id);
+
+    resolveSpawn();
+    await executePromise;
+  });
+
+  it('rests normally when no dynamic-workflow probe is injected (byte-identical to the pre-seam path)', async () => {
+    const { mock: lt, restAwaitingReview } = makeLifecycleTransitions();
+
+    const run = makeWorkflowRunRow({ worktree_path: '/my/worktree', status: 'running', substrate: 'interactive' });
+    const workflow = makeWorkflowRow({ id: run.workflow_id });
+    const registry: WorkflowRegistryLike = {
+      getRunById: vi.fn().mockReturnValue(run),
+      getById: vi.fn().mockReturnValue(workflow),
+    };
+
+    const source = new EventEmitter();
+    const { spawner, resolveSpawn, spawnStarted } = makeControllableSpawner();
+
+    const executor = new TestableRunExecutor(
+      spawner, registry, makeSpyLogger(), undefined, lt, undefined, undefined, source,
+    );
+
+    const executePromise = executor.execute(run.id);
+    await spawnStarted;
+
+    source.emit('turn-end', { panelId: run.id, sessionId: run.id, runId: run.id });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(restAwaitingReview).toHaveBeenCalledTimes(1);
+
+    resolveSpawn();
+    await executePromise;
+  });
+
   it('teardownRun (bridge dispose) does NOT fire while the interactive REPL is alive; fires only on explicit termination', async () => {
     const run = makeWorkflowRunRow({ worktree_path: '/my/worktree', status: 'running', substrate: 'interactive' });
     const workflow = makeWorkflowRow({ id: run.workflow_id });

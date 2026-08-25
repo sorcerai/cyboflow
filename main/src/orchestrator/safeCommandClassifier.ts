@@ -16,9 +16,14 @@
  *
  * Safety model (conservative by construction — a false "safe" auto-runs a
  * command with NO prompt, so the bar is "provably read-only or refuse"):
- *   - Compound commands are split quote-aware on `&&`, `||`, `;`, `|`
- *     ({@link splitShellSegments}); EVERY segment must independently classify
- *     safe, so `git status && rm -rf .` is refused (the `rm` segment fails).
+ *   - Compound commands are split quote-aware on `&&`, `||`, `;`, `|`, and a raw
+ *     newline ({@link splitShellSegments}); EVERY segment must independently
+ *     classify safe, so `git status && rm -rf .` is refused (the `rm` segment
+ *     fails).
+ *   - A command containing ANY raw newline is refused outright, on top of the
+ *     split. Belt and braces: the split handles the bare case, and the blunt
+ *     refusal covers a newline that survives inside quotes and keeps this tier
+ *     byte-parity with the OMP gate's mirrored copy, which refuses the same way.
  *   - Any segment with command substitution (`$(…)` / backticks) is refused
  *     ({@link hasCommandSubstitution}) — its real effect is unknowable here.
  *   - Any segment with redirection or backgrounding (`>`, `<`, `&`) is refused;
@@ -236,6 +241,10 @@ function isSafeReadOnlySegment(segment: string): boolean {
 export function isSafeReadOnlyBashCommand(rawCommand: string): boolean {
   const command = rawCommand.trim();
   if (command.length === 0) return false;
+  // See the module doc: a multi-line command reaches the human rather than being
+  // auto-run. The false negative (a quoted newline in an otherwise read-only
+  // `echo`) is the acceptable direction for a tier that runs with no prompt.
+  if (/[\r\n]/.test(command)) return false;
   const segments = splitShellSegments(command);
   if (segments.length === 0) return false;
   return segments.every(isSafeReadOnlySegment);

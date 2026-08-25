@@ -432,15 +432,30 @@ async function readRunbooks(
   resolveStatus: VerifyRunbookStatusLike | undefined,
 ): Promise<Map<VerificationModality, VerificationRunbookState>> {
   const out = new Map<VerificationModality, VerificationRunbookState>();
-  let rows: { modality: string; status: string; version: number; portable_hash: string }[] = [];
+  let rows: { modality: string; status: string; version: number; portable_hash: string; origin?: string | null }[] =
+    [];
   try {
-    rows = db
-      .prepare(
-        `SELECT modality, status, version, portable_hash
-           FROM verify_runbook_local
-          WHERE project_id = ?`,
-      )
-      .all(projectId) as typeof rows;
+    // Migration 105's `origin` through the same widen-then-fall-back ladder the
+    // rest of verify/ uses: a pre-105 DB throws on `prepare`, and losing the
+    // whole runbook listing to that would blank the panel on a binary that has
+    // records. The fallback drops only the provenance such a DB never had.
+    try {
+      rows = db
+        .prepare(
+          `SELECT modality, status, version, portable_hash, origin
+             FROM verify_runbook_local
+            WHERE project_id = ?`,
+        )
+        .all(projectId) as typeof rows;
+    } catch {
+      rows = db
+        .prepare(
+          `SELECT modality, status, version, portable_hash
+             FROM verify_runbook_local
+            WHERE project_id = ?`,
+        )
+        .all(projectId) as typeof rows;
+    }
   } catch {
     return out;
   }
@@ -466,6 +481,8 @@ async function readRunbooks(
       status,
       version: row.version,
       portableHash: row.portable_hash,
+      // An unrecognized value is reported as `null` — "unknown", not a guess.
+      origin: row.origin === 'setup-flow' || row.origin === 'lane-bootstrap' ? row.origin : null,
     });
   }
   return out;
@@ -495,7 +512,11 @@ async function effectiveRunbookStatus(
 ): Promise<VerifyRunbookStatus> {
   if (resolveStatus === undefined) return 'unproven-draft';
   try {
-    return await resolveStatus(projectId, modality);
+    // The panel asks a PROJECT-level question, so no probe path is passed and
+    // the resolver falls back to the project root. The reason discriminant the
+    // resolver also carries is for a caller that WRITES (the runbook bootstrap);
+    // the badge only needs the three-valued answer.
+    return (await resolveStatus(projectId, modality)).status;
   } catch {
     return 'unproven-draft';
   }
@@ -893,16 +914,27 @@ export const verificationRequestsRouter = router({
    */
   setupByProject: protectedProcedure.query(async ({ ctx }): Promise<VerifyProjectSetupRow[]> => {
     const db = requireDb(ctx.db, 'setupByProject');
-    let rows: { project_id: number; modality: string; status: string }[] = [];
+    let rows: { project_id: number; modality: string; status: string; origin?: string | null }[] = [];
     try {
-      rows = db
-        .prepare('SELECT project_id, modality, status FROM verify_runbook_local')
-        .all() as typeof rows;
+      // Migration-105 `origin`, through the widen-then-fall-back ladder: a
+      // pre-105 DB throws on `prepare`, and losing the whole setup listing to
+      // that would report every project as `not set up` on a binary where they
+      // are configured.
+      try {
+        rows = db
+          .prepare('SELECT project_id, modality, status, origin FROM verify_runbook_local')
+          .all() as typeof rows;
+      } catch {
+        rows = db
+          .prepare('SELECT project_id, modality, status FROM verify_runbook_local')
+          .all() as typeof rows;
+      }
     } catch {
       return [];
     }
 
     const proven = new Map<number, Set<VerificationModality>>();
+    const laneDerived = new Set<number>();
     const seen = new Set<number>();
     for (const row of rows) {
       if (typeof row.project_id !== 'number') continue;
@@ -927,6 +959,11 @@ export const verificationRequestsRouter = router({
         proven.set(row.project_id, set);
       }
       set.add(row.modality);
+      // Recorded only for a record that actually resolved PROVEN: an unproven
+      // lane-derived draft is not something a human has to weigh, and flagging
+      // it would put a trust question in front of someone whose real state is
+      // "verification is not running here at all".
+      if (row.origin === 'lane-bootstrap') laneDerived.add(row.project_id);
     }
 
     return [...seen]
@@ -939,6 +976,7 @@ export const verificationRequestsRouter = router({
           projectId,
           status: provenModalities.length > 0 ? ('proven' as const) : ('unproven' as const),
           provenModalities,
+          hasLaneDerivedRunbook: laneDerived.has(projectId),
         };
       });
   }),

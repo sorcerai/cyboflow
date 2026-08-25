@@ -40,7 +40,7 @@ import {
 import type { ExecutionModel } from '../../../../../shared/types/executionModel';
 import type { ExperimentArm } from '../../../../../shared/types/experiments';
 import type { SprintLaneRow, SprintLaneChangedEvent } from '../../../../../shared/types/sprintBatch';
-import { SPRINT_BATCH_MAX_TASKS } from '../../../../../shared/types/sprintBatch';
+import { resolveSprintMaxTasks } from '../../../../../shared/types/sprintBatch';
 import { sprintLaneEvents, sprintLaneChannel, SprintLaneStore } from '../../sprintLaneStore';
 import { countPendingBlockingReviewItems } from '../../reviewItemListing';
 import { ReviewItemRouter } from '../../reviewItemRouter';
@@ -1088,6 +1088,13 @@ export const runsRouter = router({
       // substrate-keyed selection cap N is enforced here (defense in depth — the
       // picker also enforces it client-side).
       taskIds: z.array(z.string().min(1)).optional(),
+      // Optional idea-session lineage for a launch whose SEED is not an idea —
+      // the idea canvas's "Launch sprint" tile (taskIds seed). Rides the trailing
+      // launchOptions bag; the launcher stamps sessions.origin_idea_id (sidebar
+      // nesting + tile greying) and applies the max-one-running-per-idea guard.
+      // NO seed semantics: seed_idea_id stays untouched, no `# Selected idea`
+      // block. Redundant next to a singular ideaId seed (which already stamps).
+      originIdeaId: z.string().min(1).optional(),
       // Optional compound seed findings (findings-triage redesign / migration 034).
       // When supplied, the launcher writes workflow_runs.seed_finding_ids (a JSON
       // string array) directly; RunExecutor.getPrompt injects the selected findings
@@ -1227,7 +1234,7 @@ export const runsRouter = router({
       if (input.taskIds !== undefined) {
         const forced = ctx.getForcedSubstrate?.() ?? null;
         const capSubstrate: CliSubstrate = forced ?? launchSubstrate ?? 'sdk';
-        const max = SPRINT_BATCH_MAX_TASKS[capSubstrate];
+        const max = resolveSprintMaxTasks(ctx.getSprintMaxTasks?.(), capSubstrate);
         if (input.taskIds.length > max) {
           throw new TRPCError({
             code: 'BAD_REQUEST',
@@ -1382,7 +1389,8 @@ export const runsRouter = router({
         input.variantId !== undefined ||
         input.baseline ||
         input.ideaIds !== undefined ||
-        input.seedPrompt !== undefined
+        input.seedPrompt !== undefined ||
+        input.originIdeaId !== undefined
           ? {
               ...(input.variantId !== undefined
                 ? { requestedVariantId: input.variantId }
@@ -1391,6 +1399,7 @@ export const runsRouter = router({
                   : {}),
               ...(input.ideaIds !== undefined ? { ideaIds: input.ideaIds } : {}),
               ...(input.seedPrompt !== undefined ? { seedPrompt: input.seedPrompt } : {}),
+              ...(input.originIdeaId !== undefined ? { originIdeaId: input.originIdeaId } : {}),
             }
           : undefined;
       const { runId, worktreePath, branchName } = launchWithAgentSelection

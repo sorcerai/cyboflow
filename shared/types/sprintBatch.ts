@@ -58,14 +58,65 @@ export type TerminalBatchStatus = (typeof TERMINAL_BATCH_STATUSES)[number];
 export const SPRINT_BATCH_CAP = 5;
 
 /**
- * Soft selection cap N (the number of tasks a user may multi-select into one
- * batch), keyed by substrate. Protects context/host resources — NOT the
+ * BUILT-IN selection cap N (the number of tasks a user may multi-select into
+ * one batch), keyed by substrate. Protects context/host resources — NOT the
  * concurrency limit (that is SPRINT_BATCH_CAP).
+ *
+ * These are the DEFAULTS, not the effective cap: Settings → Sessions writes a
+ * per-substrate override (`AppConfig.sprintMaxTasks`). Never read this map
+ * directly at an enforcement point — go through `resolveSprintMaxTasks`, which
+ * layers the user's override on top, so the picker, the two launch seams and
+ * the MCP backstop can never disagree about the live cap.
  */
-export const SPRINT_BATCH_MAX_TASKS: Readonly<Record<CliSubstrate, number>> = {
+export const SPRINT_BATCH_MAX_TASKS_DEFAULTS: Readonly<Record<CliSubstrate, number>> = {
   sdk: 15,
   interactive: 10,
 } as const;
+
+/**
+ * Bounds every configured cap is clamped to. `config.json` is user-editable and
+ * the value is also typed by hand into a Settings input, so a 0 (which would
+ * make EVERY sprint launch impossible) and an absurd 10_000 (which would hand a
+ * single orchestrator an unrunnable batch) are both floored/ceilinged rather
+ * than trusted. The clamp is applied on READ, so a hand-edited config never
+ * needs a migration.
+ */
+export const SPRINT_MAX_TASKS_MIN = 1;
+export const SPRINT_MAX_TASKS_MAX = 100;
+
+/**
+ * The user's per-substrate cap override (`AppConfig.sprintMaxTasks`). SPARSE by
+ * design: an absent member means "use the built-in default for that substrate",
+ * which is what keeps an install that never touches the setting byte-identical.
+ */
+export type SprintMaxTasksOverrides = Partial<Record<CliSubstrate, number>>;
+
+/**
+ * Coerce one configured cap to a usable integer, or `null` when the stored value
+ * is not a finite number (a hand-edited `"twenty"` / `null` / NaN). Callers treat
+ * `null` as "no override" and fall back to the built-in default.
+ */
+export function clampSprintMaxTasks(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const int = Math.trunc(value);
+  if (int < SPRINT_MAX_TASKS_MIN) return SPRINT_MAX_TASKS_MIN;
+  if (int > SPRINT_MAX_TASKS_MAX) return SPRINT_MAX_TASKS_MAX;
+  return int;
+}
+
+/**
+ * THE effective sprint selection cap for a substrate: the user's clamped
+ * override when one is set, otherwise the built-in default. The single source
+ * of truth shared by the batch picker (client-side disable), `runs.start` and
+ * `experiments.start` (server-side 400s), and the `cyboflow_create_sprint_batch`
+ * backstop — so raising the setting lifts all four at once.
+ */
+export function resolveSprintMaxTasks(
+  overrides: SprintMaxTasksOverrides | undefined,
+  substrate: CliSubstrate,
+): number {
+  return clampSprintMaxTasks(overrides?.[substrate]) ?? SPRINT_BATCH_MAX_TASKS_DEFAULTS[substrate];
+}
 
 /** Row shape of the `sprint_batches` table (migration 022). */
 export interface SprintBatchRow {

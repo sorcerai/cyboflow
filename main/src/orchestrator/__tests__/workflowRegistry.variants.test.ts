@@ -32,6 +32,7 @@ function setupDb(): Database.Database {
       id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, label TEXT NOT NULL,
       spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
       weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+      archived_at TEXT,  -- migration 116
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE UNIQUE INDEX idx_workflow_variants_wf_label ON workflow_variants(workflow_id, label);
@@ -168,6 +169,49 @@ describe('WorkflowRegistry variants', () => {
     expect(ids).toHaveLength(2);
   });
 
+  // -- Archive (migration 116) ------------------------------------------------
+
+  it('archiveVariant hides the row from listVariants but keeps it readable by id', () => {
+    const v = registry.createVariantFromCurrent(WF_PLANNER, 'v');
+    registry.setVariantStatus(v.id, 'active');
+
+    registry.archiveVariant(v.id);
+
+    expect(registry.listVariants(WF_PLANNER)).toHaveLength(0);
+    const row = registry.getVariantById(v.id);
+    // Status and weight survive — archiving is orthogonal to the lifecycle, which
+    // is why it needed its own column rather than a fifth status.
+    expect(row?.status).toBe('active');
+    expect(row?.archived_at).not.toBeNull();
+  });
+
+  it('listVariants({ includeArchived }) returns archived rows too', () => {
+    const live = registry.createVariantFromCurrent(WF_PLANNER, 'live');
+    const gone = registry.createVariantFromCurrent(WF_PLANNER, 'gone');
+    registry.archiveVariant(gone.id);
+
+    const ids = registry.listVariants(WF_PLANNER, { includeArchived: true }).map((r) => r.id);
+    expect(ids).toContain(live.id);
+    expect(ids).toContain(gone.id);
+  });
+
+  it('unarchiveVariant restores the row with the status it was archived under', () => {
+    const v = registry.createVariantFromCurrent(WF_PLANNER, 'v');
+    registry.setVariantStatus(v.id, 'paused');
+    registry.archiveVariant(v.id);
+
+    registry.unarchiveVariant(v.id);
+
+    expect(registry.listVariants(WF_PLANNER).map((r) => r.id)).toEqual([v.id]);
+    expect(registry.getVariantById(v.id)?.archived_at).toBeNull();
+    expect(registry.getVariantById(v.id)?.status).toBe('paused');
+  });
+
+  it('archive/unarchive throw "not found" for a missing variant', () => {
+    expect(() => registry.archiveVariant('nope')).toThrow(/not found/);
+    expect(() => registry.unarchiveVariant('nope')).toThrow(/not found/);
+  });
+
   // -- Baseline rotation participation (migration 054) ------------------------
 
   it('getBaselineRotation defaults to IN rotation with weight 1 (baseline is the champion)', () => {
@@ -254,6 +298,35 @@ describe('WorkflowRegistry variants', () => {
       expect(rot()).not.toBeNull();
       registry.setBaselineRotation(WF_PLANNER, { inRotation: false }); // pool: challenger = 1 → off
       expect(rot()).toBeNull();
+    });
+
+    it('archiving an active arm reconciles the rotation (membership change)', () => {
+      registry.setBaselineRotation(WF_PLANNER, { inRotation: false });
+      const a = activate('a');
+      activate('b');
+      activate('c');
+      const before = rot();
+
+      registry.archiveVariant(a); // pool b,c = 2 → replace, exactly as a delete would
+
+      const after = rot();
+      expect(after).not.toBeNull();
+      expect(after?.id).not.toBe(before?.id);
+    });
+
+    it('unarchiving an active arm puts it back in the pool', () => {
+      registry.setBaselineRotation(WF_PLANNER, { inRotation: false });
+      const a = activate('a');
+      activate('b');
+      activate('c');
+      registry.archiveVariant(a);
+      const archivedRotation = rot();
+
+      registry.unarchiveVariant(a); // pool a,b,c = 3 → another membership change
+
+      const after = rot();
+      expect(after).not.toBeNull();
+      expect(after?.id).not.toBe(archivedRotation?.id);
     });
 
     it('deleteVariant reconciles (membership change) the rotation', () => {

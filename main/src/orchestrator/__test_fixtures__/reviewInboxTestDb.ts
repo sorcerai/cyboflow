@@ -29,6 +29,9 @@ const MIGRATIONS = [
   // 085 adds review_items.audience (human/machine) — the router INSERT names it
   // and the blocking-count query filters on it, so every inbox fixture needs it.
   '085_review_item_audience.sql',
+  // 111 adds approvals.awaited — StuckDetector's stale/self-deadlock/cross-run
+  // predicates all filter on it, so any fixture holding approvals needs it.
+  '111_approval_awaited.sql',
 ] as const;
 
 /** Build a fresh migration-backed DB with the review_items inbox present. */

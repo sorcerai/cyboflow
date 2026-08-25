@@ -67,13 +67,20 @@ function createDb(): Database.Database {
       -- session-scoped chat_run_id resolve DISTINCT Codex threads.
       panel_id TEXT
     );
+    -- dedup_key + its partial unique index mirror migration 071; the sink's
+    -- snapshot upsert (CodexRawNotificationSink) names the column on every
+    -- INSERT, so omitting it here fails every persist with a SqliteError.
     CREATE TABLE raw_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id TEXT NOT NULL,
       event_type TEXT NOT NULL,
       payload_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      dedup_key TEXT
     );
+    CREATE UNIQUE INDEX idx_raw_events_dedup
+      ON raw_events(dedup_key)
+      WHERE dedup_key IS NOT NULL;
   `);
   db.prepare("INSERT INTO workflow_runs (id, updated_at) VALUES ('run-1', CURRENT_TIMESTAMP)").run();
   return db;

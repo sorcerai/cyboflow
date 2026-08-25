@@ -51,8 +51,14 @@ pnpm typecheck        # clean
 pnpm lint             # 0 errors (warnings OK)
 pnpm test:unit        # AC gate
 pnpm test:integration # 18 mocked-SDK itests
+pnpm run e2e:prereqs && pnpm run test:ci:minimal  # packaged-app smoke (blocking)
+pnpm test:gate        # real-API canary — needs authenticated `claude` on PATH
+pnpm smoke:sdk        # real-API protocol canary
 ```
-If anything fails, stop and report — do not proceed to a build.
+If anything fails, stop and report — do not proceed to a build. The E2E smoke
+tier launches the built Electron bundle, so it needs this machine's display;
+the two canaries spend real API tokens (~15-20 min combined) and exist because
+CI can never run them (no authenticated `claude` on hosted runners).
 
 ## Phase 2 — Version bump + changelog
 

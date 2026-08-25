@@ -54,6 +54,10 @@ const fanOutInnerStepSchema = z.object({
   optional: z.boolean().optional(),
   loopback: z.string().optional(),
   name: z.string().optional(),
+  // Firm gate: the orchestrator must regain control before an item advances past
+  // this stage, so it can never be folded into a delegated batch. See
+  // FanOutInnerStep.firmGate.
+  firmGate: z.boolean().optional(),
 });
 
 /**

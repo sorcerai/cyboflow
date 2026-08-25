@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { GitMerge, GitBranch } from 'lucide-react';
+import { GitMerge, GitBranch, CheckCircle2 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { Textarea } from '../ui/Textarea';
@@ -24,6 +24,11 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
   // needed first. Distinct from a generic merge error — shown inline so the
   // operator can rebase (via chat) and retry without losing the dialog.
   const [rebaseNotice, setRebaseNotice] = useState<string | null>(null);
+  // Set when the branch had NOTHING left to merge — its work is already in
+  // main, almost always because the agent merged it in chat. Not an error:
+  // offer Mark complete instead of the generic "Merge failed" toast.
+  const [alreadyMergedNotice, setAlreadyMergedNotice] = useState(false);
+  const [isStamping, setIsStamping] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -31,6 +36,8 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
       setCommitMessage('');
       setIsMerging(false);
       setRebaseNotice(null);
+      setAlreadyMergedNotice(false);
+      setIsStamping(false);
     }
   }, [isOpen]);
 
@@ -66,6 +73,7 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
     if (!canConfirm || isMerging) return;
     setIsMerging(true);
     setRebaseNotice(null);
+    setAlreadyMergedNotice(false);
 
     try {
       const result = strategy === 'squash'
@@ -80,6 +88,17 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
           result.error ??
             'Main has new commits since this branch started. Rebase this worktree onto main before merging.',
         );
+        setIsMerging(false);
+        return;
+      }
+
+      if (!result.success && result.alreadyUpToDate) {
+        // The branch has nothing left to give main — its work is already
+        // there (almost always because the agent merged it in chat). This is
+        // not a failure: surface the inline notice with a Mark-complete
+        // action instead of the generic error toast, and keep the dialog
+        // open so the operator can choose.
+        setAlreadyMergedNotice(true);
         setIsMerging(false);
         return;
       }
@@ -106,6 +125,40 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
       setIsMerging(false);
     }
   }, [canConfirm, isMerging, strategy, sessionId, commitMessage, onSuccess, onClose]);
+
+  // The alreadyUpToDate notice's own action: stamp the session complete (so
+  // the archive keeps its findings), then archive it. Order matters — see
+  // API.sessions.markComplete's doc comment.
+  const handleMarkComplete = useCallback(async () => {
+    setIsStamping(true);
+    try {
+      const stampResult = await API.sessions.markComplete(sessionId);
+      if (!stampResult.success) {
+        useErrorStore.getState().showError({
+          title: 'Mark complete failed',
+          error: stampResult.error ?? 'Unknown error',
+        });
+        return;
+      }
+      const deleteResult = await API.sessions.delete(sessionId);
+      if (!deleteResult.success) {
+        useErrorStore.getState().showError({
+          title: 'Dismiss failed',
+          error: deleteResult.error ?? 'Unknown error',
+        });
+        return;
+      }
+      onSuccess?.();
+      onClose();
+    } catch (err) {
+      useErrorStore.getState().showError({
+        title: 'Mark complete failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setIsStamping(false);
+    }
+  }, [sessionId, onSuccess, onClose]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -134,6 +187,34 @@ export function SessionMergeDialog({ isOpen, onClose, sessionId, onSuccess }: Se
             <div className="text-sm text-text-primary">
               <span className="font-medium">Rebase required before merging.</span>{' '}
               <span className="text-text-secondary">{rebaseNotice}</span>
+            </div>
+          </div>
+        )}
+
+        {alreadyMergedNotice && (
+          <div
+            data-testid="merge-already-up-to-date-notice"
+            role="alert"
+            className="mb-4 flex items-start gap-2 rounded-lg border border-status-success/40 bg-status-success/10 p-3"
+          >
+            <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0 text-status-success" />
+            <div className="text-sm text-text-primary flex-1">
+              <span className="font-medium">Nothing left to merge.</span>{' '}
+              <span className="text-text-secondary">
+                This branch's work is already in main. Mark the session complete to keep the
+                findings its runs produced.
+              </span>
+              <div className="mt-2">
+                <Button
+                  data-testid="merge-mark-complete"
+                  size="sm"
+                  onClick={() => void handleMarkComplete()}
+                  loading={isStamping}
+                  loadingText="Marking complete..."
+                >
+                  Mark session complete
+                </Button>
+              </div>
             </div>
           </div>
         )}

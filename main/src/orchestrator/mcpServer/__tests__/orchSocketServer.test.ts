@@ -32,7 +32,6 @@ import type Database from 'better-sqlite3';
 import { OrchSocketServer } from '../orchSocketServer';
 import type { LoggerLike } from '../../types';
 import type { OrchSocketProvider } from '../../runLauncher';
-import type { PermissionServerLike } from '../../stuckDetector';
 import { dbAdapter } from '../../__test_fixtures__/dbAdapter';
 import { createTestDb, seedRun, seedApproval } from '../../__test_fixtures__/orchestratorTestDb';
 
@@ -495,14 +494,16 @@ describe('OrchSocketServer', () => {
   // Structural interface conformance (compile-time assertions)
   // -------------------------------------------------------------------------
 
-  it('satisfies the OrchSocketProvider and PermissionServerLike interfaces', async () => {
+  it('satisfies the OrchSocketProvider interface', async () => {
     server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
-    // These assignments fail to compile if the structural shape drifts.
+    // This assignment fails to compile if the structural shape drifts.
     const asProvider: OrchSocketProvider = server;
-    const asPermServer: PermissionServerLike = server;
     expect(typeof asProvider.getSocketPath()).toBe('string');
-    expect(asPermServer.hasClientForRun('nope')).toBe(false);
+    // hasClientForRun survives as a diagnostic (its PermissionServerLike
+    // contract retired with the stale_socket rung), so pin it directly rather
+    // than through an interface no longer worth declaring.
+    expect(server.hasClientForRun('nope')).toBe(false);
   });
 });

@@ -101,7 +101,14 @@ export function resolveEffectiveMapping(
   return mapping;
 }
 
-const MAPPING_TARGETS: readonly TrackerMappingTarget[] = ['dont', 'idea', 'ready', 'done', 'wontdo'];
+const MAPPING_TARGETS: readonly TrackerMappingTarget[] = [
+  'dont',
+  'idea',
+  'ready',
+  'done',
+  'wontdo',
+  'indev',
+];
 
 function isMappingTarget(value: unknown): value is TrackerMappingTarget {
   return typeof value === 'string' && (MAPPING_TARGETS as readonly string[]).includes(value);
@@ -223,6 +230,13 @@ export function mappingTargetToStageId(
       return stageIds.wontdo;
     case 'dont':
       return null;
+    case 'indev':
+      // OUTBOUND-ONLY (see TrackerMappingTarget). Position 7 is derived, so
+      // naming it here would produce a stage write TaskChangeRouter rejects as
+      // 'forbidden_stage' — and even if it landed, the boot self-heal would
+      // revert it on the next pass. Inbound therefore treats it as 'dont';
+      // its whole effect is on the write-back side, in pickWriteBackState.
+      return null;
   }
 }
 
@@ -245,16 +259,31 @@ export function stageIdToWriteBackGroup(
 }
 
 /**
- * The concrete provider state a write-back targets: the FIRST state in the
- * group by the provider's own returned order. Providers return workflow states
- * in their configured board order, so "first started state" is the natural
- * "In Progress" and "first completed state" the natural "Done" without asking
- * the user to pick one. Null when the workspace has no state in that group
- * (the caller then skips the write rather than inventing a state).
+ * The concrete provider state a write-back targets.
+ *
+ * An explicit `'indev'` pin in the mapping WINS for the `started` group: that
+ * is the user naming, in the mapping table, which state "In development"
+ * pushes. It overrides the state's own group, because the pin exists precisely
+ * to correct a group the adapter had to GUESS (Dart infers groups from state
+ * names; Linear and Plane declare them).
+ *
+ * Failing a pin, the fallback is the FIRST state in the group by the provider's
+ * own returned order. Providers return workflow states in their configured
+ * board order, so "first started state" is the natural "In Progress" and "first
+ * completed state" the natural "Done" without asking the user to pick one.
+ *
+ * Null when nothing matches (the caller then skips the write rather than
+ * inventing a state) — reachable on a provider whose state NAMES defeat the
+ * inference and where the user has pinned nothing.
  */
 export function pickWriteBackState(
   states: TrackerState[],
   group: TrackerStateGroup,
+  mapping: TrackerStateMapping = {},
 ): TrackerState | null {
+  if (group === 'started') {
+    const pinned = states.find((state) => mapping[state.id] === 'indev');
+    if (pinned !== undefined) return pinned;
+  }
   return states.find((state) => state.group === group) ?? null;
 }

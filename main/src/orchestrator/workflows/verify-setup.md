@@ -281,7 +281,7 @@ schema — there is nothing else in it:
     "cdp-app"?:       ModalityEntry,
     "native-screen"?: ModalityEntry,
   },
-  levers?: { portEnv?: string, dataDirEnv?: string, cdpPortFlag?: string, notes?: string },
+  levers?: { portEnv?: string, nonceEnv?: string, dataDirEnv?: string, cdpPortFlag?: string, notes?: string },
 }
 
 ModalityEntry = {

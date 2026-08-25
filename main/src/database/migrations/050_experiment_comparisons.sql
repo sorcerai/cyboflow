@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS experiment_comparisons (
 
   -- K-sample verdict.
   sample_count            INTEGER,                -- valid samples that survived (<= K)
+  -- sampleIndex is the PANEL SLOT index (gapped when a slot fails), and
+  -- panel.length + ordinal for bounded-backfill samples: identity/key only, NOT a
+  -- dense ordinal.
   per_sample_json         TEXT,                   -- [{sampleIndex, positionAFirst, rawPreference, preference, confidence, rationale, judgeName?, judgeModel?}]
   preference              TEXT CHECK (preference IN ('A','B','tie')),  -- NULL until complete
   confidence              REAL,                   -- 0..1, mean confidence of winning-side samples
@@ -56,6 +59,9 @@ CREATE TABLE IF NOT EXISTS experiment_comparisons (
   judge_model             TEXT,
   judge_build_id          TEXT,
   prompt_hash             TEXT,
+  -- OVERLOADED by status: failure message on 'failed'/'skipped'; judge-panel
+  -- DEGRADATION note on 'complete' (a healthy row — slots dropped, ballot
+  -- backfilled). `error IS NOT NULL` alone does NOT mean the comparison broke.
   error                   TEXT,
 
   -- Human-decision linkage: blocking kind='decision' review item minted by the

@@ -116,14 +116,18 @@ export class VariantResolver {
     if (opts?.baseline) return { variant: null, source: 'baseline-pin', rotationExperimentId: null };
 
     // ⚠️ LOCKSTEP with experimentStore.computeRotationArmSet's pool predicate — the
-    // two MUST admit exactly the same members (active + weight>0 variants, plus the
-    // opted-in baseline). If you change this predicate, change computeRotationArmSet's
-    // in the same edit, or a run could be attributed to a rotation whose arm snapshot
-    // omits the picked arm.
+    // two MUST admit exactly the same members (active + weight>0 + NOT archived
+    // variants, plus the opted-in baseline). If you change this predicate, change
+    // computeRotationArmSet's in the same edit, or a run could be attributed to a
+    // rotation whose arm snapshot omits the picked arm.
+    //
+    // `archived_at IS NULL` (migration 116) is a ROTATION-only exclusion: the
+    // explicit-pin path above deliberately loads a variant of any status and any
+    // archived-ness, so restarting a historical run still reproduces it.
     const variants = this.db
       .prepare(
         `SELECT * FROM workflow_variants
-          WHERE workflow_id = ? AND status = 'active' AND weight > 0
+          WHERE workflow_id = ? AND status = 'active' AND weight > 0 AND archived_at IS NULL
           ORDER BY id`,
       )
       .all(workflowId) as WorkflowVariantRow[];

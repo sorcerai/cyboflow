@@ -42,6 +42,9 @@ What to establish, and where each answer comes from:
   them:
   - a port env var or CLI flag the dev server reads — and whether it refuses to
     move (a `strictPort`-style setting turns a taken port into a hard failure);
+  - an env var the build or serve step stamps its identity marker from (the one
+    that decides whether the attestation carries THIS request's nonce or a fixed
+    default like `dev`);
   - a remote-debugging / CDP port flag the app passes through to the runtime;
   - a data-dir / profile-dir / app-dir override;
   - a single-instance lock, and **what key it is keyed on** — a lock keyed on
@@ -94,6 +97,7 @@ problem, so it is not a shape you may improvise. This is the whole schema:
   },
   levers?: {                       // lever NAMES, never values
     portEnv?: string,              // env var the serve cmd reads the leased port from
+    nonceEnv?: string,             // env var the build/serve reads this request's nonce from
     dataDirEnv?: string,           // env var that redirects the app's state dir
     cdpPortFlag?: string,          // CLI flag pinning the app's CDP port
     notes?: string,
@@ -127,6 +131,17 @@ resolved value: `${PORT}` for a leased web port, `$VERIFY_DRIVER_PORT` for the
 debugging port in attach mode, `$VERIFY_ARTIFACTS_DIR` for a per-request scratch
 dir to anchor an isolated profile under. A literal port number in a committed
 runbook is a promise about someone else's machine.
+
+**`portEnv` and `nonceEnv` are the two levers the harness EXPORTS**, bound to the
+port it leased and the nonce it minted for that request. Declare whatever names
+the project's own code actually reads — a server doing `process.env.PORT`, a
+build stamping its marker from `process.env.APP_BUILD_ID` — and they arrive set.
+Leave them out and the same two facts fall to whatever the verification agent
+infers from your `notes`, which is not reproducible: the same project shape has
+proven on one run and failed on the next on that guess alone, and the bad
+direction marks a runbook proven that only works when the agent embellishes it.
+Names the harness already owns (`VERIFY_*`) and names that configure execution
+(`PATH`, `NODE_OPTIONS`, `DYLD_*`, `LD_*`) are refused.
 
 A worked example — a static site with no build step and no route it can add:
 

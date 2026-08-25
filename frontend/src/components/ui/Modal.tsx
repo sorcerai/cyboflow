@@ -14,6 +14,16 @@ export interface ModalProps {
   className?: string;
 }
 
+// Module-level stack of open Modal instances, most recent (top-most) last.
+// Escape is a STACK operation: only the top-most open modal may consume it —
+// otherwise nested modals (e.g. Settings -> a tracker "connected" view -> an
+// add-mapping wizard) each bind their own document-level Escape handler and a
+// single keypress unwinds every ancestor at once. A modal with
+// closeOnEscape={false} still occupies the stack top while open, so it
+// swallows Escape rather than letting it fall through to its parent — that's
+// the correct "modal captures Escape" behaviour.
+const escapeStack: symbol[] = [];
+
 export const Modal: React.FC<ModalProps> = ({
   isOpen,
   onClose,
@@ -26,17 +36,38 @@ export const Modal: React.FC<ModalProps> = ({
 }) => {
   const modalRef = useRef<HTMLDivElement>(null);
   const mouseDownTargetRef = useRef<EventTarget | null>(null);
-  
-  // Handle escape key
+  const instanceIdRef = useRef<symbol | null>(null);
+  if (instanceIdRef.current === null) {
+    instanceIdRef.current = Symbol('modal');
+  }
+
+  // Register/unregister this instance on the escape stack while open, so
+  // nested modals can tell whether they're the top-most one. Re-opening
+  // (isOpen false -> true) re-registers on top of the stack.
   useEffect(() => {
-    if (!isOpen || !closeOnEscape) return;
-    
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
+    if (!isOpen) return;
+    const id = instanceIdRef.current as symbol;
+    escapeStack.push(id);
+    return () => {
+      const index = escapeStack.lastIndexOf(id);
+      if (index !== -1) {
+        escapeStack.splice(index, 1);
       }
     };
-    
+  }, [isOpen]);
+
+  // Handle escape key — only the top-most open modal on the stack responds;
+  // ancestors ignore a keypress that belongs to a modal stacked above them.
+  useEffect(() => {
+    if (!isOpen || !closeOnEscape) return;
+
+    const id = instanceIdRef.current as symbol;
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (escapeStack[escapeStack.length - 1] !== id) return;
+      onClose();
+    };
+
     document.addEventListener('keydown', handleEscape);
     return () => document.removeEventListener('keydown', handleEscape);
   }, [isOpen, onClose, closeOnEscape]);

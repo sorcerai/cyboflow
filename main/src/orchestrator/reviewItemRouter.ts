@@ -108,7 +108,13 @@ export class ReviewItemError extends Error {
 // ---------------------------------------------------------------------------
 
 /** Actors that may write review items. Mirrors TaskActor. */
-export type ReviewActor = 'user' | 'orchestrator' | `agent:${string}` | 'linear' | 'plane';
+export type ReviewActor =
+  | 'user'
+  | 'orchestrator'
+  | `agent:${string}`
+  | 'linear'
+  | 'plane'
+  | 'dart';
 
 /** Create a new review item. Omit `reviewItemId` (it is minted). */
 export interface ReviewItemCreate {

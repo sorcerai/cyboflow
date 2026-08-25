@@ -111,7 +111,7 @@ describe('PanelTabBar add chat action', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Add chat panel' }));
-    fireEvent.click(screen.getByText('PTY (interactive)'));
+    fireEvent.click(screen.getByText('CLI (interactive)'));
 
     expect(onAddChat).toHaveBeenCalledTimes(1);
     expect(onAddChat).toHaveBeenCalledWith('interactive');
@@ -191,7 +191,7 @@ describe('PanelTabBar add chat action', () => {
     expect(screen.getByText(`Run this chat with the interactive ${provider} terminal`)).toBeInTheDocument();
 
     // Live in every session type — the override actually routes now.
-    fireEvent.click(screen.getByText('PTY (interactive)'));
+    fireEvent.click(screen.getByText('CLI (interactive)'));
     expect(onAddChat).toHaveBeenCalledWith('interactive');
   });
 });

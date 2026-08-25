@@ -1,13 +1,18 @@
 name: E2E (smoke tier)
 
-# Report-only Playwright smoke tier driving the built Electron bundle via
-# _electron.launch() (tests/helpers/electronApp.ts). Runs on demand and nightly
-# on a macOS runner (ship-target fidelity — a real display, no xvfb). The test
-# step is continue-on-error until the tier is proven green two consecutive
-# nightly runs; at that point flip it to blocking and drop the CLAUDE.md caveat.
+# Playwright smoke tier driving the built Electron bundle via
+# _electron.launch() (tests/helpers/electronApp.ts), on a macOS runner
+# (ship-target fidelity — a real display, no xvfb). The smoke tier is BLOCKING:
+# promoted 2026-08-14 after 41/41 green nightlies since 2026-07-04 (step-level
+# verified). It gates PRs to main and must stay in branch protection's required
+# checks ("E2E smoke (macOS)"). The sdk-canaries and flake-watch jobs remain
+# report-only and nightly-only (canaries need an authenticated `claude`;
+# flake-watch is empty until a test is quarantined).
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [ main ]
   schedule:
     # 07:00 UTC nightly.
     - cron: '0 7 * * *'
@@ -46,10 +51,9 @@ jobs:
       - name: Install Playwright (no browser download needed for Electron)
         run: pnpm exec playwright install-deps || true
 
-      # Report-only until proven green — a launch/environment hiccup must never
-      # block the nightly. Drive the smoke tier only.
+      # Blocking since 2026-08-14 (41/41 green nightlies). Drive the smoke tier
+      # only — the 7-test minimal config with a proven CI track record.
       - name: Run smoke tier
-        continue-on-error: true
         run: pnpm run test:ci:minimal
         env:
           CI: true
@@ -75,6 +79,9 @@ jobs:
   sdk-canaries:
     name: SDK drift canaries (macOS)
     runs-on: macos-latest
+    # Nightly/dispatch only — on hosted runners `claude` is never on PATH, so a
+    # PR run would just spin up a macOS runner to skip both steps.
+    if: github.event_name != 'pull_request'
 
     steps:
       - name: Checkout code
@@ -135,6 +142,8 @@ jobs:
   flake-watch:
     name: Flake watch (quarantined tests, report-only)
     runs-on: macos-latest
+    # Nightly/dispatch only — a no-op on PRs until something is quarantined.
+    if: github.event_name != 'pull_request'
 
     steps:
       - name: Checkout code

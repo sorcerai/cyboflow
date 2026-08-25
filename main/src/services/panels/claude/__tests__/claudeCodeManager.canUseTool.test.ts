@@ -74,7 +74,7 @@ vi.mock('../../../../orchestrator/permissionRules', async (orig) => {
   const actual = await orig<typeof import('../../../../orchestrator/permissionRules')>();
   return {
     ...actual,
-    loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [] })),
+    loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [], ask: [] })),
   };
 });
 
@@ -126,11 +126,18 @@ function extractPreToolUseHook(opts: Options): HookCallback | null {
   return hooks[0] ?? null;
 }
 
-/** Invoke the installed canUseTool with a minimal options object. */
+/**
+ * Invoke the installed canUseTool with a minimal options object.
+ *
+ * `extra` merges into the SDK's third argument, which is how a test supplies
+ * `matchedAskRule` — the field the CLI sets when a user `permissions.ask` rule
+ * forced the prompt.
+ */
 async function callCanUseTool(
   opts: Options,
   toolName: string,
   input: Record<string, unknown>,
+  extra: Partial<Parameters<CanUseTool>[2]> = {},
 ): Promise<PermissionResult> {
   const fn = opts.canUseTool;
   if (!fn) throw new Error('canUseTool not installed on the composed Options');
@@ -138,6 +145,7 @@ async function callCanUseTool(
     signal: new AbortController().signal,
     toolUseID: 'tu-1',
     requestId: 'req-1',
+    ...extra,
   } as Parameters<CanUseTool>[2];
   // SDK 0.3.201 widened CanUseTool to `PermissionResult | null` (null = suppress the
   // control response); cyboflow's makeCanUseTool always decides, so null is a test failure.
@@ -303,7 +311,7 @@ describe('ClaudeCodeManager canUseTool — auto-mode prompting (ApprovalDecision
   it('allowlisted tool short-circuits → { behavior: "allow", updatedInput } WITHOUT touching ApprovalRouter', async () => {
     // composeHookOptions loads the rules ONCE at spawn (shared by the hook AND
     // canUseTool); mockReturnValueOnce applies to exactly that single load.
-    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [] });
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [], ask: [] });
     const opts = await autoOpts('run-allowlist', 'sess-allowlist');
 
     const res = await callCanUseTool(opts, 'Bash', { command: 'git status -s' });
@@ -312,6 +320,53 @@ describe('ClaudeCodeManager canUseTool — auto-mode prompting (ApprovalDecision
     // shipped the production ZodError (an allowlisted Bash command returned a bare
     // allow, which the CLI rejected as "Tool permission request failed: ZodError").
     expect(res).toEqual({ behavior: 'allow', updatedInput: { command: 'git status -s' } });
+    expect(requestApproval).not.toHaveBeenCalled();
+  });
+
+  // Consent bypass fixed after the agent-sdk 0.3.224 bump. The CLI sets
+  // `matchedAskRule` when a user-configured `permissions.ask` rule forced the
+  // prompt, and the SDK contract says a host running its own auto-approval must
+  // treat that as rule-forced — the user's stated intent IS a human prompt.
+  // cyboflow's allowlist short-circuit ignored it, so a broad local allow rule
+  // silently swallowed the narrower ask the user had explicitly written.
+  it('matchedAskRule VETOES the allowlist short-circuit and routes to ApprovalRouter', async () => {
+    // Broad allow that WOULD have matched, exactly as in the test above.
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [], ask: [] });
+    const opts = await autoOpts('run-ask-rule', 'sess-ask-rule');
+
+    const res = await callCanUseTool(
+      opts,
+      'Bash',
+      { command: 'git status -s' },
+      { matchedAskRule: { source: 'userSettings', toolName: 'Bash', ruleContent: 'git status:*' } },
+    );
+
+    expect(requestApproval).toHaveBeenCalledTimes(1);
+    // Still a well-formed allow once the human approves (updatedInput invariant).
+    expect(res).toEqual({ behavior: 'allow', updatedInput: { command: 'git status -s' } });
+  });
+
+  it('a rule-forced ask that the human DENIES is denied, not auto-allowed', async () => {
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [], ask: [] });
+    requestApproval.mockResolvedValueOnce({ behavior: 'deny' as const, message: 'nope' });
+    const opts = await autoOpts('run-ask-deny', 'sess-ask-deny');
+
+    const res = await callCanUseTool(
+      opts,
+      'Bash',
+      { command: 'git status -s' },
+      { matchedAskRule: { source: 'projectSettings', toolName: 'Bash' } },
+    );
+
+    expect(res).toEqual({ behavior: 'deny', message: 'nope' });
+  });
+
+  it('without matchedAskRule the allowlist short-circuit is unchanged', async () => {
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(git status:*)'], deny: [], ask: [] });
+    const opts = await autoOpts('run-no-ask-rule', 'sess-no-ask-rule');
+
+    await callCanUseTool(opts, 'Bash', { command: 'git status -s' });
+
     expect(requestApproval).not.toHaveBeenCalled();
   });
 
@@ -335,7 +390,7 @@ describe('ClaudeCodeManager canUseTool — auto-mode prompting (ApprovalDecision
     expect(isRecord((resA as { updatedInput?: unknown }).updatedInput)).toBe(true);
 
     // Producer 2: allowlist short-circuit (never reaches ApprovalRouter).
-    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(ls:*)'], deny: [] });
+    vi.mocked(loadMergedPermissionRules).mockReturnValueOnce({ allow: ['Bash(ls:*)'], deny: [], ask: [] });
     const optsB = await autoOpts('run-reg-b', 'sess-reg-b');
     const resB = (await callCanUseTool(optsB, 'Bash', { command: 'ls -la' })) as PermissionResult;
     expect(resB.behavior).toBe('allow');

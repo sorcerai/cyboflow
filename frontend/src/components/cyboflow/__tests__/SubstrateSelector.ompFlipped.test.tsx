@@ -49,7 +49,7 @@ describe('SubstrateSelector — OMP rows once selectableInPickers flips', () => 
     render(<SubstrateSelector value="claude-sdk" onChange={vi.fn()} runtimeScope="session" />);
 
     expect(screen.getByRole('option', { name: 'OMP' })).not.toBeDisabled();
-    expect(screen.getByRole('option', { name: 'OMP terminal' })).not.toBeDisabled();
+    expect(screen.getByRole('option', { name: 'OMP (CLI)' })).not.toBeDisabled();
   });
 
   it('still hides the OMP rows when flipped but the provider itself is off (absent ⇒ disabled)', () => {

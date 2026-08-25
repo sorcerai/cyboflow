@@ -33,7 +33,11 @@ export interface AgentToolCallBlock {
 export interface AgentToolResultBlock {
   type: 'tool_result';
   tool_call_id: string;
-  content: string | Array<{ type: string; text: string }>;
+  // Mirrors the widened ClaudeStream ToolResultBlock.content shape (claudeStream.ts):
+  // `text` is optional and unrecognized block types (e.g. image blocks with no
+  // `text` field) pass through, so a Claude-side tool_result carrying an image
+  // block round-trips through the agent-stream conversion without narrowing.
+  content: string | Array<{ type: string; text?: string; [k: string]: unknown }>;
   is_error?: boolean;
 }
 

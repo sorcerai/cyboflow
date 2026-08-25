@@ -14,7 +14,11 @@ import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ACCEPT_EDITS_AUTO_APPROVE_TOOLS } from '../../../../orchestrator/permissionModeMapper';
 import { ACCEPT_EDITS_SAFE_READONLY_TOOLS } from '../../../../orchestrator/safeCommandClassifier';
-import { decideToolCall } from '../gate/ompGateExtension';
+import {
+  MOST_RESTRICTIVE_GATE_CONFIG,
+  decideToolCall,
+  parseGateConfig,
+} from '../gate/ompGateExtension';
 import {
   buildOmpGateConfig,
   composeOmpMcpToolName,
@@ -105,14 +109,38 @@ describe('the allowlists mirror cyboflow, not OMP', () => {
 describe('buildOmpGateConfig', () => {
   const base = { permissionMode: 'default' as const, cyboflowMcpAvailable: true };
 
-  it('translates the deny list and always denies the subagent tool', () => {
+  it('translates the deny list and no longer denies the subagent tool', () => {
     const config = buildOmpGateConfig({
       ...base,
       disallowedTools: ['mcp__cyboflow__cyboflow_request_verification', 'Bash', 'Bash'],
     });
 
     expect(config.disallowedTools).toEqual(['mcp__cyboflow_request_verification', 'bash']);
-    expect(config.denyTaskTool).toBe(true);
+    // Lifted once the premise was measured rather than assumed — the gate's
+    // handler DOES fire inside a `task` subagent, and at depth 2. See the
+    // builder's doc block for the probe.
+    expect(config.denyTaskTool).toBe(false);
+  });
+
+  /**
+   * The half of the deny that did NOT move, and the reason it matters more than
+   * the half that did: the builder only runs when a config is being BUILT. A
+   * spawn that reaches the gate with no config, or a malformed one, must still
+   * refuse subagent dispatch — otherwise "the config failed to arrive" becomes
+   * "the permission system is off", which is the failure this flag was always
+   * really guarding.
+   */
+  it('leaves the fail-closed defaults denying, however the builder is set', () => {
+    const quiet = { debug: () => undefined, warn: () => undefined, error: () => undefined };
+    expect(MOST_RESTRICTIVE_GATE_CONFIG.denyTaskTool).toBe(true);
+    expect(parseGateConfig(undefined, quiet).denyTaskTool).toBe(true);
+    expect(parseGateConfig('not json at all', quiet).denyTaskTool).toBe(true);
+    expect(
+      parseGateConfig(JSON.stringify({ permissionMode: 'auto' }), quiet).denyTaskTool,
+    ).toBe(true);
+    expect(
+      decideToolCall({ toolName: 'task', input: {} }, MOST_RESTRICTIVE_GATE_CONFIG).kind,
+    ).toBe('block');
   });
 
   it('omits the cyboflow MCP names for an in-place session that gets no MCP', () => {
@@ -171,7 +199,9 @@ describe('buildOmpGateConfig', () => {
       rule: 'auto-allow-tool',
     });
     expect(decideToolCall({ toolName: 'write', input: {} }, strict)).toEqual({ kind: 'ask' });
-    expect(decideToolCall({ toolName: 'task', input: {} }, strict).kind).toBe('block');
+    // `task` now falls through to the ordinary ladder instead of blocking at
+    // rule 2; in `default` mode that lands on the human, not on an auto-allow.
+    expect(decideToolCall({ toolName: 'task', input: {} }, strict)).toEqual({ kind: 'ask' });
     expect(decideToolCall({ toolName: 'mcp__cyboflow_report_finding', input: {} }, strict)).toEqual({
       kind: 'allow',
       rule: 'cyboflow-mcp',
@@ -238,9 +268,36 @@ describe('buildOmpGateConfig', () => {
       kind: 'allow',
       rule: 'dont-ask',
     });
-    expect(decideToolCall({ toolName: 'task', input: {} }, dontAsk).kind).toBe('block');
+    // THE ONE PLACE LIFTING denyTaskTool GENUINELY WIDENS THINGS. Rule 2 used
+    // to bite before the `dontAsk` short-circuit, so subagent dispatch was the
+    // single thing `dontAsk` could not do. It can now — which is what the mode
+    // says on the tin ("full access, approvals off"), and is only defensible
+    // because the subagent's OWN calls are gated: the probe in the builder's
+    // doc block shows them reaching this same predicate, at depth 2, where
+    // `dontAsk` allows them exactly as it allows the parent's.
+    expect(decideToolCall({ toolName: 'task', input: {} }, dontAsk)).toEqual({
+      kind: 'allow',
+      rule: 'dont-ask',
+    });
     expect(
       decideToolCall({ toolName: 'mcp__cyboflow_request_verification', input: {} }, dontAsk).kind,
     ).toBe('block');
+  });
+});
+
+describe('buildOmpGateConfig — the human-decision budget', () => {
+  const base = { permissionMode: 'default' as const, cyboflowMcpAvailable: true };
+
+  it('omits the field entirely when no budget was resolved', () => {
+    // Absence is the signal that tells the gate to keep its built-in ~25s
+    // budget. A defaulted number here would be a claim that OMP was configured
+    // to allow a longer handler, which for an un-raised spawn is false.
+    const config = buildOmpGateConfig(base);
+    expect('humanDecisionBudgetMs' in config).toBe(false);
+  });
+
+  it('forwards the budget verbatim when one was resolved', () => {
+    const config = buildOmpGateConfig({ ...base, humanDecisionBudgetMs: 1_770_000 });
+    expect(config.humanDecisionBudgetMs).toBe(1_770_000);
   });
 });

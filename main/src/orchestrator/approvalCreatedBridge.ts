@@ -9,6 +9,11 @@
  *  - JOIN at bridge (not inside ApprovalRouter.requestApproval) so the
  *    in-memory ApprovalRequest shape stays lean for the SDK PreToolUse hook,
  *    which never reads workflowName.
+ *  - `awaited` is read from the approvals row rather than passed in, because
+ *    this bridge serves two emitters: the original create, where it is always
+ *    true, and ApprovalRouter.setAwaited's re-emit, whose whole purpose is to
+ *    push the FLIPPED value to the renderer. Reading the row keeps one source of
+ *    truth and means neither emitter has to remember to pass it.
  *  - Missing-row fallback: emit with workflowName='' and log a console.warn
  *    rather than throwing, because silent-drop creates an invisible discard
  *    mode that is harder to debug than a warn.
@@ -22,6 +27,7 @@ import type { ApprovalRequest } from '../../../shared/types/approval';
 import type { ApprovalCreatedEvent } from '../../../shared/types/approvals';
 import { truncatePayloadPreview } from '../../../shared/utils/approvals';
 import type { DatabaseLike } from './types';
+import { selectApprovalAttribution } from './approvalListing';
 
 /**
  * Build an ApprovalCreatedEvent from an in-memory ApprovalRequest by
@@ -60,6 +66,26 @@ export function buildApprovalCreatedEvent(
     );
   }
 
+  // Default true, not false: an approvals row is unreadable here only on a
+  // pre-migration-110 DB or a lookup failure, and every transport but the OMP
+  // gate blocks its requester for the whole window. Guessing "nobody is waiting"
+  // would silently downgrade a genuinely blocked agent's card.
+  let awaited = true;
+  try {
+    const row = db
+      .prepare('SELECT awaited FROM approvals WHERE id = ?')
+      .get(request.id) as { awaited?: number } | undefined;
+    if (row && typeof row.awaited === 'number') awaited = row.awaited !== 0;
+  } catch (err) {
+    console.warn(
+      `[approvalCreatedBridge] awaited lookup threw for approvalId=${request.id}: ${err}`,
+    );
+  }
+
+  // Same derivation the queue-wide listing uses, so a card built from the live
+  // event and the same card after a refetch cannot disagree about who asked.
+  const attribution = selectApprovalAttribution(db, request.runId);
+
   const payloadJson = JSON.stringify(request.input);
   const payloadPreview = truncatePayloadPreview(payloadJson);
 
@@ -73,6 +99,8 @@ export function buildApprovalCreatedEvent(
       rationale: null,
       createdAt: new Date(request.timestamp).toISOString(),
       status: 'pending',
+      awaited,
+      ...attribution,
     },
   };
 }

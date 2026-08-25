@@ -35,6 +35,7 @@ import type { TaskChangedEvent } from '../../../../shared/types/tasks';
 import { dbAdapter } from '../__test_fixtures__/dbAdapter';
 import { createTestDb, seedRun } from '../__test_fixtures__/orchestratorTestDb';
 import type { QuestionPayload } from '../../../../shared/types/questions';
+import type { DesignSessionLaunchDeps } from '../designSessionLaunch';
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1692,6 +1693,263 @@ describe('QuestionRouter approve-plan retires a SHIP run\'s idea to Decomposed',
       .get(ideaId) as { actor: string; kind: string };
     expect(ev.actor).toBe('orchestrator');
     expect(ev.kind).toBe('decomposed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Design-mode fork (planner.md step 2 "The design fork"): answering the
+// planner's `approve-idea` gate with "Approve → design mode" launches a
+// design-mode session via QuestionRouter.setDesignSessionLaunchDeps's injected
+// saga (designSessionLaunch.ts's launchDesignSessionForFork — see
+// designSessionLaunch.test.ts for the saga's own compensation/failure-report
+// coverage in isolation). This block covers the QuestionRouter-side wiring:
+// the classifier's disambiguation against the plain three options, the
+// step-id gate, and the owned-idea resolution.
+// ---------------------------------------------------------------------------
+
+describe('QuestionRouter design-mode fork launches a design session (approve-idea gate)', () => {
+  // Minimal migration chain: questions (010) + review_items (016/085) for
+  // QuestionRouter itself, run_seed_idea (017) for workflow_runs.seed_idea_id
+  // (listRunOwnedIdeaIds' resolution path for this single-idea gate).
+  function buildDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
+      CREATE TABLE projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    db.prepare('INSERT INTO projects (id, name, path) VALUES (1, ?, ?)').run('Proj', '/tmp/p1');
+    const migDir = join(__dirname, '..', '..', 'database', 'migrations');
+    db.exec(readFileSync(join(migDir, '006_cyboflow_schema.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '007_add_stuck_reason.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '010_questions.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '011_workflow_step_tracking.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '014_native_tasks.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '015_entity_model_rebuild.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '016_review_items.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '085_review_item_audience.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '017_run_seed_idea.sql'), 'utf-8'));
+    db.exec(readFileSync(join(migDir, '059_entity_category.sql'), 'utf-8'));
+    return db;
+  }
+
+  function seedIdeaForkRun(
+    db: Database.Database,
+    opts: { runId: string; currentStepId: string; seedIdeaId: string | null },
+  ): void {
+    db.prepare(
+      `INSERT OR IGNORE INTO workflows (id, project_id, name, spec_json) VALUES ('wf-fork', 1, 'planner', '{}')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO workflow_runs (id, workflow_id, project_id, status, current_step_id, seed_idea_id)
+       VALUES (?, 'wf-fork', 1, 'running', ?, ?)`,
+    ).run(opts.runId, opts.currentStepId, opts.seedIdeaId);
+  }
+
+  const IDEA_FORK_QUESTIONS: QuestionPayload[] = [
+    {
+      question: 'Approve this idea?',
+      header: 'Approve idea',
+      multiSelect: false,
+      options: [
+        { label: 'Approve → design mode' },
+        { label: 'Approve → keep planning' },
+        { label: 'Revise' },
+        { label: 'Reject' },
+      ],
+    },
+  ];
+
+  function makeFakeLaunchDeps(overrides: Partial<DesignSessionLaunchDeps> = {}): {
+    deps: DesignSessionLaunchDeps;
+    validateIdeaLink: ReturnType<typeof vi.fn>;
+    createDesignSession: ReturnType<typeof vi.fn>;
+    kickoffDesignPanel: ReturnType<typeof vi.fn>;
+    dismissSession: ReturnType<typeof vi.fn>;
+    reportLaunchFailure: ReturnType<typeof vi.fn>;
+  } {
+    // Build each collaborator as override-if-given, else a default mock — NOT a
+    // spread-after-defaults merge, which would leave the returned handle
+    // pointing at the (unused) default mock instead of the override actually
+    // wired into `deps`.
+    const validateIdeaLink = overrides.validateIdeaLink ?? vi.fn().mockReturnValue({ ok: true });
+    const createDesignSession =
+      overrides.createDesignSession ??
+      vi.fn().mockResolvedValue({ sessionId: 'sess-fork-1', runId: 'run-design-1', worktreePath: '/tmp/wt-fork' });
+    const kickoffDesignPanel = overrides.kickoffDesignPanel ?? vi.fn().mockResolvedValue(undefined);
+    const dismissSession = overrides.dismissSession ?? vi.fn().mockResolvedValue(undefined);
+    const reportLaunchFailure = overrides.reportLaunchFailure ?? vi.fn();
+    const deps: DesignSessionLaunchDeps = {
+      validateIdeaLink,
+      createDesignSession,
+      kickoffDesignPanel,
+      dismissSession,
+      reportLaunchFailure,
+    };
+    return {
+      deps,
+      validateIdeaLink: validateIdeaLink as ReturnType<typeof vi.fn>,
+      createDesignSession: createDesignSession as ReturnType<typeof vi.fn>,
+      kickoffDesignPanel: kickoffDesignPanel as ReturnType<typeof vi.fn>,
+      dismissSession: dismissSession as ReturnType<typeof vi.fn>,
+      reportLaunchFailure: reportLaunchFailure as ReturnType<typeof vi.fn>,
+    };
+  }
+
+  async function answerIdeaGate(
+    db: Database.Database,
+    router: QuestionRouter,
+    runId: string,
+    chosen: string,
+  ): Promise<void> {
+    const questionPromise = router.requestQuestion(
+      runId,
+      `tu-${runId}-${Math.random().toString(36).slice(2)}`,
+      IDEA_FORK_QUESTIONS,
+      vi.fn(),
+    );
+    await router['getQuestionQueue'](runId).onIdle();
+    const questionId = (
+      db
+        .prepare("SELECT id FROM questions WHERE run_id = ? AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1")
+        .get(runId) as { id: string }
+    ).id;
+    await router.respond(questionId, { answers: { 'Approve this idea?': chosen } });
+    await questionPromise;
+  }
+
+  afterEach(() => {
+    QuestionRouter._resetForTesting();
+  });
+
+  it('picking "Approve → design mode" launches a design session for the run\'s seeded idea', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    const { deps, validateIdeaLink, createDesignSession, kickoffDesignPanel } = makeFakeLaunchDeps();
+    router.setDesignSessionLaunchDeps(deps);
+
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: 'idea-99' });
+
+    await answerIdeaGate(db, router, 'run-fork', 'Approve → design mode');
+
+    expect(validateIdeaLink).toHaveBeenCalledWith('idea-99', 1);
+    expect(createDesignSession).toHaveBeenCalledWith({
+      projectId: 1,
+      ideaId: 'idea-99',
+      nameHint: expect.any(String),
+    });
+    expect(kickoffDesignPanel).toHaveBeenCalledWith({ sessionId: 'sess-fork-1', worktreePath: '/tmp/wt-fork' });
+  });
+
+  // Disambiguation: none of the plain three options — nor the OTHER fork
+  // option — must ever trigger a launch, even though 'Approve → keep
+  // planning' and plain 'Approve' both start with 'approve' (the substring
+  // isApproveAnswer alone would accept).
+  it.each([['Approve'], ['Approve → keep planning'], ['Revise'], ['Reject']])(
+    'answering %s does NOT launch a design session',
+    async (chosen) => {
+      const db = buildDb();
+      const adapter = dbAdapter(db);
+      const router = QuestionRouter.initialize(adapter);
+      const { deps, createDesignSession } = makeFakeLaunchDeps();
+      router.setDesignSessionLaunchDeps(deps);
+
+      seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: 'idea-99' });
+
+      await answerIdeaGate(db, router, 'run-fork', chosen);
+
+      expect(createDesignSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it('the SAME "Approve → design mode" label at a DIFFERENT step (approve-plan) does NOT launch — step-id gate wins', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    const { deps, createDesignSession } = makeFakeLaunchDeps();
+    router.setDesignSessionLaunchDeps(deps);
+
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-plan', seedIdeaId: 'idea-99' });
+
+    await answerIdeaGate(db, router, 'run-fork', 'Approve → design mode');
+
+    expect(createDesignSession).not.toHaveBeenCalled();
+  });
+
+  it('a failed launch is reported and never throws out of respond() (compensation is the saga\'s own concern — see designSessionLaunch.test.ts)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    const { deps, createDesignSession, dismissSession, reportLaunchFailure } = makeFakeLaunchDeps({
+      kickoffDesignPanel: vi.fn().mockRejectedValue(new Error('panel creation failed')),
+    });
+    router.setDesignSessionLaunchDeps(deps);
+
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: 'idea-99' });
+
+    await expect(answerIdeaGate(db, router, 'run-fork', 'Approve → design mode')).resolves.toBeUndefined();
+
+    expect(createDesignSession).toHaveBeenCalledOnce();
+    expect(dismissSession).toHaveBeenCalledWith('sess-fork-1');
+    expect(reportLaunchFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: 1, ideaId: 'idea-99', runId: 'run-fork', error: 'panel creation failed' }),
+    );
+  });
+
+  it('a stale idea link (no seed_idea_id resolvable) is reported and never calls createDesignSession', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    const { deps, createDesignSession, reportLaunchFailure } = makeFakeLaunchDeps();
+    router.setDesignSessionLaunchDeps(deps);
+
+    // No seed_idea_id — listRunOwnedIdeaIds resolves zero owned ideas, which is
+    // unresolvable (not exactly 1) and must fail closed rather than guess.
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: null });
+
+    await answerIdeaGate(db, router, 'run-fork', 'Approve → design mode');
+
+    expect(createDesignSession).not.toHaveBeenCalled();
+    expect(reportLaunchFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: 1, runId: 'run-fork' }),
+    );
+  });
+
+  it('an invalid idea link (validateIdeaLink fails — e.g. archived/decomposed since the gate opened) is rejected cleanly', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    const { deps, validateIdeaLink, createDesignSession, reportLaunchFailure } = makeFakeLaunchDeps({
+      validateIdeaLink: vi.fn().mockReturnValue({ ok: false, error: 'Idea idea-99 is archived.' }),
+    });
+    router.setDesignSessionLaunchDeps(deps);
+
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: 'idea-99' });
+
+    await answerIdeaGate(db, router, 'run-fork', 'Approve → design mode');
+
+    expect(validateIdeaLink).toHaveBeenCalledWith('idea-99', 1);
+    expect(createDesignSession).not.toHaveBeenCalled();
+    expect(reportLaunchFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ ideaId: 'idea-99', runId: 'run-fork', error: 'Idea idea-99 is archived.' }),
+    );
+  });
+
+  it('never wiring setDesignSessionLaunchDeps degrades to a no-op (respond() still completes normally)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    const router = QuestionRouter.initialize(adapter);
+    // Deliberately NOT calling router.setDesignSessionLaunchDeps(...).
+
+    seedIdeaForkRun(db, { runId: 'run-fork', currentStepId: 'approve-idea', seedIdeaId: 'idea-99' });
+
+    await expect(answerIdeaGate(db, router, 'run-fork', 'Approve → design mode')).resolves.toBeUndefined();
   });
 });
 

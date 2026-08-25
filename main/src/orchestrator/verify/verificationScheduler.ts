@@ -60,6 +60,7 @@ import {
   isVerificationModality,
   parseVerificationTaskV1,
   resolveTaskModality,
+  runbookBootstrapKillSwitchEngaged,
 } from '../../../../shared/types/visualVerification';
 import type {
   VerificationAgentRunnerLike,
@@ -69,7 +70,15 @@ import type {
 import type { AgentPreflightResult } from './preflight';
 import { classifyVerificationFailure } from './failureClassifier';
 import type { VerifyCapabilityStore } from './capabilityStore';
-import type { VerifyRunbookStore } from './runbookStore';
+import type { VerifyRunbookStore, VerifyRunbookStatusDetail } from './runbookStore';
+import {
+  declineForRunbookStatus,
+  taskDerivesEnvironment,
+  type BootstrapDecision,
+  type BootstrapDeclineReason,
+} from './bootstrapEligibility';
+import { runbookBootstrapPreflight } from './runbookBootstrapPreflight';
+import type { BootstrapRunOutcome, RunbookBootstrapArgs } from './runbookBootstrapRunner';
 import type {
   VerifyRunbookModality,
   VerifyRunbookModalityEntry,
@@ -177,6 +186,85 @@ const NATIVE_CAPTURE_UNAVAILABLE_DETAIL =
  */
 export const VERIFY_NO_RUNBOOK_REASON =
   'no proven verification runbook for this project (run verification setup)';
+
+/**
+ * The §3.2 skip reason for §4's PRE-MERGE case: a runbook IS proven for this
+ * project, this branch just does not carry the portable file yet.
+ *
+ * A separate string because the remedy is the opposite of the one above.
+ * `VERIFY_NO_RUNBOOK_REASON` tells a human to run verification setup; doing that
+ * HERE would derive a fresh runbook and UPSERT it over the proven singleton
+ * record every other branch depends on (runbookStore's `registerDraft`),
+ * breaking verification for the projects that configured it properly. The right
+ * action is to merge the branch that already carries it.
+ */
+export const VERIFY_RUNBOOK_ELSEWHERE_REASON =
+  'a proven verification runbook exists for this project but is not in this branch';
+
+/**
+ * The §3.2 skip reason for a runbook that WAS proven and has since drifted —
+ * its own content, the project inputs it builds through, or the host. The
+ * record was demoted write-through by the read that produced this; what it needs
+ * is re-proving, not re-deriving.
+ */
+export const VERIFY_RUNBOOK_DRIFTED_REASON =
+  "this project's proven verification runbook no longer matches its inputs";
+
+/**
+ * The §3.2 skip reason when the runbook record could not be READ at all (a
+ * pre-096 DB, a SQL error, an input hash that would not compute). Distinct from
+ * "none exists" on purpose: the store fails soft to `'absent'`, and reporting
+ * that as "never set up" would send a human to re-run a setup flow that already
+ * succeeded.
+ */
+export const VERIFY_RUNBOOK_UNREADABLE_REASON =
+  'the verification runbook record for this project could not be read';
+
+/**
+ * The skip reason for a runbook decline — the forward direction of
+ * {@link runbookDeclineForSkipReason}.
+ *
+ * `null` (the status is bootstrappable: nothing derived, a draft, or a file this
+ * host never proved) and `'already-proven'` both fall through to the ORIGINAL
+ * reason string, so every pre-existing consumer and every existing test keeps
+ * matching exactly what it matched before. Only the three genuinely different
+ * situations get their own text. `'already-proven'` is unreachable from the gate
+ * (a proven status returns before this) and is mapped rather than thrown on so a
+ * future caller cannot turn a classification into a crash.
+ */
+function skipReasonForRunbookDecline(decline: BootstrapDeclineReason | null): string {
+  switch (decline) {
+    case 'proof-belongs-elsewhere':
+      return VERIFY_RUNBOOK_ELSEWHERE_REASON;
+    case 'stale-proof':
+      return VERIFY_RUNBOOK_DRIFTED_REASON;
+    case 'unobservable':
+      return VERIFY_RUNBOOK_UNREADABLE_REASON;
+    default:
+      return VERIFY_NO_RUNBOOK_REASON;
+  }
+}
+
+/**
+ * Reverse-map a persisted `error_message` back to the situation that produced
+ * it, so a consumer holding only the string (verdictDelivery, building the
+ * human-facing finding) can attach the RIGHT remedy. `null` for anything that is
+ * not a runbook-shaped skip.
+ */
+export function runbookDeclineForSkipReason(
+  errorMessage: string | null,
+): BootstrapDeclineReason | null {
+  switch (errorMessage) {
+    case VERIFY_RUNBOOK_ELSEWHERE_REASON:
+      return 'proof-belongs-elsewhere';
+    case VERIFY_RUNBOOK_DRIFTED_REASON:
+      return 'stale-proof';
+    case VERIFY_RUNBOOK_UNREADABLE_REASON:
+      return 'unobservable';
+    default:
+      return null;
+  }
+}
 
 /**
  * The prefix stamped on a terminal the §3.1 GATE-INTEGRITY guard blocked — a
@@ -821,6 +909,15 @@ export interface VerificationSchedulerDeps {
   logger?: LoggerLike;
   /** Resolved visualVerify config (port/sim pools, threshold). Defaults applied. */
   config?: ResolvedVisualVerifyConfig;
+  /**
+   * The LIVE config, re-read per call. `config` above is resolved once at boot,
+   * which is right for the judge threshold and the port pools (a run must not
+   * change shape underneath itself) and wrong for a user-facing toggle: a switch
+   * flipped in Settings is expected to bind the next run, not the next launch.
+   * That mattered most in the OFF direction — unchecking "let runs set up
+   * verification themselves" mid-incident left the next lane still committing.
+   */
+  liveConfig?: () => ResolvedVisualVerifyConfig;
   /** Verdict-delivery side-effect hook (P8 wires the real one; stubbed here). */
   onVerdict?: OnVerdict;
   /** Shared lease pool override (tests). Defaults to a pool over the global mutex. */
@@ -968,12 +1065,24 @@ export interface VerificationSchedulerDeps {
    * the host fingerprint (§5.3 "Any component changing demotes"). Two of those
    * three are filesystem work, so the thunk cannot be synchronous without either
    * blocking the drain on IO or answering from a cache that is exactly what
-   * drift detection must not rely on. index.ts wires it to
-   * {@link VerifyRunbookStore.status} against the PROJECT path; the enqueue-side
-   * seam (see {@link VerificationScheduler.resolveProvenRunbook}) probes the
-   * requesting run's worktree instead.
+   * drift detection must not rely on.
+   *
+   * `probePath` is the TREE to check, and the gate passes the REQUESTING RUN's
+   * worktree (lane-runbook-bootstrap.md §3). It used to pass nothing, and the
+   * thunk probed the project root — while the enqueue-side injection
+   * ({@link VerificationScheduler.resolveProvenRunbook}) had always probed the
+   * run's worktree. The two therefore described DIFFERENT TREES, and a runbook a
+   * run commits to its own branch stayed invisible to the gate until that branch
+   * merged: every request in that run kept skipping with a setup CTA even though
+   * the tree it would execute in carried a proven runbook. Omitting `probePath`
+   * still falls back to the project root, which is what the project-level health
+   * badge wants.
    */
-  runbookStatus?: (projectId: number, modality: VerificationModality) => Promise<RunbookStatus>;
+  runbookStatus?: (
+    projectId: number,
+    modality: VerificationModality,
+    probePath?: string,
+  ) => Promise<VerifyRunbookStatusDetail>;
   /**
    * The machine-local runbook record store (§5.2 seam 1 + §5.3), injected as the
    * concrete class exactly like {@link VerificationSchedulerDeps.capabilityStore}
@@ -1023,6 +1132,20 @@ export interface VerificationSchedulerDeps {
    * keeps the standalone-typecheck invariant and never imports a service.
    */
   nativeCaptureProbe?: () => Promise<boolean>;
+  /**
+   * The ACTING half of the lane runbook bootstrap
+   * (docs/proposals/lane-runbook-bootstrap.md §12 steps 3–8): derive, commit,
+   * register, and prove a runbook for a lane whose verification would otherwise
+   * be skipped.
+   *
+   * Injected as one closure rather than as its several collaborators because the
+   * scheduler has no business holding a git binary, an SDK query, or a
+   * filesystem — index.ts assembles those and hands down a single
+   * `(args) => outcome` seam. Absent (every unit test, and any deployment where
+   * the toggle can never be on) ⇒ the preflight still computes and logs its
+   * decision and nothing acts on it, which is byte-identical to phase 2.
+   */
+  runbookBootstrap?: (args: RunbookBootstrapArgs) => Promise<BootstrapRunOutcome>;
 }
 
 /**
@@ -1294,6 +1417,7 @@ export class VerificationScheduler {
   private readonly artifactsDirResolver: (runId: string) => string;
   private readonly logger?: LoggerLike;
   private readonly config: ResolvedVisualVerifyConfig;
+  private readonly liveConfig: (() => ResolvedVisualVerifyConfig) | null;
   private readonly onVerdict?: OnVerdict;
   private readonly leasePool: ResourceLeasePool;
   private readonly requestTimeoutMs: number;
@@ -1314,10 +1438,12 @@ export class VerificationScheduler {
   private readonly runbookStatus: (
     projectId: number,
     modality: VerificationModality,
-  ) => Promise<RunbookStatus>;
+    probePath?: string,
+  ) => Promise<VerifyRunbookStatusDetail>;
   private readonly runbookStore?: VerifyRunbookStore;
   private readonly capabilityFinding?: CapabilityBreakerFindingFn;
   private readonly nativeCaptureProbe?: () => Promise<boolean>;
+  private readonly runbookBootstrap?: (args: RunbookBootstrapArgs) => Promise<BootstrapRunOutcome>;
 
   /**
    * The single COALESCED fallback timer armed while any row is `queued` (§5.6). It
@@ -1368,6 +1494,7 @@ export class VerificationScheduler {
     this.artifactsDirResolver = deps.artifactsDirResolver;
     this.logger = deps.logger;
     this.config = deps.config ?? VISUAL_VERIFY_DEFAULTS;
+    this.liveConfig = deps.liveConfig ?? null;
     this.onVerdict = deps.onVerdict;
     this.leasePool = deps.leasePool ?? new ResourceLeasePool();
     this.requestTimeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -1388,12 +1515,16 @@ export class VerificationScheduler {
     // §3.2: an UNWIRED deployment has no way to know a project proved anything —
     // 'absent' is the honest default, not a placeholder. (Phase 2 wires the real
     // store at index.ts; this default is what legacy tests and a pre-096 DB get.)
-    this.runbookStatus = deps.runbookStatus ?? (async (): Promise<RunbookStatus> => 'absent');
+    this.runbookStatus =
+      deps.runbookStatus ??
+      // Unwired ⇒ the honest pre-phase-2 answer: nothing was ever derived.
+      (async (): Promise<VerifyRunbookStatusDetail> => ({ status: 'absent', reason: 'no-record' }));
     this.runbookStore = deps.runbookStore;
     this.capabilityFinding = deps.capabilityFinding;
     // §4: deliberately NOT defaulted to an always-true thunk — absent means "no
     // probe ran", which the gate reads as unsupported (phase-0 behavior).
     this.nativeCaptureProbe = deps.nativeCaptureProbe;
+    this.runbookBootstrap = deps.runbookBootstrap;
   }
 
   // --------------------------------------------------------------------------
@@ -1630,6 +1761,32 @@ export class VerificationScheduler {
      */
     setupProof?: boolean;
     /**
+     * The LANE-DRIVEN bootstrap proof (docs/proposals/lane-runbook-bootstrap.md
+     * §5). Stamped to migration 107's `bootstrap_proof`, and deliberately NOT a
+     * synonym for {@link setupProof} — it claims exactly ONE of that flag's three
+     * privileges:
+     *
+     *   - EXEMPT from the §3.2 degrade gate, for the identical bootstrap-deadlock
+     *     reason (you cannot prove a runbook if being unproven blocks the proof);
+     *   - but COUNTED against the project's lifetime budget and charged like any
+     *     lane request, because a budget exemption is safe for a flow a human
+     *     launches once per project and unsafe for something a lane reaches on
+     *     every sprint;
+     *   - and drained at ORDINARY priority, because it BLOCKS a live lane and so
+     *     has no business queueing behind one.
+     *
+     * It is also not a wire field: `mcpQueryHandler` never reads it, so the only
+     * writer is the in-process controller seam. That makes it strictly narrower
+     * than `setupProof`, whose workflow-identity check exists to stop a lane from
+     * claiming the budget exemption.
+     *
+     * A bootstrap proof must NEVER drive a sprint lane — it carries the runbook's
+     * build/serve, not the lane's acceptance criteria — so both lane-driving
+     * policy sites exclude on this flag; see verdictDelivery and
+     * SchedulerVisualVerifyGate.
+     */
+    bootstrapProof?: boolean;
+    /**
      * §5.2 seam 3 — the PIN. `runbookHash` content-addresses the portable half
      * the composed `task` was merged from; `runbookLocalVersion` is the
      * machine-local record's CAS version at enqueue. Both are resolved by the
@@ -1688,39 +1845,59 @@ export class VerificationScheduler {
       req.runbookHash ?? null,
       req.runbookLocalVersion ?? null,
     ];
+    const bootstrapValue: [number] = [req.bootstrapProof === true ? 1 : 0];
     try {
       this.db
         .prepare(
           `INSERT INTO verification_requests
-             (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key, modality, setup_proof, runbook_hash, runbook_local_version)
-           VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key, modality, setup_proof, runbook_hash, runbook_local_version, bootstrap_proof)
+           VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(...values, ...gateValues, ...pinValues);
-    } catch (pinErr) {
-      this.logger?.debug('[VerificationScheduler] runbook pin columns unavailable; enqueuing without a pin', {
+        .run(...values, ...gateValues, ...pinValues, ...bootstrapValue);
+    } catch (bootstrapErr) {
+      // A pre-105 DB has no `bootstrap_proof`. Falling back DROPS the flag, which
+      // is the only safe direction: an unstamped row is read back as an ordinary
+      // request, so it is gated and budgeted normally and can never promote a
+      // runbook. The bootstrap simply cannot run on such a DB, which is correct —
+      // the feature is younger than the column.
+      this.logger?.debug('[VerificationScheduler] bootstrap_proof column unavailable; enqueuing without it', {
         requestId: id,
-        error: pinErr instanceof Error ? pinErr.message : String(pinErr),
+        error: bootstrapErr instanceof Error ? bootstrapErr.message : String(bootstrapErr),
       });
       try {
         this.db
           .prepare(
             `INSERT INTO verification_requests
-               (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key, modality, setup_proof)
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+               (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key, modality, setup_proof, runbook_hash, runbook_local_version)
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(...values, ...gateValues);
-      } catch (err) {
-        this.logger?.debug('[VerificationScheduler] modality/setup_proof columns unavailable; legacy enqueue', {
+          .run(...values, ...gateValues, ...pinValues);
+      } catch (pinErr) {
+        this.logger?.debug('[VerificationScheduler] runbook pin columns unavailable; enqueuing without a pin', {
           requestId: id,
-          error: err instanceof Error ? err.message : String(err),
+          error: pinErr instanceof Error ? pinErr.message : String(pinErr),
         });
-        this.db
-          .prepare(
-            `INSERT INTO verification_requests
-               (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key)
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)`,
-          )
-          .run(...values);
+        try {
+          this.db
+            .prepare(
+              `INSERT INTO verification_requests
+                 (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key, modality, setup_proof)
+               VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+            )
+            .run(...values, ...gateValues);
+        } catch (err) {
+          this.logger?.debug('[VerificationScheduler] modality/setup_proof columns unavailable; legacy enqueue', {
+            requestId: id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          this.db
+            .prepare(
+              `INSERT INTO verification_requests
+                 (id, run_id, project_id, status, verify_type, deliverable_json, chain_json, attempt, task_json, snapshot_sha, enqueue_key)
+               VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)`,
+            )
+            .run(...values);
+        }
       }
     }
     this.logger?.debug('[VerificationScheduler] enqueued request', {
@@ -1730,6 +1907,7 @@ export class VerificationScheduler {
       chain: req.chain,
       modality,
       setupProof: req.setupProof === true,
+      bootstrapProof: req.bootstrapProof === true,
       hasTask: req.task !== undefined,
       hasEnqueueKey: req.enqueueKey !== undefined,
       runbookHash: req.runbookHash ?? null,
@@ -2425,22 +2603,42 @@ export class VerificationScheduler {
    * SELECT throws, and losing `task_json` to that throw would silently degrade
    * every agent row to the synthesized bare-intent task. Fail-soft answers are
    * the pre-phase-0 posture — no stamped modality (the caller re-derives it) and
-   * not a setup-proof run (counted, gated, exactly as today).
+   * neither kind of proof run (counted, gated, exactly as today).
+   *
+   * TWO RUNGS, for the same reason this method exists at all: migration 107's
+   * `bootstrap_proof` is younger than 095's `setup_proof`, so a DB at 095/096
+   * throws on the widened SELECT. Falling back to the narrower one keeps the
+   * modality and the setup flag rather than losing all three, and reports
+   * `bootstrapProof: false` — which is not a guess but the truth for every row
+   * such a DB can contain.
    */
   private agentGateColumnsForRow(id: string): {
     modality: VerificationModality | null;
     setupProof: boolean;
+    bootstrapProof: boolean;
   } {
     try {
       const row = this.db
-        .prepare('SELECT modality, setup_proof FROM verification_requests WHERE id = ?')
-        .get(id) as { modality: unknown; setup_proof: unknown } | undefined;
+        .prepare('SELECT modality, setup_proof, bootstrap_proof FROM verification_requests WHERE id = ?')
+        .get(id) as { modality: unknown; setup_proof: unknown; bootstrap_proof: unknown } | undefined;
       return {
         modality: isVerificationModality(row?.modality) ? row.modality : null,
         setupProof: row?.setup_proof === 1 || row?.setup_proof === true,
+        bootstrapProof: row?.bootstrap_proof === 1 || row?.bootstrap_proof === true,
       };
     } catch {
-      return { modality: null, setupProof: false };
+      try {
+        const row = this.db
+          .prepare('SELECT modality, setup_proof FROM verification_requests WHERE id = ?')
+          .get(id) as { modality: unknown; setup_proof: unknown } | undefined;
+        return {
+          modality: isVerificationModality(row?.modality) ? row.modality : null,
+          setupProof: row?.setup_proof === 1 || row?.setup_proof === true,
+          bootstrapProof: false,
+        };
+      } catch {
+        return { modality: null, setupProof: false, bootstrapProof: false };
+      }
     }
   }
 
@@ -2566,6 +2764,129 @@ export class VerificationScheduler {
   }
 
   /**
+   * §12 step 1 — the runbook-bootstrap PREFLIGHT, asked by the enqueue seam
+   * BEFORE a request row exists.
+   *
+   * Lives on the scheduler because the scheduler already holds all three inputs
+   * and nobody else holds any of them: the resolved `visualVerify` config (the
+   * toggle), the `runbookStatus` thunk (the SAME one the degrade gate consults,
+   * which is the point — the preflight must not be able to form a second opinion
+   * about a project's runbook), and the run→worktree ladder. The decision itself
+   * is a separate, dependency-free module so it can be tested without any of
+   * this; this method is only the wiring.
+   *
+   * NEVER THROWS, and the caller treats any failure as "do not bootstrap".
+   */
+  async evaluateRunbookBootstrap(args: {
+    projectId: number;
+    runId: string;
+    laneTaskRef: string;
+    modality: VerificationModality;
+    task: VerificationTaskV1;
+    /** The caller's own worktree, when it has one (skips the run-row lookup). */
+    probePath?: string;
+  }): Promise<BootstrapDecision> {
+    const probePath =
+      args.probePath ?? this.worktreePathForRun(args.runId) ?? undefined;
+    return runbookBootstrapPreflight(
+      {
+        projectId: args.projectId,
+        runId: args.runId,
+        laneTaskRef: args.laneTaskRef,
+        modality: args.modality,
+        task: args.task,
+        ...(probePath !== undefined ? { probePath } : {}),
+      },
+      {
+        // The project toggle AND the host kill switch, combined here so the
+        // decision module never reads the environment. Both are read at CALL
+        // time — the toggle through `liveConfig`, because the boot-time snapshot
+        // made a Settings checkbox require a restart to mean anything, in both
+        // directions and with nothing in the UI saying so.
+        enabled:
+          (this.liveConfig?.() ?? this.config).autoBootstrapRunbook === true &&
+          !runbookBootstrapKillSwitchEngaged(),
+        status: (projectId, modality, path) => this.runbookStatus(projectId, modality, path),
+        ...(this.logger ? { logger: this.logger } : {}),
+      },
+    );
+  }
+
+  /**
+   * §12 steps 2–8 — DECIDE and, when the decision is yes, ACT.
+   *
+   * The one entry point `enqueueTaskVerification` calls. It is deliberately the
+   * whole thing rather than a decision the caller then acts on, because the two
+   * halves must not be able to drift: a caller that consulted the preflight and
+   * then applied its own idea of what "proceed" means is how a feature ends up
+   * bootstrapping the case §4 says never to bootstrap.
+   *
+   * WHAT THE CALLER DOES WITH THE RESULT IS THE SAME IN EVERY CASE: carry on to
+   * the ordinary enqueue. On `'proven'` that enqueue now resolves the freshly
+   * proven runbook, merges it, pins it, and passes the §3.2 gate — the lane
+   * verifies exactly as it would on a project a human had configured. On every
+   * other outcome the gate skips it with a reason that names the situation. The
+   * bootstrap has no channel to fail a lane and must not grow one.
+   *
+   * NEVER THROWS. `runRunbookBootstrap` has its own catch-all, and this method
+   * wraps the whole thing again because it is reached from the enqueue seam,
+   * whose contract is that it cannot crash a lane.
+   */
+  async maybeBootstrapRunbook(args: {
+    projectId: number;
+    runId: string;
+    laneTaskRef: string;
+    modality: VerificationModality;
+    task: VerificationTaskV1;
+    probePath?: string;
+  }): Promise<BootstrapRunOutcome | { kind: 'not-attempted'; reason: BootstrapDeclineReason }> {
+    const decision = await this.evaluateRunbookBootstrap(args);
+    if (!decision.proceed) return { kind: 'not-attempted', reason: decision.reason };
+    if (this.runbookBootstrap === undefined) {
+      // The phase-2 posture, preserved on purpose: the decision is computed and
+      // logged, and nothing acts on it.
+      this.logger?.debug('[VerificationScheduler] runbook bootstrap would fire but no runner is wired', {
+        runId: args.runId,
+        projectId: args.projectId,
+        laneTaskRef: args.laneTaskRef,
+        modality: args.modality,
+      });
+      return { kind: 'not-attempted', reason: 'disabled' };
+    }
+
+    const probePath = args.probePath ?? this.worktreePathForRun(args.runId) ?? undefined;
+    if (probePath === undefined) {
+      // Nothing to survey and nothing to commit into. This is the same tree the
+      // decision was made against, so a run with no worktree could not have been
+      // bootstrapped whatever the decision said.
+      this.logger?.debug('[VerificationScheduler] runbook bootstrap skipped: the run has no worktree', {
+        runId: args.runId,
+        laneTaskRef: args.laneTaskRef,
+      });
+      return { kind: 'not-attempted', reason: 'unobservable' };
+    }
+
+    try {
+      return await this.runbookBootstrap({
+        projectId: args.projectId,
+        runId: args.runId,
+        laneTaskRef: args.laneTaskRef,
+        modality: args.modality,
+        worktreePath: probePath,
+        adopt: decision.adopt,
+      });
+    } catch (err) {
+      this.logger?.warn('[VerificationScheduler] runbook bootstrap threw (degrading to today\'s skip)', {
+        runId: args.runId,
+        projectId: args.projectId,
+        laneTaskRef: args.laneTaskRef,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { kind: 'not-attempted', reason: 'unobservable' };
+    }
+  }
+
+  /**
    * The composed task the agent runs: the persisted `task_json` when present + valid
    * (dual-format contract §5.2), else a DEGENERATE task synthesized from the legacy
    * input (a bare-intent request) — `summary = intent`, no build/behaviors, `target`
@@ -2683,8 +3004,11 @@ export class VerificationScheduler {
    *     self-refreshed (TTL / host-generation — see VerifyCapabilityStore).
    *
    *  3. DEGRADE PATH (§3.2). The request needs an ENVIRONMENT derived for it —
-   *     it has a build step or a serve step — and this project has no PROVEN
-   *     runbook for the modality. This deliberately RETIRES per-run guessing for
+   *     it has a build step or a serve step — and there is no PROVEN runbook for
+   *     the modality IN THE TREE THIS REQUEST WOULD EXECUTE IN (the run's
+   *     worktree; see the probe-path note on
+   *     {@link VerificationSchedulerDeps.runbookStatus}). This deliberately
+   *     RETIRES per-run guessing for
    *     build/serve tasks: §1's whole diagnosis is that the agent engine "guesses
    *     per-run with no memory and guesses wrong every time" (0-for-5 in
    *     production; wrong serve form, colliding singletons, wrong ABI, blown
@@ -2703,6 +3027,16 @@ export class VerificationScheduler {
     setupProof: boolean,
     /** This row's ledger key — see {@link capabilityRunbookKey}. */
     runbookHash: string,
+    /**
+     * Migration 107 — a LANE-DRIVEN bootstrap proof. Exempt from gate (3) on the
+     * identical §3.6 reasoning that exempts `setupProof`: this request exists to
+     * PROVE the runbook whose absence gate (3) is complaining about, so gating it
+     * is a bootstrap deadlock. It is exempt from NOTHING ELSE — gates (1) and (2)
+     * still bind (an unsupported modality and an active suppression are facts
+     * about the host and the ledger, not about whether a runbook exists), and the
+     * budget still charges it.
+     */
+    bootstrapProof: boolean,
   ): Promise<string | null> {
     // (1) Modalities with no executable path on the agent engine (§3.3), plus the
     // probe-conditional native-screen lane (§4).
@@ -2721,13 +3055,23 @@ export class VerificationScheduler {
     }
 
     // (3) The §3.2 degrade path.
-    if (setupProof) return null;
-    const derivesEnvironment =
-      (Array.isArray(task.build) && task.build.length > 0) || task.serve !== undefined;
-    if (derivesEnvironment && (await this.runbookStatus(row.project_id, modality)) !== 'proven') {
-      return VERIFY_NO_RUNBOOK_REASON;
-    }
-    return null;
+    if (setupProof || bootstrapProof) return null;
+    // ONE definition of "derives an environment", shared with the bootstrap
+    // preflight — see bootstrapEligibility.ts for why they must not be two.
+    if (!taskDerivesEnvironment(task)) return null;
+    // Probe the tree this request would actually execute in — the run's
+    // worktree, the SAME ladder resolveProvenRunbook uses, so the gate and the
+    // enqueue-time injection can no longer disagree about which tree they are
+    // describing. `undefined` (a run with no worktree row, or an unreadable one)
+    // lets the thunk fall back to the project root, which is the old behavior.
+    const probePath = this.worktreePathForRun(row.run_id) ?? undefined;
+    const runbook = await this.runbookStatus(row.project_id, modality, probePath);
+    if (runbook.status === 'proven') return null;
+    // NOT all "no proven runbook" are the same situation, and the remedies are
+    // mutually exclusive (§4): telling a human to run setup on a branch that is
+    // merely missing the file would overwrite the proven record every other
+    // branch shares. Classify with the SAME function the preflight declines by.
+    return skipReasonForRunbookDecline(declineForRunbookStatus(runbook));
   }
 
   /**
@@ -2789,6 +3133,7 @@ export class VerificationScheduler {
       modality,
       gate.setupProof,
       this.capabilityRunbookKey(row.id),
+      gate.bootstrapProof,
     );
     if (gateSkip !== null) {
       await this.markTerminalAndDeliver(
@@ -2889,6 +3234,7 @@ export class VerificationScheduler {
         snapshotSha,
         modality,
         gate.setupProof,
+        gate.bootstrapProof,
       ),
     };
   }
@@ -2963,6 +3309,15 @@ export class VerificationScheduler {
     snapshotSha: string | null,
     modality: VerificationModality,
     setupProof: boolean,
+    /**
+     * Migration 107 — a lane-driven bootstrap proof. Kept SEPARATE from
+     * `setupProof` rather than folded into one "isProof" boolean, because the two
+     * differ on exactly the axes this method spends: `setupProof` bypasses the
+     * project budget and the judge-call charge, and `bootstrapProof` does NOT.
+     * They agree only on the runner's pin expectations (both legitimately execute
+     * an unproven draft) and on proof eligibility at settle time.
+     */
+    bootstrapProof: boolean,
   ): Promise<void> {
     const controller = new AbortController();
     this.inFlight.set(row.id, controller);
@@ -3048,9 +3403,14 @@ export class VerificationScheduler {
         // legitimately execute an 'unproven-draft' record (proving it is the
         // point) but must pin to the EXACT version it was enqueued against;
         // ordinary traffic is the mirror image. Only the scheduler holds this
-        // bit (the `setup_proof` column), so it must be handed over rather than
-        // guessed from the task.
-        ...(setupProof ? { setupProof: true } : {}),
+        // bit (the `setup_proof` / `bootstrap_proof` columns), so it must be
+        // handed over rather than guessed from the task.
+        //
+        // A BOOTSTRAP proof takes the same half: it was composed from a draft the
+        // controller registered moments earlier, so demanding a 'proven' record
+        // would reject the very thing it exists to prove. The runner's flag is
+        // therefore "is this a proof run", not "is this the setup flow".
+        ...(setupProof || bootstrapProof ? { setupProof: true } : {}),
         artifactsDir: this.artifactsDirResolver(row.run_id),
         verifyPort: servesPort ? leasedPort : null,
         verifyDriverPort: leasedPort + 1,
@@ -3108,7 +3468,15 @@ export class VerificationScheduler {
         return;
       }
 
-      await this.settleAgentTerminal(row, input, result, modality, setupProof, snapshotSha);
+      await this.settleAgentTerminal(
+        row,
+        input,
+        result,
+        modality,
+        setupProof,
+        snapshotSha,
+        bootstrapProof,
+      );
     } catch (err) {
       const aborted = controller.signal.aborted;
       controller.abort();
@@ -3204,6 +3572,8 @@ export class VerificationScheduler {
     modality: VerificationModality,
     setupProof: boolean,
     snapshotSha: string | null,
+    /** Migration 107 — see {@link VerificationScheduler.processAgentRow}. */
+    bootstrapProof: boolean = false,
   ): Promise<void> {
     const isTerminalFailure =
       result.status === 'failed' || result.status === 'timeout' || result.status === 'skipped';
@@ -3263,6 +3633,36 @@ export class VerificationScheduler {
       );
     }
 
+    // §5.3 — the proof flip runs BEFORE the terminal write, and the ordering is
+    // load-bearing rather than incidental.
+    //
+    // IT USED TO RUN AFTER, on the reasoning that a proof-recording failure must
+    // never change a verdict already committed. That reasoning still holds and is
+    // preserved by the try/catch below — but the ordering it produced was a race.
+    // `awaitTerminal` polls the request ROW, and the row went terminal here,
+    // before `deliver()` — a whole pipeline of real IO — and only then did the
+    // record flip. A bootstrap waiting on its own proof could therefore observe
+    // `passed`, return "proven", and have the lane's very next enqueue read the
+    // record as still an unproven draft and skip the verification anyway: the
+    // exact outcome the bootstrap spent an agent, a budget charge, two commits
+    // and up to fifteen minutes to avoid.
+    //
+    // Flipping first makes "the row is terminal" mean "the record has already
+    // been decided", which is what every reader assumed it meant.
+    if ((setupProof || bootstrapProof) && status === 'passed') {
+      try {
+        this.recordRunbookProof(row, modality, result, snapshotSha);
+      } catch (err) {
+        // Swallowed deliberately: the verdict below is the load-bearing act, and
+        // a proof-recording failure may not prevent it from being written.
+        this.logger?.warn('[VerificationScheduler] recording the runbook proof threw; the verdict still stands', {
+          requestId: row.id,
+          modality,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     await this.markTerminalAndDeliver(
       row,
       status,
@@ -3280,14 +3680,6 @@ export class VerificationScheduler {
       result.fileNames,
       input,
     );
-
-    // §5.3 — the proof flip runs AFTER the terminal write, exactly like the
-    // ledger feedback below and for the same reason: the verdict is the
-    // load-bearing act, and a proof-recording failure must never be able to
-    // change one that is already committed.
-    if (setupProof && status === 'passed') {
-      this.recordRunbookProof(row, modality, result, snapshotSha);
-    }
 
     await this.recordCapabilityOutcome(
       row,

@@ -11,7 +11,7 @@
  * separate subscription — variant edits are always user-initiated from the same
  * client, unlike run status which needs a push channel).
  */
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { create } from 'zustand';
 import type { inferRouterOutputs } from '@trpc/server';
 import { trpc } from '../trpc/client';
@@ -26,7 +26,13 @@ export type WorkflowVariantRow = RouterOutputs['cyboflow']['variants']['list'][n
 export type BaselineRotation = RouterOutputs['cyboflow']['variants']['getBaselineRotation'];
 
 export interface VariantsState {
-  /** Variant rows keyed by workflowId. Absent key = never fetched. */
+  /**
+   * Variant rows keyed by workflowId, INCLUDING archived ones (migration 116) —
+   * the fetch always asks for the full set so the manager's "Show archived"
+   * toggle is a local filter rather than a refetch. Consumers that want only the
+   * live set read {@link useWorkflowVariants}, which splits the two. Absent key
+   * = never fetched.
+   */
   byWorkflowId: Record<string, WorkflowVariantRow[]>;
   /** Baseline rotation participation keyed by workflowId (migration 054). */
   baselineByWorkflowId: Record<string, BaselineRotation>;
@@ -43,6 +49,9 @@ export interface VariantsState {
   invalidate: (workflowId: string) => Promise<void>;
 }
 
+/** Stable empty row array — a fresh `[]` per render would break the memos below. */
+const EMPTY_ROWS: WorkflowVariantRow[] = [];
+
 export const useVariantsStore = create<VariantsState>((set, get) => ({
   byWorkflowId: {},
   baselineByWorkflowId: {},
@@ -58,7 +67,7 @@ export const useVariantsStore = create<VariantsState>((set, get) => ({
     }));
     try {
       const [rows, baseline] = await Promise.all([
-        trpc.cyboflow.variants.list.query({ workflowId }),
+        trpc.cyboflow.variants.list.query({ workflowId, includeArchived: true }),
         trpc.cyboflow.variants.getBaselineRotation.query({ workflowId }),
       ]);
       set((s) => ({
@@ -84,7 +93,7 @@ export const useVariantsStore = create<VariantsState>((set, get) => ({
     set((s) => ({ error: { ...s.error, [workflowId]: null } }));
     try {
       const [rows, baseline] = await Promise.all([
-        trpc.cyboflow.variants.list.query({ workflowId }),
+        trpc.cyboflow.variants.list.query({ workflowId, includeArchived: true }),
         trpc.cyboflow.variants.getBaselineRotation.query({ workflowId }),
       ]);
       set((s) => ({
@@ -109,7 +118,10 @@ export const useVariantsStore = create<VariantsState>((set, get) => ({
  * workflow row yet) — returns an empty, not-loaded result.
  */
 export function useWorkflowVariants(workflowId: string | null): {
+  /** LIVE variants only — archived rows are split out below. */
   variants: WorkflowVariantRow[];
+  /** Archived variants (migration 116), for the manager's "Show archived" view. */
+  archivedVariants: WorkflowVariantRow[];
   /** Baseline rotation participation (migration 054); null until first fetch resolves. */
   baseline: BaselineRotation | null;
   loaded: boolean;
@@ -117,15 +129,24 @@ export function useWorkflowVariants(workflowId: string | null): {
   error: string | null;
 } {
   const fetchFn = useVariantsStore((s) => s.fetch);
-  const variants = useVariantsStore((s) => (workflowId ? s.byWorkflowId[workflowId] : undefined)) ?? [];
+  const allVariants = useVariantsStore((s) => (workflowId ? s.byWorkflowId[workflowId] : undefined)) ?? EMPTY_ROWS;
   const baseline = useVariantsStore((s) => (workflowId ? s.baselineByWorkflowId[workflowId] : undefined)) ?? null;
   const loaded = useVariantsStore((s) => (workflowId ? s.loadedWorkflowIds[workflowId] : false)) ?? false;
   const loading = useVariantsStore((s) => (workflowId ? s.loading[workflowId] : false)) ?? false;
   const error = useVariantsStore((s) => (workflowId ? s.error[workflowId] : null)) ?? null;
 
+  // Split ONCE per row-array identity: every caller but the manager wants the
+  // live set, and returning a fresh filtered array each render would defeat the
+  // memoized consumers downstream.
+  const variants = useMemo(() => allVariants.filter((v) => v.archived_at === null), [allVariants]);
+  const archivedVariants = useMemo(
+    () => allVariants.filter((v) => v.archived_at !== null),
+    [allVariants],
+  );
+
   useEffect(() => {
     if (workflowId) void fetchFn(workflowId);
   }, [workflowId, fetchFn]);
 
-  return { variants, baseline, loaded, loading, error };
+  return { variants, archivedVariants, baseline, loaded, loading, error };
 }

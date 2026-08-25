@@ -100,4 +100,54 @@ describe('useUnifiedPanelMessages', () => {
       expect(apiMocks.getJsonMessages).toHaveBeenCalledTimes(2);
     }, { timeout: 1_500 });
   });
+
+  it('retries a live refresh that arrives while the initial fetch is still in flight', async () => {
+    let resolveInitialConversation!: (value: { success: true; data: [] }) => void;
+    const initialConversation = new Promise<{ success: true; data: [] }>((resolve) => {
+      resolveInitialConversation = resolve;
+    });
+    apiMocks.getConversationMessages
+      .mockReset()
+      .mockReturnValueOnce(initialConversation)
+      .mockResolvedValue({
+        success: true,
+        data: [{
+          id: 1,
+          session_id: 'session-1',
+          message_type: 'user',
+          content: 'accepted while loading',
+          timestamp: '2026-08-18 18:03:29',
+        }],
+      });
+
+    const { result } = renderHook(() => useUnifiedPanelMessages('panel-1'));
+
+    await waitFor(() => {
+      expect(apiMocks.getJsonMessages).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('session-output-available', {
+        detail: { sessionId: 'session-1', panelId: 'panel-1' },
+      }));
+    });
+
+    // Let the debounced live loader run into the in-flight guard. Before the
+    // fix this notification was discarded and no second query ever happened.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(apiMocks.getJsonMessages).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveInitialConversation({ success: true, data: [] });
+      await initialConversation;
+    });
+
+    await waitFor(() => {
+      expect(apiMocks.getJsonMessages).toHaveBeenCalledTimes(2);
+      expect(result.current.messages).toHaveLength(1);
+      expect(result.current.messages[0].segments).toEqual([
+        { type: 'text', content: 'accepted while loading' },
+      ]);
+    });
+  });
 });

@@ -40,11 +40,21 @@ interface McpCallResponse {
   error?: { code: number; message: string };
 }
 
+/**
+ * Ceiling on a single bridge round trip. `fetch` has NO default timeout: a
+ * herder that accepts the connection and then never answers would leave the
+ * promise pending forever, and with it the caller's `polling` flag — the one
+ * way that guard can wedge a panel permanently instead of merely skipping a
+ * beat. Generous enough for a slow `fleet_read`, finite enough to recover.
+ */
+const BRIDGE_TIMEOUT_MS = 30_000;
+
 export class OmpBridgeHttpClient implements OmpBridgeClientLike {
   constructor(
     private readonly baseUrl: string,
     private readonly token: string,
     private readonly sessionId: string,
+    private readonly timeoutMs: number = BRIDGE_TIMEOUT_MS,
   ) {}
 
   async callTool(call: OmpBridgeToolCall): Promise<OmpBridgeCallResult> {
@@ -64,12 +74,18 @@ export class OmpBridgeHttpClient implements OmpBridgeClientLike {
           method: "tools/call",
           params: { name: call.name, arguments: call.arguments },
         }),
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
+      // An AbortSignal.timeout abort surfaces as a TimeoutError DOMException;
+      // name it so a wedged herder is distinguishable from a refused socket.
+      const timedOut = error instanceof Error && error.name === 'TimeoutError';
       return {
         ok: false,
         isError: true,
-        text: `bridge unreachable: ${error instanceof Error ? error.message : String(error)}`,
+        text: timedOut
+          ? `bridge timed out after ${this.timeoutMs}ms`
+          : `bridge unreachable: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
 

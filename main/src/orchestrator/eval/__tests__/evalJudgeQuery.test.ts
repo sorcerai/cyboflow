@@ -128,6 +128,42 @@ describe('makeEvalJudgeQuery', () => {
     await expect(fn({ prompt: 'p', schema: {} })).rejects.toBeInstanceOf(EvalJudgeTimeoutError);
   });
 
+  it('leaves the deadline at the base for a small diff', async () => {
+    install(makeBlockUntilAbortQuery());
+    const fn = makeEvalJudgeQuery(undefined, 5);
+    await expect(fn({ prompt: 'p', schema: {}, diffChars: 1_000 })).rejects.toThrow(
+      /timed out after 5ms/,
+    );
+  });
+
+  it('stretches the deadline for a large diff instead of firing at the base', async () => {
+    // The large-diff timeout fix: a juror grading a big diff must not be cut off at
+    // the small-diff wall. Fake timers so the stretched deadline is asserted without
+    // spending it.
+    vi.useFakeTimers();
+    try {
+      install(makeBlockUntilAbortQuery());
+      const fn = makeEvalJudgeQuery(undefined, 5);
+      // 120k chars => 2 steps of headroom over the 5ms base.
+      const p = fn({ prompt: 'p', schema: {}, diffChars: 120_000 }).catch((err) => err as Error);
+      let settled = false;
+      void p.then(() => {
+        settled = true;
+      });
+
+      // Well past the BASE deadline; the stretched one has not arrived.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(600_000);
+      const err = await p;
+      expect(err).toBeInstanceOf(EvalJudgeTimeoutError);
+      expect((err as Error).message).toMatch(/timed out after 600005ms/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('throws the distinct EvalJudgeMaxTurnsError when the judge exhausts maxTurns without structured output', async () => {
     // Previously this drained to `return null` and masqueraded downstream as
     // "judge sample is not an object" — a parse-shaped error that drew a

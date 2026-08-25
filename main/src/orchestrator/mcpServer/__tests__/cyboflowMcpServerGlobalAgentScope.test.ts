@@ -107,7 +107,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<Re
 }
 
 describe('cyboflowMcpServer ListTools (CYBOFLOW_MCP_SCOPE=global-agent)', () => {
-  it('advertises EXACTLY the 12-tool global-agent family — no run-scoped tool leaks in', async () => {
+  it('advertises EXACTLY the 13-tool global-agent family — no run-scoped tool leaks in', async () => {
     const tools = await listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
@@ -118,6 +118,7 @@ describe('cyboflowMcpServer ListTools (CYBOFLOW_MCP_SCOPE=global-agent)', () => 
         'cyboflow_fs_grep',
         'cyboflow_fs_list',
         'cyboflow_fs_read',
+        'cyboflow_history',
         'cyboflow_overview',
         'cyboflow_propose_action',
         'cyboflow_queue',
@@ -141,6 +142,22 @@ describe('cyboflowMcpServer ListTools (CYBOFLOW_MCP_SCOPE=global-agent)', () => 
     expect(description).toContain('never executes');
     expect(description).toContain('confirm');
     expect(description).toContain('stop');
+  });
+
+  it('cyboflow_history declares every argument optional and pins its role enum', async () => {
+    const tools = await listTools();
+    const history = tools.find((t) => t.name === 'cyboflow_history');
+    expect(history).toBeDefined();
+    expect(history!.inputSchema.required).toEqual([]);
+    expect(history!.inputSchema.properties['role'].enum).toEqual(['user', 'assistant']);
+    expect(Object.keys(history!.inputSchema.properties).sort()).toEqual(
+      ['before_id', 'days_back', 'limit', 'query', 'role'].sort(),
+    );
+    // The promptable half of the contract: it must tell the model this is its
+    // own long-term memory and that it should search before disclaiming.
+    const description = history!.description.toLowerCase();
+    expect(description).toContain('long-term memory');
+    expect(description).toContain("never claim you don't remember without searching first");
   });
 
   it('cyboflow_workflow requires workflow_id and cyboflow_entity requires task_id', async () => {
@@ -213,6 +230,26 @@ describe('cyboflowMcpServer CallTool (CYBOFLOW_MCP_SCOPE=global-agent)', () => {
     expect(await callTool('cyboflow_fs_grep', { path: '/some/project' })).toMatchObject({ error: 'invalid_arguments' });
     expect(await callTool('cyboflow_fs_grep', { pattern: 'foo' })).toMatchObject({ error: 'invalid_arguments' });
     const valid = await callTool('cyboflow_fs_grep', { pattern: 'foo', path: '/some/project', glob: '*.ts' });
+    expect(valid.error).toBe('[Cyboflow MCP] IPC client not connected');
+  });
+
+  it('cyboflow_history takes no required args, rejects a malformed role/limit, and dispatches a valid call', async () => {
+    // Every argument is optional — a bare call must reach the query layer.
+    expect((await callTool('cyboflow_history', {})).error).toBe('[Cyboflow MCP] IPC client not connected');
+
+    expect(await callTool('cyboflow_history', { role: 'nobody' })).toMatchObject({ error: 'invalid_arguments' });
+    expect(await callTool('cyboflow_history', { limit: 'ten' })).toMatchObject({ error: 'invalid_arguments' });
+    expect(await callTool('cyboflow_history', { query: 42 })).toMatchObject({ error: 'invalid_arguments' });
+    expect(await callTool('cyboflow_history', { days_back: '7' })).toMatchObject({ error: 'invalid_arguments' });
+    expect(await callTool('cyboflow_history', { before_id: 'abc' })).toMatchObject({ error: 'invalid_arguments' });
+
+    const valid = await callTool('cyboflow_history', {
+      query: 'release',
+      role: 'assistant',
+      days_back: 7,
+      before_id: 900,
+      limit: 5,
+    });
     expect(valid.error).toBe('[Cyboflow MCP] IPC client not connected');
   });
 

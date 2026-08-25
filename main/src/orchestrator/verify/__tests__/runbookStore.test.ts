@@ -529,3 +529,121 @@ describe('VerifyRunbookStore fail-soft on a pre-096 DB', () => {
     h.db.close();
   });
 });
+
+/**
+ * `statusDetail()` — the situation behind the three-valued answer
+ * (lane-runbook-bootstrap.md §4).
+ *
+ * The suite above proves the ANSWERS are right. This one exists because three
+ * distinct situations answer `'unproven-draft'` and two answer `'absent'`, and
+ * a caller that intends to WRITE — a bootstrap that would `registerDraft` over
+ * the singleton (project, modality) row — has to tell them apart. The load
+ * bearing case is `'proven-file-absent-here'`: the record is live, proven, and
+ * shared with every other tree, and a caller that read only the collapsed
+ * `'unproven-draft'` would overwrite it.
+ *
+ * Every case also asserts that `status()` projects to the same answer, so the
+ * gate's view and a writer's view cannot drift apart.
+ */
+describe('VerifyRunbookStore.statusDetail', () => {
+  it('no record and no file is no-record', async () => {
+    const h = makeHarness();
+    expect(await h.store.statusDetail(1, '/tmp/empty', 'web')).toEqual({
+      status: 'absent',
+      reason: 'no-record',
+    });
+    expect(await h.store.status(1, '/tmp/empty', 'web')).toBe('absent');
+    h.db.close();
+  });
+
+  it('no record but a declaring file in THIS tree is file-only, not no-record', async () => {
+    const h = makeHarness();
+    // A teammate's committed runbook, freshly cloned: adopt-and-prove, not
+    // author-a-competing-one. Same 'unproven-draft' answer as a draft record.
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'unproven-draft',
+      reason: 'file-only',
+    });
+    expect(await h.store.status(1, WORKTREE, 'web')).toBe('unproven-draft');
+    expect(persistedStatus(h.db)).toBeUndefined();
+    h.db.close();
+  });
+
+  it('an unproven record is draft', async () => {
+    const h = makeHarness();
+    await h.store.registerDraft(1, WORKTREE, 'web');
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'unproven-draft',
+      reason: 'draft',
+    });
+    h.db.close();
+  });
+
+  it('a PROVEN record whose file this tree lacks is proven-file-absent-here, and stays proven', async () => {
+    const h = makeHarness();
+    await proveWeb(h);
+
+    // THE case a writing caller must never act on — the pre-merge state. The
+    // collapsed answer is indistinguishable from 'draft'; the reason is not.
+    expect(await h.store.statusDetail(1, '/tmp/wt-b', 'web')).toEqual({
+      status: 'unproven-draft',
+      reason: 'proven-file-absent-here',
+    });
+    expect(persistedStatus(h.db)).toBe('proven');
+
+    // And the tree that carries it still reads proven, for both views.
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'proven',
+      reason: 'proven',
+    });
+    expect(await h.store.status(1, WORKTREE, 'web')).toBe('proven');
+    h.db.close();
+  });
+
+  it.each([
+    ['portable hash drift', (h: Harness) => h.files.set(WORKTREE, JSON.stringify({
+      ...baseRunbook(),
+      modalities: { ...baseRunbook().modalities, web: { ...baseRunbook().modalities.web!, build: ['pnpm build:other'] } },
+    }))],
+    ['project input drift', (h: Harness) => { h.state.inputHash = 'inputs-v2'; }],
+    ['host fingerprint drift', (h: Harness) => { h.state.fingerprint = 'host-v2'; }],
+    ['an unparseable portable file', (h: Harness) => h.files.set(WORKTREE, '{ not json')],
+  ])('%s reports drifted and demotes the record', async (_label, mutate) => {
+    const h = makeHarness();
+    await proveWeb(h);
+    mutate(h);
+
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'unproven-draft',
+      reason: 'drifted',
+    });
+    // 'drifted' is the one reason that has already spent the proof — unlike
+    // 'proven-file-absent-here', there is nothing left here to protect.
+    expect(persistedStatus(h.db)).toBe('unproven-draft');
+    h.db.close();
+  });
+
+  it('an unobservable input hash is indeterminate, NOT no-record', async () => {
+    const h = makeHarness();
+    await proveWeb(h);
+    h.state.inputHash = null;
+
+    // Both collapse to 'absent', but "I could not look" is not "nothing is
+    // there" — and the record is still proven underneath.
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'absent',
+      reason: 'indeterminate',
+    });
+    expect(persistedStatus(h.db)).toBe('proven');
+    h.db.close();
+  });
+
+  it('a pre-096 DB is indeterminate, NOT no-record', async () => {
+    const h = makeHarness(buildPre096Db());
+    expect(await h.store.statusDetail(1, WORKTREE, 'web')).toEqual({
+      status: 'absent',
+      reason: 'indeterminate',
+    });
+    h.db.close();
+  });
+});

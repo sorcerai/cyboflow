@@ -24,14 +24,20 @@
 import { MODEL_OPTIONS, modelDisplayLabel } from '../cyboflow/unified/ModelPill';
 import { PERMISSION_MODE_OPTIONS } from '../cyboflow/AgentPermissionModeSelector';
 import { DEFAULT_CODEX_MODEL } from '../cyboflow/ModelSelector';
-import { isCodexModelFamily, isCodexModelSelection } from '../../../../shared/types/agentModels';
 import {
+  isCodexModelFamily,
+  isCodexModelSelection,
+  isOmpModelFamily,
+} from '../../../../shared/types/agentModels';
+import {
+  AGENT_RUNTIME_LABELS as SESSION_AGENT_RUNTIME_LABELS,
   DEFAULT_SESSION_AGENT_RUNTIME,
   SESSION_AGENT_RUNTIMES,
   WORKFLOW_LAUNCHABLE_RUNTIMES,
   claudeRuntimeFromSubstrate,
   providerForRuntime,
   substrateForRuntime,
+  type AgentProvider,
   type AgentRuntime,
 } from '../../../../shared/types/agentRuntime';
 import { isRuntimeSelectableInPickers } from '../../../../shared/types/agentCapabilities';
@@ -104,25 +110,20 @@ const SUBSTRATE_LABELS: Record<CliSubstrate, string> = {
 };
 
 /**
- * Local label map because `shared/types/agentRuntime` only exports
- * WORKFLOW_AGENT_RUNTIME_LABELS (the LAUNCHABLE subset) and the quick-session
- * key can legitimately store a PTY runtime. Kept in the same wording as that map
- * so the two read as one family.
+ * The runtime labels this screen renders. Every SESSION runtime comes straight
+ * from the shared {@link SESSION_AGENT_RUNTIME_LABELS} — the same map
+ * `SubstrateSelector` and the wizard's launch summary read — so a rename lands
+ * on every picker at once instead of drifting between Settings and the launch
+ * surfaces (this map used to be a hand-kept copy, and did drift).
+ *
+ * `codex-exec` is the one member the shared map cannot carry: it is headless, so
+ * it is not a `SessionAgentRuntime` at all and reaches no picker. It is named
+ * here only because this map is keyed over the FULL `AgentRuntime` union — a
+ * stored value read back off config.json could still name it.
  */
 const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
-  'claude-sdk': 'Claude SDK',
-  'claude-interactive': 'Claude interactive',
-  'codex-sdk': 'Codex SDK',
-  'codex-pty': 'Codex terminal',
+  ...SESSION_AGENT_RUNTIME_LABELS,
   'codex-exec': 'Codex exec',
-  // `omp-sdk` is offerable on BOTH key kinds now that it is launchable;
-  // `omp-pty` stays quick-session-only, exactly as `codex-pty` does. The
-  // fallback for a missing key is the raw runtime id, so every member is named.
-  'omp-sdk': 'OMP',
-  'omp-pty': 'OMP terminal',
-  // Quick-session-only remote supervisor (omp-phase4-coexistence-adr.md §5) —
-  // same wording as the shared AGENT_RUNTIME_LABELS entry.
-  'omp-fleet': 'OMP fleet',
 };
 
 /**
@@ -136,6 +137,62 @@ const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
 export function agentRuntimeOptions(key: string): readonly AgentRuntime[] {
   const forKind = isQuickRunTypeKey(key) ? SESSION_AGENT_RUNTIMES : WORKFLOW_LAUNCHABLE_RUNTIMES;
   return forKind.filter((runtime) => isRuntimeSelectableInPickers(runtime));
+}
+
+/** The OMP runtimes that run OMP on THIS machine, as opposed to supervising a remote fleet. */
+const LOCAL_OMP_RUNTIMES: ReadonlySet<AgentRuntime> = new Set(['omp-sdk', 'omp-pty']);
+
+/**
+ * {@link agentRuntimeOptions} narrowed to the OMP flavor this install actually
+ * runs — the same rule `SubstrateSelector` applies, so Settings and the launch
+ * picker cannot disagree about which OMP exists here.
+ *
+ * The two flavors are ALTERNATIVES: Aria mode supervises a remote fleet
+ * (`omp-fleet`), everything else runs OMP locally (`omp-sdk`/`omp-pty`). Never
+ * both.
+ *
+ * `omp-fleet` is offered on ARIA MODE ALONE. It used to also require
+ * `launchable`, which meant an Aria install with no bridge showed NO OMP row at
+ * all — the local runtimes are hidden precisely because Aria is on. The caller
+ * renders it DISABLED with the reason instead (see
+ * {@link runtimeUnavailableReason}), so the row explains itself rather than
+ * vanishing while the provider toggle still reads "on".
+ *
+ * `current` is preserved unconditionally. A value already stored for this key
+ * must stay in its own dropdown even when the flavor would hide it: a `<select>`
+ * whose list omits its own value renders blank and would rewrite the stored
+ * override the next time any OTHER field on the screen is saved. Flipping the
+ * toggle changes what you can PICK, never what is already stored.
+ *
+ * NOTE: deliberately separate from `agentRuntimeOptions`, which stays the pure
+ * launch-KIND coercion the baseline math depends on (`runTypeBaseline`). Flavor
+ * is a display concern; folding it into the coercion would move baselines — and
+ * therefore every diff chip — when the toggle flips.
+ */
+export function agentRuntimePickerOptions(
+  key: string,
+  omp: { launchable: boolean; ariaMode: boolean },
+  current?: string | null,
+): readonly AgentRuntime[] {
+  return agentRuntimeOptions(key).filter((runtime) => {
+    if (runtime === current) return true;
+    if (runtime === 'omp-fleet') return omp.ariaMode;
+    if (LOCAL_OMP_RUNTIMES.has(runtime)) return !omp.ariaMode;
+    return true;
+  });
+}
+
+/**
+ * Why an OFFERED runtime cannot be selected on this machine, or null when it
+ * can. Mirrors `SubstrateSelector.unavailableReason` so the two pickers give the
+ * same answer for the same install.
+ */
+export function runtimeUnavailableReason(
+  runtime: AgentRuntime,
+  omp: { launchable: boolean; ariaMode: boolean },
+): string | null {
+  if (runtime === 'omp-fleet' && !omp.launchable) return 'bridge not configured';
+  return null;
 }
 
 /** The model aliases the picker offers (single-sourced with the composer pill). */
@@ -506,42 +563,80 @@ export function effectiveRuntimeForDraft(
   return draft.agentRuntime ?? baseline.agentRuntime;
 }
 
-/** True when the draft would launch on the Codex provider. */
-export function draftUsesCodexRuntime(
+/** The provider the draft would actually launch on. */
+export function draftRuntimeProvider(
   draft: RunTypeDraft,
   baseline: RunTypeBaseline,
-): boolean {
-  return providerForRuntime(effectiveRuntimeForDraft(draft, baseline)) === 'codex';
+): AgentProvider {
+  return providerForRuntime(effectiveRuntimeForDraft(draft, baseline));
+}
+
+/**
+ * True when a model value is usable on a CLAUDE runtime — i.e. no OTHER
+ * provider's family claims it. Stated as an exclusion, matching
+ * `normalizeAgentModelSelection`'s own rule ("drop a value another provider's
+ * family claims", agentModels.ts): the Claude catalog is fetched per login and
+ * contains ids no static predicate recognizes, so "keep only what
+ * `isClaudeModelFamily` claims" would silently discard every dynamic row.
+ */
+function isClaudeUsableModel(model: string): boolean {
+  return !isCodexModelFamily(model) && !isOmpModelFamily(model);
 }
 
 /**
  * The same-family projection of one model value for `runtime`.
  *
- * `null` means "follow defaults", which is only expressible on the CLAUDE side:
- * an omitted `model` member resolves to the (always-Claude) floor at launch, so
- * under a Codex runtime "follow defaults" IS the cross-family combination — it
- * is replaced with the explicit Codex sentinel instead. This mirrors
- * `ModelSelector`, whose `allowDefaultOption` is likewise Claude-path only.
+ * `null` means "follow defaults" — an OMITTED `model` member, which resolves to
+ * the (always-Claude) per-kind floor at launch. Whether that is expressible
+ * depends on the provider, and the three answers differ for real reasons:
  *
- * `fallbackModel` is what a Codex value degrades to on a Claude runtime (and
- * what a `null` degrades FROM on a Codex one). It is deliberately the bare model
- * string rather than a `RunTypeBaseline`: this function only ever read
- * `baseline.model`, and the GLOBAL rung (Settings → "Default Launch Model") has
- * no baseline above it — only the hardcoded floor — yet must enforce exactly
- * this invariant. Taking the fallback directly is what lets both rungs share ONE
- * coercion instead of growing a second near-identical copy.
+ *   - **Claude** — expressible: the floor IS a Claude model.
+ *   - **Codex** — NOT expressible: the floor would be a Claude alias under a
+ *     Codex runtime, i.e. the cross-family pair itself. Codex advertises an
+ *     explicit `auto` sentinel, so `null` is replaced with it.
+ *   - **OMP** — expressible again, though for a different reason than Claude's:
+ *     OMP advertises NO "let the runtime pick" sentinel (`ompModelCatalogStore`),
+ *     so absence is the only way to say it. It is safe because the floor that
+ *     leaks through is dropped downstream — `resolveAgentModelAlias('omp', …)`
+ *     runs `normalizeAgentModelSelection`, which discards a Claude-family value
+ *     under the omp provider, leaving OMP on its own default. So "follow
+ *     defaults" under OMP genuinely means "OMP's default model".
+ *
+ * A concrete cross-family value degrades to `fallbackModel` on Claude and to
+ * the Codex sentinel on Codex. On OMP it degrades to `null`: OMP's catalog is
+ * fetched per host (495 models on this one), so there is no static id to invent,
+ * and "let OMP choose" is the honest thing to fall back to.
+ *
+ * `fallbackModel` is deliberately the bare model string rather than a
+ * `RunTypeBaseline`: this function only ever read `baseline.model`, and the
+ * GLOBAL rung (Settings → "Default Launch Model") has no baseline above it —
+ * only the hardcoded floor — yet must enforce exactly this invariant. Taking the
+ * fallback directly is what lets both rungs share ONE coercion instead of
+ * growing a second near-identical copy. It is itself re-checked before being
+ * handed back, because it can legitimately name ANOTHER provider's model (a
+ * per-type baseline inherits the global rung, which may be a Codex or OMP pick).
  */
 export function coerceModelForRuntime(
   model: string | null,
   runtime: AgentRuntime,
   fallbackModel: string,
 ): string | null {
-  if (providerForRuntime(runtime) === 'codex') {
-    const effective = model ?? fallbackModel;
-    return isCodexModelSelection(effective) ? effective : DEFAULT_CODEX_MODEL;
+  switch (providerForRuntime(runtime)) {
+    case 'codex': {
+      const effective = model ?? fallbackModel;
+      return isCodexModelSelection(effective) ? effective : DEFAULT_CODEX_MODEL;
+    }
+    case 'omp': {
+      if (model === null) return null;
+      if (isOmpModelFamily(model)) return model;
+      return isOmpModelFamily(fallbackModel) ? fallbackModel : null;
+    }
+    case 'claude': {
+      if (model === null) return null;
+      if (isClaudeUsableModel(model)) return model;
+      return isClaudeUsableModel(fallbackModel) ? fallbackModel : null;
+    }
   }
-  if (model === null) return null;
-  return isCodexModelFamily(model) ? fallbackModel : model;
 }
 
 /**
@@ -658,9 +753,13 @@ function effectiveGlobalRuntime(runtime: AgentRuntime | undefined): AgentRuntime
   return runtime ?? DEFAULT_SESSION_AGENT_RUNTIME;
 }
 
-/** True when the global rung would launch on the Codex provider. */
-export function globalRuntimeUsesCodex(runtime: AgentRuntime | undefined): boolean {
-  return providerForRuntime(effectiveGlobalRuntime(runtime)) === 'codex';
+/**
+ * The provider the GLOBAL rung would launch on. The model controls scope to
+ * THIS — every provider ships its own catalog, and Settings must not offer a
+ * model the launch would drop.
+ */
+export function globalRuntimeProvider(runtime: AgentRuntime | undefined): AgentProvider {
+  return providerForRuntime(effectiveGlobalRuntime(runtime));
 }
 
 /**

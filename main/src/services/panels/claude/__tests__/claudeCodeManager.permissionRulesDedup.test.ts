@@ -47,7 +47,7 @@ vi.mock('../../../../orchestrator/permissionRules', async (orig) => {
   const actual = await orig<typeof import('../../../../orchestrator/permissionRules')>();
   return {
     ...actual,
-    loadMergedPermissionRules: vi.fn(() => ({ allow: [] as string[], deny: [] as string[] })),
+    loadMergedPermissionRules: vi.fn(() => ({ allow: [] as string[], deny: [] as string[], ask: [] as string[] })),
   };
 });
 

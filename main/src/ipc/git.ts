@@ -1,9 +1,7 @@
 import { IpcMain } from 'electron';
 import type { AppServices } from './types';
-import { execSync } from '../utils/commandExecutor';
-import { runGitAsync } from '../utils/runGit';
-import { buildGitCommitCommand, escapeShellArg } from '../utils/shellEscape';
-import { isCommitFooterEnabled } from '../utils/commitFooter';
+import { runGit, runGitAsync, END_OF_OPTIONS } from '../utils/runGit';
+import { appendCommitFooter } from '../utils/commitFooter';
 import { panelManager } from '../services/panelManager';
 import { mainWindow } from '../index';
 import { panelEventBus } from '../services/panelEventBus';
@@ -15,9 +13,15 @@ import type { ExecException } from 'child_process';
 import { TaskChangeRouter } from '../orchestrator/taskChangeRouter';
 import { ArtifactRouter } from '../orchestrator/artifactRouter';
 import { SprintLaneStore } from '../orchestrator/sprintLaneStore';
-import { stampSessionRunsOutcome, stampSessionRunsPrOpen } from '../orchestrator/runRecovery';
+import {
+  stampSessionRunsOutcome,
+  stampSessionRunsPrOpen,
+  stampSessionRunsCompleted,
+  sessionDeliveredWork,
+} from '../orchestrator/runRecovery';
 import { trackUsage } from '../services/telemetry';
 import { makeDatabaseLike } from '../orchestrator/loggerAdapter';
+import { ALREADY_UP_TO_DATE_CODE } from '../services/worktreeManager';
 
 // Extended type for git system virtual panels
 type SystemPanelType = ToolPanelType | 'git';
@@ -29,6 +33,19 @@ interface GitError extends Error {
   workingDirectory?: string;
   projectPath?: string;
   originalError?: Error;
+}
+
+/**
+ * Whether a thrown merge error is the "branch has nothing left to give main"
+ * case (WorktreeManager tags it with ALREADY_UP_TO_DATE_CODE and carries the tag
+ * through its GitError wrap). Matched on the code, never the message.
+ */
+function isAlreadyUpToDate(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: string }).code === ALREADY_UP_TO_DATE_CODE
+  );
 }
 
 // Interface for process errors that have stdout/stderr properties
@@ -564,26 +581,22 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       }
 
       // Check if there are any changes to commit
-      const status = execSync('git status --porcelain', { 
-        cwd: session.worktreePath,
-        encoding: 'utf-8'
-      }).trim();
+      const status = runGit(session.worktreePath, ['status', '--porcelain']).trim();
 
       if (!status) {
         return { success: false, error: 'No changes to commit' };
       }
 
       // Stage all changes
-      execSync('git add -A', { cwd: session.worktreePath });
+      runGit(session.worktreePath, ['add', '-A']);
 
-      // Create the commit with Cyboflow's signature using safe escaping
-      const commitCommand = buildGitCommitCommand(message, isCommitFooterEnabled(configManager));
+      // Create the commit with Cyboflow's signature. The message is a plain argv
+      // element, so it needs no shell escaping.
+      const commitMessage = appendCommitFooter(message, configManager);
 
       try {
-        execSync(commitCommand, { 
-          cwd: session.worktreePath
-        });
-        
+        runGit(session.worktreePath, ['commit', '-m', commitMessage]);
+
         // Refresh git status for this session after commit
         await refreshGitStatusForSession(sessionId);
         
@@ -1052,7 +1065,7 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       // Check if we're actually in a rebase state (could have been pre-detected conflicts)
       // Try to abort any existing rebase, but don't fail if there isn't one
       try {
-        const statusOutput = execSync('git status --porcelain=v1', { cwd: session.worktreePath }).toString();
+        const statusOutput = runGit(session.worktreePath, ['status', '--porcelain=v1']);
         if (statusOutput.includes('rebase')) {
           await worktreeManager.abortRebase(session.worktreePath);
           
@@ -1252,6 +1265,10 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       const gitError = error as GitError;
       return {
         success: false,
+        // The branch had nothing left to give main — almost always because the
+        // work was already landed by hand (the agent merged it in chat). That is
+        // not a failure, so the dialog offers Mark complete instead of an error.
+        alreadyUpToDate: isAlreadyUpToDate(error),
         error: error instanceof Error ? error.message : 'Failed to squash and merge worktree to main',
         gitError: {
           commands: gitError.gitCommands,
@@ -1371,6 +1388,9 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       // Pass detailed git error information to frontend
       return {
         success: false,
+        // See the squash handler: an already-landed branch is a Mark-complete
+        // prompt, not a merge failure.
+        alreadyUpToDate: isAlreadyUpToDate(error),
         error: error instanceof Error ? error.message : 'Failed to merge worktree to main',
         gitError: {
           commands: gitError.gitCommands,
@@ -1564,6 +1584,85 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
   });
 
   /**
+   * Whether this session's work has been DELIVERED, answered from both sides:
+   *
+   *   delivered — a run this session hosted carries a DELIVERED_RUN_OUTCOMES
+   *               stamp (our own merge / create-PR path ran).
+   *   landed    — git says the branch has nothing left to give main
+   *               (WorktreeManager.getBranchLandingState), which is how the
+   *               "the agent merged it in chat" case is visible at all.
+   *
+   * Read by the dismiss dialog: either signal turns Dismiss into a choice
+   * between Mark complete and dismissing anyway, because dismissing a session
+   * whose code IS in the tree also throws away findings that still apply.
+   * Fail-soft on every axis — an unreadable worktree reports landed=false and
+   * the operator simply gets the plain confirmation.
+   */
+  ipcMain.handle('sessions:get-delivery-state', async (_event, sessionId: string) => {
+    try {
+      const session = await sessionManager.getSession(sessionId);
+      if (!session) {
+        return { success: false, error: 'Session not found' };
+      }
+
+      const delivered = sessionDeliveredWork(makeDatabaseLike(databaseService), sessionId);
+
+      let landed = false;
+      let ownCommits = 0;
+      const project = sessionManager.getProjectForSession(sessionId);
+      if (session.worktreePath && project) {
+        try {
+          const mainBranch = await worktreeManager.getProjectMainBranch(project.path);
+          const state = await worktreeManager.getBranchLandingState(session.worktreePath, mainBranch);
+          landed = state.landed;
+          ownCommits = state.ownCommits;
+        } catch (error) {
+          console.error(`[IPC:git] landing probe failed for session ${sessionId}:`, error);
+        }
+      }
+
+      return { success: true, data: { delivered, landed, ownCommits } };
+    } catch (error: unknown) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to read session delivery state',
+      };
+    }
+  });
+
+  /**
+   * Record that this session's work LANDED by a path we never observed — the
+   * agent merged it in chat, or the branch was merged outside the app.
+   *
+   * Stamps outcome='completed' on the session's runs, reusing
+   * stampSessionRunsOutcome's `outcome IS NULL` guard so a run that already
+   * recorded its own decision is never clobbered. This is a bookkeeping stamp
+   * ONLY: it archives nothing and touches no git. The caller archives the
+   * session afterwards through the normal delete path, and because delivery is
+   * now stamped, that archive keeps the session's findings instead of sweeping
+   * them.
+   */
+  ipcMain.handle('sessions:mark-complete', async (_event, sessionId: string) => {
+    try {
+      const session = await sessionManager.getSession(sessionId);
+      if (!session) {
+        return { success: false, error: 'Session not found' };
+      }
+
+      const stamped = stampSessionRunsCompleted(makeDatabaseLike(databaseService), sessionId);
+      console.log(`[IPC:git] Marked session ${sessionId} complete (stamped ${stamped} run(s))`);
+      trackUsage('session_resolved', { action: 'complete' });
+      return { success: true, data: { stamped } };
+    } catch (error: unknown) {
+      console.error(`[IPC:git] Failed to mark session ${sessionId} complete:`, error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to mark session complete',
+      };
+    }
+  });
+
+  /**
    * Subjects of the session branch's OWN commits (mainBranch..HEAD in the
    * worktree), newest first. Used by the merge dialog to prefill the squash
    * commit message — unlike sessions:get-last-commits this never includes
@@ -1582,10 +1681,9 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       }
 
       const mainBranch = await worktreeManager.getProjectMainBranch(project.path);
-      const output = execSync(`git log --pretty=%s ${escapeShellArg(mainBranch)}..HEAD`, {
-        cwd: session.worktreePath,
-        encoding: 'utf8',
-      }).toString().trim();
+      const output = runGit(session.worktreePath, [
+        'log', '--pretty=%s', END_OF_OPTIONS, `${mainBranch}..HEAD`,
+      ]).trim();
       const subjects = output.length > 0 ? output.split('\n') : [];
       return { success: true, data: { subjects } };
     } catch (error) {
@@ -1678,10 +1776,7 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
       const mainBranch = await worktreeManager.getProjectMainBranch(project.path);
 
       // Get current branch name
-      const currentBranch = execSync('git branch --show-current', { 
-        cwd: session.worktreePath,
-        encoding: 'utf8' 
-      }).trim();
+      const currentBranch = runGit(session.worktreePath, ['branch', '--show-current']).trim();
 
       const originBranch = session.isMainRepo
         ? await worktreeManager.getOriginBranch(session.worktreePath, mainBranch)
@@ -1719,15 +1814,9 @@ export function registerGitHandlers(ipcMain: IpcMain, services: AppServices): vo
         return { success: false, error: 'Session or worktree path not found' };
       }
 
-      const remoteUrl = execSync('git remote get-url origin', {
-        cwd: session.worktreePath,
-        encoding: 'utf8',
-      }).trim();
+      const remoteUrl = runGit(session.worktreePath, ['remote', 'get-url', 'origin']).trim();
 
-      const branchName = execSync('git branch --show-current', {
-        cwd: session.worktreePath,
-        encoding: 'utf8',
-      }).trim();
+      const branchName = runGit(session.worktreePath, ['branch', '--show-current']).trim();
 
       return { success: true, data: { remoteUrl, branchName } };
     } catch (error) {

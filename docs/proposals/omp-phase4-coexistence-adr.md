@@ -97,18 +97,67 @@ the documented next step.
 
 ## 5. Availability + gating (concrete)
 
+- **Aria mode is the grant + the flavor switch.** `AppConfig.ariaMode`
+  (Settings → Advanced Options → OMP Runtime) answers both "does this install
+  supervise a REMOTE fleet or run OMP locally" and "is Cyboflow authorized to
+  drive it". `omp-fleet` and `omp-sdk`/`omp-pty` are ALTERNATIVES — a panel is
+  either a local OMP process or a supervised remote worker — so the picker
+  offers one flavor or the other, never both. `CYBOFLOW_OMP_SUPERVISE` remains
+  an override for headless/CI hosts with no Settings UI; the two are OR-ed.
+  Requiring a shell variable to switch on a desktop feature was a real usability
+  failure, not a security property: reachability of the bridge and authorization
+  to drive it stay separate questions, but the operator answers the second one
+  by clicking, not by exporting.
 - **Fail-closed config:** `OmpSessionManager` is constructed **only** when
-  `resolveOmpBridgeCommandConfig()` resolves. Unresolved ⇒ no manager instance ⇒ dispatch
-  returns `unavailable` and the picker omits the entry. A half-configured bridge must
-  never silently authorize a session.
+  `resolveOmpBridgeCommandConfig()` resolves **and** the boot principal holds
+  `omp:supervise`. Either one missing ⇒ no manager instance ⇒ dispatch returns
+  `unavailable` and the picker omits the entry. A half-configured bridge must never
+  silently authorize a session, and a *fully* configured one must not either: config
+  says the fleet is REACHABLE, the capability says this operator authorized Cyboflow to
+  drive it. Those are different questions and both have to answer yes.
 - **Provider access toggle:** `AGENT_PROVIDERS` gains `'omp'`, so the existing
   `AgentProviderAccess` toggle system works for OMP with zero new gating code. The OMP
   entry is visible **only if** `isAgentProviderEnabled(access, 'omp')` **AND** the bridge
   config resolved.
-- **Capability:** the manager's `OmpCommandAdapter` is the supervise-authorized one; the
-  renderer-facing `hasSupervise` gate is untouched.
+- **`cyboflow.omp.availability` reports the manager, not the config.** It asks whether
+  the boot-built `OmpSessionManager` EXISTS rather than re-deriving
+  `resolveOmpBridgeCommandConfig()`. Re-deriving would let the picker offer OMP fleet the
+  instant Aria mode is toggled while dispatch still answered "the bridge is not
+  configured" until the next launch; asking the manager keeps the picker and the dispatch
+  seam telling one story. `ariaMode` rides the same probe and IS live, because the flavor
+  split is pure presentation.
+- **Capability:** enforcement is **structural, not by convention**. Every adapter handed
+  to a caller — the tRPC context's and the session manager's alike — is wrapped in
+  `OmpSupervisedAdapter`, which capability-checks all eight verbs and audits the six
+  mutating ones (ATTEMPTED + COMPLETED, correlated on `operationId`). The two read-only
+  poll verbs are gated but deliberately unaudited: at `OMP_DEFAULT_POLL_MS` per live
+  panel they would bury the mutation trail.
+
+  This replaces an earlier arrangement in which only the `ompCommand` router checked
+  `hasSupervise`. `OmpSessionManager` drives the SAME privileged surface from the panel
+  seams, so a bare adapter put the product's actual path outside the authorization model:
+  spawn and kill ran unchecked and unaudited while the router answered FORBIDDEN for the
+  same verbs. Wrapping is what makes "workers never receive the supervise surface" a
+  property of the type rather than a rule each new seam has to remember.
+- **Loopback is checked by parsed hostname**, not string prefix. The config carries a
+  bearer token the client sends to whatever host it names, and
+  `startsWith('http://127.0.0.1')` accepts `http://127.0.0.1.evil.example/`. The token
+  file's owner-only mode is enforced rather than assumed.
+- **Teardown is explicit.** OMP workers are REMOTE: nothing about a panel closing, a
+  session being dismissed, or the app quitting stops them. Dismiss and `before-quit` both
+  call into the fleet manager directly, because `resolvePanelLane` maps these
+  `'claude'`-typed panels onto the `omp-sdk` lane whose manager never spawned them.
 
 ## 6. Consequences / increments
+
+**Storage:** the `omp-fleet` runtime is admitted on `sessions.agent_runtime` and
+`workflow_runs.agent_runtime` by migration **105**, which reuses 103's additive
+DROP/re-ADD-column recipe. It is deliberately NOT a table rebuild: the migration ledger
+is keyed by filename, so a new file numbered into a gap below an already-released
+migration runs LAST on an upgraded DB, and a hardcoded `CREATE TABLE sessions` there
+drops every column it fails to list (`status_message`, added imperatively by
+`database.ts`, is the live example) and restates 103's CHECK lists from memory —
+un-widening `omp-sdk`/`omp-pty` on exactly the installs that use them.
 
 **Status:** increment 1 (types) and increment 2 (adapter `send`/`read`/`state`) are
 landed and gate-green. Increments 3-5 are pending.

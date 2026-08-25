@@ -297,7 +297,7 @@ approval mode is set so that a missing/unloaded gate **fails closed**, never ope
 |---|---|---|
 | `default` | `always-ask` | apply cyboflow's predicate: auto-allow reads; everything else → orch-socket → ApprovalRouter |
 | `acceptEdits` | `always-ask` | as above, plus auto-allow exactly cyboflow's edit-tool set (never OMP's write tier) |
-| `auto` | `always-ask` | as above, plus the merged permission-rule allowlist |
+| `auto` | `always-ask` | **INVERTED (revised 2026-08-16):** allow unless the call trips a hazard table — `gate/ompGateExtension.ts`'s `isAutoModeAllowedTool` / `isAutoModeAllowedBashCommand`, plus the merged permission-rule allowlist. As SHIPPED originally this row read "acceptEdits + allowlist", which made OMP's `auto` strictly narrower than the same word on Claude (whose `auto` installs no hook at all and lets the native classifier decide): every ordinary build command — `pnpm test`, `mkdir -p`, `node scripts/x.mjs` — still blocked on a human. The hazard tables are the classifier's stand-in. Rules 1-3 and the URI-scheme narrowing are unchanged, and `default`/`acceptEdits` keep the prove-it-safe posture. |
 | `dontAsk` | `yolo` | log-only (+ `disallowedTools` still enforced) |
 
 Mechanics:
@@ -331,13 +331,13 @@ Mechanics:
   missing; the bridge additionally denies any prompt seen without a verified sentinel. The failure
   mode is a blocked session, never a silent yolo. A spawn-time assertion + unit test lock the
   mode/lockdown/`-e` flags.
-- **Every blocking `extension_ui_request` kind is answered in Phase 1** (review finding: `select`,
+- **Every blocking `extension_ui_request` kind is answered** (review finding: `select`,
   `input`, and `editor` are blocking too, and an unanswered one hangs the turn with no
   `agent_end`): the approval-shaped `select` → the sentinel-gated approve above; non-approval
-  `select`/`confirm`/`input`/`editor` → deterministic cancellation with a surfaced panel error
-  (until the Phase-3 question bridge exists); `notify`/`setStatus`/`setWidget`/`setTitle`/
+  `select`/`confirm`/`input`/`editor` → `OmpQuestionBridge` → `QuestionRouter` → the inline chat
+  question card → an `extension_ui_response` that resumes OMP; `notify`/`setStatus`/`setWidget`/`setTitle`/
   `open_url` → fire-and-forget per OMP's protocol (no response expected), logged. Each kind has a
-  fake-timers test asserting the turn resolves without any timeout dependence.
+  focused bridge test, including teardown and truthful error attribution.
 - MCP write-tier prompts for the `cyboflow` server itself are auto-allowed by the gate (they are
   our own tools, same stance as Codex's `default_tools_approval_mode: 'approve'`).
 
@@ -394,8 +394,8 @@ Mechanics:
 - Quick-session create path: runtime validation, provider-access gate, substrate projection
   (`omp-sdk` ⇒ `substrate='sdk'`, `omp-pty` ⇒ eager PTY spawn) in `session.ts` +
   `createQuickSessionCore.ts`.
-- Frontend: `SubstrateSelector` rows (+ v1 caveats panel: "no question gate; approvals for the
-  terminal lane stay in the terminal"), `AgentPermissionModeSelector` option set,
+- Frontend: `SubstrateSelector` rows (+ v1 caveat that approvals for the terminal lane stay in
+  the terminal), `AgentPermissionModeSelector` option set,
   model picker via the generalized catalog store (RPC `get_available_models`, 5-min cache,
   grouped by OMP provider prefix), `EffortPill`/`ModelPill` via registries, `PanelTabBar`/
   `RunChatView` labels via registry, onboarding + Integrations detection card.
@@ -443,15 +443,14 @@ Lift the Phase-1 guard; add:
    and that change owns the isolation decision. Recorded at `ompGateConfigBuilder.ts`
    (`buildOmpGateConfig`'s doc comment) so the next reader of the deny finds it there.
 
-Not required (host owns gates at T1): question bridge, subagent role mapping, prompt envelope.
+Not required (host owns gates at T1): subagent role mapping, prompt envelope.
 
 ## 7. Phase 3 — T2 orchestrator + T3 juror/verifier (deliberately later)
 
 - T2 needs: an OMP prompt envelope (`PROVIDER_PROMPT_ENVELOPES.omp`) redirecting AskUserQuestion →
   `cyboflow_request_user_input` and mapping `cyboflow-*` subagent roles onto OMP agent definitions;
   a `.omp/agents/*.md` writer alongside `workflowBundleWriter` (OMP discovers project agents there;
-  frontmatter differs from `.claude/agents` — name/description/systemPrompt); question-gate bridge
-  (OMP `ask` tool or `extension_ui_request` `select`/`input` kinds → QuestionRouter); resume/nudge
+  frontmatter differs from `.claude/agents` — name/description/systemPrompt); resume/nudge
   via `switch_session`. The monitor and final-gate handover stay Claude — same conscious decision
   already made for Codex.
 - T3 blocker: RPC has no per-prompt JSON-schema structured output (the SDK's `outputSchema` is
@@ -527,7 +526,7 @@ Not required (host owns gates at T1): question bridge, subagent role mapping, pr
 | 1 | OMP's release velocity breaks the RPC contract under us | min-version floor + tested-version banner + contract fixtures; we spawn the user's binary, so breakage is visible, not silent |
 | 2 | mcp.json env injection semantics | RESOLVED — bare-name pre-connect copy from process env is documented (`docs/mcp-config.md`); contract-tested in `ompMcpConfigWriter.test.ts` |
 | 3 | Hook (`tool_call`) scope inside OMP subagents unknown | deny `task` tool in EVERY mode until proven; upstream question filed |
-| 3b | OMP hard-caps `tool_call` handlers at 30 s (no knob) — human approvals slower than the gate's 25 s budget are fail-closed blocked on the omp-sdk lane | legible block reason (stops the model's blind retry loop, measured); upstream a budget knob to OMP; the review-queue flow still records the request |
+| 3b | ~~OMP hard-caps `tool_call` handlers at 30 s (no knob)~~ **RESOLVED, omp 17.3.5** — the cap is now the `extensionHandlers.toolCallTimeoutMs` setting (no upper clamp). cyboflow raises it per spawn through a `PI_CONFIG_FILES` config overlay and hands the gate the matching budget, so a human is no longer forced to answer inside ~25 s. The 25 s budget remains the floor for omp < 17.3.5 and for a spawn whose overlay could not be written. | `ompHandlerTimeoutOverlay.ts`; version-gated by `supportsConfigurableHandlerTimeout` |
 | 4 | No RPC structured-output → T3 blocked | defer T3; consider upstreaming `output_schema` |
 | 5 | No `--mcp-config` path flag → in-place sessions lack `cyboflow_*` | v1 limitation; upstream PR candidate |
 | 6 | `agent_end.isTerminal` semantics (maintenance resumes) could double-resolve a turn | manager treats only `isTerminal !== false` as terminal and ignores post-terminal events until next prompt; fixture-tested |
@@ -539,7 +538,7 @@ Not required (host owns gates at T1): question bridge, subagent role mapping, pr
 ## 12. Non-goals (v1)
 
 Bundled OMP binary; per-provider credential UI; OMP as main orchestrator (T2) or juror (T3);
-token-level live-tail for omp-sdk; question-gate bridge; `omp-pty` in workflows; OMP subagent
+token-level live-tail for omp-sdk; `omp-pty` in workflows; OMP subagent
 (`task`/vibe-mode) orchestration under cyboflow flows; Windows/Linux validation (macOS first, same
 as the rest of the app).
 

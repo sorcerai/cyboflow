@@ -1,6 +1,9 @@
 import { useRef, useState } from 'react';
-import { GitMerge, ExternalLink, Trash2 } from 'lucide-react';
+import { GitMerge, ExternalLink, Trash2, X } from 'lucide-react';
 import { useLifecycleTarget } from '../../hooks/useLifecycleTarget';
+import { useSessionStore } from '../../stores/sessionStore';
+import { useActiveRunsStore } from '../../stores/activeRunsStore';
+import { anyIdeaChildSessionActive } from '../../utils/ideaSessionGrouping';
 import { trpc } from '../../trpc/client';
 import { useErrorStore } from '../../stores/errorStore';
 import { findGuardedExperimentForSession } from '../../utils/armDismissGuard';
@@ -14,6 +17,13 @@ interface SessionLifecycleActionBarProps {
   onMerge?: () => void;
   onCreatePR?: () => void;
   onDismiss?: () => void;
+  /**
+   * Close an idea HOME session (session.homeIdeaId set). Distinct from Dismiss:
+   * the home session is in-place (nothing to merge, nothing lost), so the caller
+   * closes it directly — no merge-warning dialog. The bar only offers Close
+   * while none of the idea's launched child sessions is actively working.
+   */
+  onCloseSession?: () => void;
 }
 
 interface ArmGuardState {
@@ -27,8 +37,15 @@ interface ArmGuardState {
   proceed: () => void;
 }
 
-export function SessionLifecycleActionBar({ onMerge, onCreatePR, onDismiss }: SessionLifecycleActionBarProps) {
+export function SessionLifecycleActionBar({ onMerge, onCreatePR, onDismiss, onCloseSession }: SessionLifecycleActionBarProps) {
   const target = useLifecycleTarget();
+  // Idea-home Close gating inputs. Subscribed unconditionally (hooks-before-
+  // early-return); only read on the idea-home branch below.
+  const allSessions = useSessionStore((s) => s.sessions);
+  const targetProjectId = target?.session.projectId;
+  const runsForProject = useActiveRunsStore((s) =>
+    targetProjectId !== undefined ? s.runsByProject[targetProjectId] : undefined,
+  );
   // Experiment-aware dismiss guard (S2). Held here so the interception lives on
   // the Dismiss trigger itself; null = no guard shown.
   const [armGuard, setArmGuard] = useState<ArmGuardState | null>(null);
@@ -52,6 +69,38 @@ export function SessionLifecycleActionBar({ onMerge, onCreatePR, onDismiss }: Se
   const inPlace = target.session.inPlace === true;
 
   const session = target.session;
+
+  // An idea's HOME session (backlog "Open" → in-place find-or-create door) gets
+  // Close instead of the whole Merge/PR/Dismiss close-out: it works in-place on
+  // the project checkout, so there is nothing to merge and nothing to lose —
+  // the merge-warning dismiss dialog would be pure noise (and reopening from
+  // the backlog recreates the home). Close is offered ONLY while none of the
+  // idea's launched child sessions is actively working; while one is, the bar
+  // renders nothing (closing the home would orphan the live children's sidebar
+  // grouping mid-run). No arm guard either — a home session is never an A/B arm.
+  if (session.homeIdeaId) {
+    const childActive = anyIdeaChildSessionActive(
+      allSessions,
+      runsForProject,
+      session.homeIdeaId,
+      session.id,
+    );
+    if (childActive) return null;
+    return (
+      <div className="flex items-center gap-1.5" data-testid="session-lifecycle-action-bar">
+        <div className="mx-2 h-4 w-px bg-border-primary" />
+        <button
+          data-testid="session-action-close"
+          onClick={() => onCloseSession?.()}
+          className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-text-secondary hover:bg-bg-tertiary hover:text-text-primary"
+          title="Close this idea session. Nothing is merged or discarded — reopen it any time from the backlog."
+        >
+          <X size={14} />
+          Close
+        </button>
+      </div>
+    );
+  }
 
   // Intercept Dismiss/Merge/Create-PR when the session is one arm of a LIVE A/B
   // experiment. Tearing down (or accepting) a single arm strands the experiment

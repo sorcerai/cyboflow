@@ -22,6 +22,9 @@
 import type {
   TrackerProvider,
   TrackerWorkspaceIdentity,
+  TrackerGroup,
+  TrackerGroupSection,
+  TrackerGroupTree,
   TrackerSourceTree,
   TrackerSourceContainer,
   TrackerSourceNarrow,
@@ -30,13 +33,21 @@ import type {
   TrackerStateGroup,
   TrackerIssue,
 } from '../../../../shared/types/trackerSync';
-import type { TrackerAdapter, TrackerAdapterCapabilities, FetchLike, IssueDraft } from './adapterTypes';
+import type {
+  TrackerAdapter,
+  TrackerAdapterCapabilities,
+  FetchLike,
+  IssueDraft,
+  IssueContentPatch,
+  TrackerFieldOptionsRaw,
+} from './adapterTypes';
 import {
   TrackerApiError,
   TrackerAuthError,
   TRACKER_REQUEST_TIMEOUT_MS,
   describeTransportFailure,
 } from './errors';
+import { PROVIDER_ARCHIVE_CAPABILITY } from './providerCapabilities';
 
 const LINEAR_API_URL = 'https://api.linear.app/graphql';
 
@@ -88,6 +99,11 @@ interface LinearProjectNode {
   name: string;
 }
 
+/** A workspace-root project node, carrying the teams it spans (the Map step). */
+interface LinearProjectWithTeamsNode extends LinearProjectNode {
+  teams: { nodes: LinearTeamNode[] };
+}
+
 interface LinearCycleNode {
   id: string;
   number: number;
@@ -119,6 +135,20 @@ interface LinearIssueNode {
   parent: { id: string } | null;
   updatedAt: string;
   archivedAt: string | null;
+  /**
+   * Linear reads priority as a FLOAT (`2` arrives as `2.0`) even though the
+   * write side takes an Int and the scale has exactly five rungs. Normalized to
+   * the raw string token at {@link mapIssueNode}; `0` is Linear's real "No
+   * priority" rung, NOT an absence.
+   */
+  priority: number | null;
+  /**
+   * Set by `issueArchive(trash: true)` alongside `archivedAt` (probe L1).
+   * Selected here so the archive write-back's response stamp has it without a
+   * second selection edit; nothing reads it yet — `archivedAt` is what inbound
+   * classifies an archived issue on.
+   */
+  trashed: boolean | null;
 }
 
 interface ValidateCredentialsResponse {
@@ -128,6 +158,10 @@ interface ValidateCredentialsResponse {
 
 interface ListTeamsResponse {
   teams: LinearConnection<LinearTeamNode>;
+}
+
+interface ListProjectsWithTeamsResponse {
+  projects: LinearConnection<LinearProjectWithTeamsNode>;
 }
 
 interface ListTeamProjectsResponse {
@@ -166,6 +200,14 @@ interface UpdateIssueStateResponse {
   issueUpdate: { success: boolean };
 }
 
+interface UpdateIssueContentResponse {
+  issueUpdate: { success: boolean; issue: LinearIssueNode | null };
+}
+
+interface ArchiveIssueResponse {
+  issueArchive: { success: boolean };
+}
+
 interface LinearIdEqFilter {
   eq: string;
 }
@@ -185,6 +227,24 @@ interface LinearIssueCreateInput {
   title: string;
   description?: string;
   stateId?: string;
+  /** `IssueDraft.priority`, converted to Linear's Int scale — see {@link toLinearPriorityInt}. */
+  priority?: number | null;
+}
+
+/** `IssueUpdateInput`, restricted to the fields `updateIssueContent` writes. */
+interface LinearIssueUpdateInput {
+  title?: string;
+  /**
+   * Linear takes markdown directly (no rich-format conversion, unlike Plane),
+   * so this is `IssueContentPatch.description` passed straight through —
+   * Linear never writes a recovery marker in the first place
+   * (`capabilities.idempotentCreate` is true, so there is nothing for a
+   * content write to preserve), which is why there is no marker-composition
+   * step here at all, symmetric with `createIssue`/`createSubIssue` below.
+   */
+  description?: string | null;
+  /** `IssueContentPatch.priority`, converted to Linear's Int scale — see {@link toLinearPriorityInt}. */
+  priority?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +273,8 @@ const ISSUE_NODE_FIELDS = `
     }
     updatedAt
     archivedAt
+    priority
+    trashed
 `;
 
 const VALIDATE_CREDENTIALS_QUERY = `
@@ -236,6 +298,37 @@ const LIST_TEAMS_QUERY = `
         id
         name
         key
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+/**
+ * Projects at the WORKSPACE root, each with the teams it spans — the Map step's
+ * source. A root query rather than the per-team one below because the Map step
+ * wants every project in one pass, and Linear's `Project.teams` is what turns a
+ * project into the (project × team) pairs the engine's team+project issue
+ * filter can actually address. `teams(first: 50)` is unpaginated by design: a
+ * project spanning more than fifty teams is not a mapping unit anyone will pick
+ * from a list, and the whole-teams section below covers it.
+ */
+const LIST_PROJECTS_WITH_TEAMS_QUERY = `
+  query ListProjectsWithTeams($after: String) {
+    projects(first: 100, after: $after) {
+      nodes {
+        id
+        name
+        teams(first: 50) {
+          nodes {
+            id
+            name
+            key
+          }
+        }
       }
       pageInfo {
         hasNextPage
@@ -361,9 +454,53 @@ const UPDATE_ISSUE_STATE_MUTATION = `
   }
 `;
 
+/**
+ * The `updateIssueContent` write. A SEPARATE mutation from
+ * `UPDATE_ISSUE_STATE_MUTATION` rather than a shared one selecting
+ * `issue { ...ISSUE_NODE_FIELDS }` unconditionally: the state write never
+ * needs the echoed issue back (it returns void), so paying for the full
+ * selection on every state move would be pure waste. This one DOES need it —
+ * per invariant 1, the caller stamps the baseline from exactly these
+ * (post-normalizer) values, and `issueUpdate` is the only route to them.
+ */
+const UPDATE_ISSUE_CONTENT_MUTATION = `
+  mutation UpdateIssueContent($id: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $id, input: $input) {
+      success
+      issue {
+${ISSUE_NODE_FIELDS}
+      }
+    }
+  }
+`;
+
+/**
+ * `issueArchive(trash: true)` — the ONLY route probe L1 found that actually
+ * archives: `issueUpdate({ trashed: true })` is REJECTED outright ("invalid
+ * trashed state"), so `issueUpdate` must never be used for this. `success`
+ * is all this needs to select — `archiveIssue` returns void, and the probe
+ * confirmed a direct `issue(id)` lookup still resolves post-archive if a
+ * caller ever needs the echoed state (nothing here does).
+ */
+const ARCHIVE_ISSUE_MUTATION = `
+  mutation ArchiveIssue($id: String!) {
+    issueArchive(id: $id, trash: true) {
+      success
+    }
+  }
+`;
+
 // ---------------------------------------------------------------------------
 // Small pure helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Linear's five priority rungs as RAW tokens, in the provider's own order
+ * (`'0'` No priority, `'1'` Urgent … `'4'` Low). Fixed by the provider, so the
+ * adapter states them instead of discovering them — see
+ * {@link LinearAdapter.listFieldOptions}.
+ */
+const LINEAR_PRIORITY_TOKENS: readonly string[] = ['0', '1', '2', '3', '4'];
 
 /** Linear `WorkflowState.type` → cyboflow's canonical `TrackerStateGroup`. */
 const STATE_TYPE_TO_GROUP: Record<string, TrackerStateGroup> = {
@@ -425,6 +562,37 @@ function deriveInitials(name: string): string {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
+/**
+ * Linear's Float priority as the raw string token the rest of the engine
+ * compares on ('0'..'4').
+ *
+ * ROUNDED, not truncated or formatted: `String(2.0)` is already `'2'`, but a
+ * value that ever arrives as `1.9999` would stringify to something no mapping
+ * knows, and the scale is integral by definition. `0` maps to `'0'` — Linear's
+ * "No priority" rung is a VALUE, not an absence, so it must never fall into the
+ * null branch. Null survives only if the field was not selected at all.
+ */
+function mapPriority(value: number | null): string | null {
+  return typeof value === 'number' && Number.isFinite(value) ? String(Math.round(value)) : null;
+}
+
+/**
+ * The write-side inverse of {@link mapPriority}: a provider-raw token
+ * (`'0'..'4'`, already mapped by the caller — see `IssueDraft.priority` /
+ * `IssueContentPatch.priority`) to the Int Linear's mutations take.
+ * `undefined` (field not present in the draft/patch) stays `undefined` so the
+ * caller's "leave alone" / "provider default" intent survives into the
+ * GraphQL variables unchanged; `null` passes through as-is (Linear's
+ * `IssueUpdateInput.priority`/`IssueCreateInput.priority` are nullable Ints)
+ * even though in practice the priority mapping never actually produces `null`
+ * for this provider — `'0'` (No priority) is Linear's real unset rung, per
+ * `TrackerIssue.priority`'s doc comment.
+ */
+function toLinearPriorityInt(token: string | null | undefined): number | null | undefined {
+  if (token === undefined || token === null) return token;
+  return Number(token);
+}
+
 function mapIssueNode(node: LinearIssueNode): TrackerIssue {
   return {
     externalId: node.id,
@@ -444,6 +612,10 @@ function mapIssueNode(node: LinearIssueNode): TrackerIssue {
     parentExternalId: node.parent?.id ?? null,
     updatedAt: node.updatedAt,
     archivedAt: node.archivedAt,
+    priority: mapPriority(node.priority),
+    // ALWAYS null for Linear: it models no issue TYPE, and label emulation is
+    // out of scope, so there is nothing a category could be read from.
+    category: null,
     // ALWAYS null for Linear, and stated explicitly rather than left off: this
     // adapter has `capabilities.idempotentCreate`, so the outbox's client key IS
     // the created issue's id. A lost create is recovered by external id (a
@@ -506,6 +678,16 @@ export class LinearAdapter implements TrackerAdapter {
     nativeParentAutoClose: true,
     selfHostedBaseUrl: false,
     idempotentCreate: true,
+    // Linear has no issue-type field at all (category is Dart-only, per the
+    // locked scope decision — no label emulation in v1).
+    contentWrite: { title: true, description: true, priority: true, category: false },
+    // `issueArchive(trash: true)` — probe L1 confirmed it sets `archivedAt`
+    // and `trashed`, is restorable (visible under `includeArchived: true`,
+    // and by direct id lookup), and is exactly the milder-than-delete
+    // operation the locked scope decision requires. Read from the shared
+    // table so the outbound trigger — which gates on the capability WITHOUT
+    // an adapter in hand — can never disagree with this adapter.
+    archive: PROVIDER_ARCHIVE_CAPABILITY.linear,
   };
 
   private readonly apiKey: string;
@@ -525,6 +707,69 @@ export class LinearAdapter implements TrackerAdapter {
       workspaceName: data.organization.name,
       actorLabel: data.viewer.displayName ?? data.viewer.name,
     };
+  }
+
+  /**
+   * The Map step's groups: Linear PROJECTS first, whole TEAMS as a fallback
+   * section.
+   *
+   * A project is emitted once per team it spans, not once per project, because
+   * the selection a group carries has to be one the engine can already filter
+   * on: `{team, project}` is exactly `buildIssueFilter`'s existing narrow, so no
+   * engine change is needed and a project spanning two teams cannot land its
+   * two teams' issues under one state mapping (Linear workflow states are
+   * per-team — hence `stateScopeKey` = the team id).
+   *
+   * The "Whole teams" section is not redundant: many workspaces do not use
+   * projects at all, and an issue in NO project is only reachable through a team
+   * group.
+   */
+  async listGroups(): Promise<TrackerGroupTree> {
+    const [projects, teams] = await Promise.all([
+      paginateConnection<LinearProjectWithTeamsNode>((after) =>
+        this.request<ListProjectsWithTeamsResponse>(LIST_PROJECTS_WITH_TEAMS_QUERY, { after }).then(
+          (data) => data.projects
+        )
+      ),
+      paginateConnection<LinearTeamNode>((after) =>
+        this.request<ListTeamsResponse>(LIST_TEAMS_QUERY, { after }).then((data) => data.teams)
+      ),
+    ]);
+
+    const projectGroups: TrackerGroup[] = [];
+    for (const project of projects) {
+      const projectTeams = project.teams?.nodes ?? [];
+      // A project with no team has no addressable issue filter — it is skipped
+      // rather than guessed at; its issues stay reachable via a team group.
+      for (const team of projectTeams) {
+        const sourceLabel = `${project.name} · ${team.name}`;
+        projectGroups.push({
+          id: `${team.id}/${project.id}`,
+          // The team only disambiguates where it has to: a single-team project
+          // reads as itself, which is how the workspace names it.
+          name: projectTeams.length === 1 ? project.name : sourceLabel,
+          key: team.key,
+          sourceLabel,
+          selection: { containerId: team.id, narrowId: project.id, narrowKind: 'project' },
+          stateScopeKey: team.id,
+        });
+      }
+    }
+
+    const teamGroups: TrackerGroup[] = teams.map((team) => ({
+      id: `team:${team.id}`,
+      name: team.name,
+      key: team.key,
+      sourceLabel: `${team.name} · whole team`,
+      selection: { containerId: team.id, narrowId: 'all', narrowKind: 'all' },
+      stateScopeKey: team.id,
+    }));
+
+    const sections: TrackerGroupSection[] = [
+      { label: 'Projects', groups: projectGroups },
+      { label: 'Whole teams', groups: teamGroups },
+    ];
+    return { sections };
   }
 
   async listContainers(): Promise<TrackerSourceTree> {
@@ -588,6 +833,19 @@ export class LinearAdapter implements TrackerAdapter {
     }));
   }
 
+  /**
+   * Linear's priority scale is FIXED and workspace-independent (Urgent / High /
+   * Medium / Low / No priority), so this is stated rather than fetched — there is
+   * no query behind it and nothing a workspace owner can rename. The tokens are
+   * the RAW `'0'..'4'` values the engine compares on; the human labels are a UI
+   * concern and are attached where the picker is rendered, not here.
+   *
+   * `categories: null` — Linear models no issue type at all.
+   */
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    return { priorities: [...LINEAR_PRIORITY_TOKENS], categories: null };
+  }
+
   async listIssues(selection: TrackerSourceSelection, sinceIso?: string): Promise<TrackerIssue[]> {
     const filter = buildIssueFilter(selection, sinceIso);
     const nodes = await paginateConnection<LinearIssueNode>((after) =>
@@ -648,6 +906,7 @@ export class LinearAdapter implements TrackerAdapter {
       title: draft.title,
       description: draft.description,
       stateId: draft.stateId,
+      priority: toLinearPriorityInt(draft.priority),
     };
     return this.issueCreate(input);
   }
@@ -670,6 +929,7 @@ export class LinearAdapter implements TrackerAdapter {
       title: draft.title,
       description: draft.description,
       stateId: draft.stateId,
+      priority: toLinearPriorityInt(draft.priority),
     });
   }
 
@@ -689,6 +949,60 @@ export class LinearAdapter implements TrackerAdapter {
     });
     if (!data.issueUpdate.success) {
       throw new TrackerApiError('linear', `issueUpdate reported failure for ${externalId}`, null);
+    }
+  }
+
+  /**
+   * One generalized `issueUpdate` carrying only the keys `patch` actually
+   * sets (checked via `!== undefined`, per `IssueContentPatch`'s contract),
+   * selecting the full issue node back — the echo-suppression baseline's
+   * stamp source (invariant 1).
+   *
+   * `category` is never mapped onto anything: Linear has no issue-type
+   * field, `capabilities.contentWrite.category` says so, and the caller is
+   * the one that must never populate it for this provider.
+   */
+  async updateIssueContent(externalId: string, patch: IssueContentPatch): Promise<TrackerIssue | null> {
+    const input: LinearIssueUpdateInput = {};
+    if (patch.title !== undefined) input.title = patch.title;
+    if (patch.description !== undefined) input.description = patch.description;
+    if (patch.priority !== undefined) input.priority = toLinearPriorityInt(patch.priority);
+    const data = await this.request<UpdateIssueContentResponse>(UPDATE_ISSUE_CONTENT_MUTATION, {
+      id: externalId,
+      input,
+    });
+    if (!data.issueUpdate.success || !data.issueUpdate.issue) {
+      throw new TrackerApiError('linear', `issueUpdate reported failure for ${externalId}`, null);
+    }
+    return mapIssueNode(data.issueUpdate.issue);
+  }
+
+  /**
+   * `issueArchive(trash: true)` — the L1-winning route (see
+   * `ARCHIVE_ISSUE_MUTATION`; `issueUpdate({ trashed: true })` is rejected
+   * and must never be used). An "entity not found"-class GraphQL error is
+   * treated as SUCCESS — the twin was already trashed/deleted by some other
+   * path — mirroring the 404-is-success rule the REST adapters apply to
+   * their own not-found status; every other error still propagates.
+   */
+  async archiveIssue(externalId: string): Promise<void> {
+    const { data, errors, status } = await this.execute<ArchiveIssueResponse>(ARCHIVE_ISSUE_MUTATION, {
+      id: externalId,
+    });
+    if (status === 401 || isAuthError(errors)) {
+      throw new TrackerAuthError('linear', authMessage(errors, status), status);
+    }
+    if (isEntityNotFoundError(errors)) {
+      return;
+    }
+    if (errors.length > 0) {
+      throw new TrackerApiError('linear', errors.map((error) => error.message).join('; '), status);
+    }
+    if (!httpOk(status)) {
+      throw new TrackerApiError('linear', `unexpected HTTP status ${status}`, status);
+    }
+    if (!data?.issueArchive.success) {
+      throw new TrackerApiError('linear', `issueArchive reported failure for ${externalId}`, null);
     }
   }
 

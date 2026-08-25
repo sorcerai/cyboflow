@@ -28,6 +28,17 @@ import type Database from 'better-sqlite3';
 vi.mock('../agentOverlayWriter', () => ({ installAgentOverlay: vi.fn() }));
 
 /**
+ * resolveRunFrozenSpec is mocked so the stage-script tests can pin the run's
+ * EFFECTIVE (frozen / variant) spec independently of the live workflows row —
+ * that distinction is the point of one of them. `frozen.value` is null by
+ * default, which is the "no frozen revision" fallback the real helper returns.
+ */
+const frozen = vi.hoisted(() => ({ value: null as { workflowName: string; specJson: string | null } | null }));
+vi.mock('../../../../orchestrator/runFrozenSpec', () => ({
+  resolveRunFrozenSpec: () => frozen.value,
+}));
+
+/**
  * child_process is mocked ONLY so a single test can force a git failure that is
  * NOT "not a git repository" (the one class ensureBundleExcluded still warns
  * about). `impl` is null everywhere else, in which case the real execFileSync
@@ -49,6 +60,7 @@ vi.mock('child_process', async (importOriginal) => {
 import { installWorkflowBundle } from '../workflowBundleInstall';
 import { installAgentOverlay } from '../agentOverlayWriter';
 import { WorkflowBundleWriter } from '../workflowBundleWriter';
+import { fanOutBatchWorkflowName } from '../../../../orchestrator/prompts/fanOutStageScript';
 import type { WorkflowBundle } from '../../../../orchestrator/workflows/workflowBundle';
 import { makeSpyLogger } from '../../../../orchestrator/__test_fixtures__/loggerLikeSpy';
 
@@ -235,5 +247,133 @@ describe('workflowBundleInstall — installWorkflowBundle fail-soft', () => {
       (c) => c.level === 'warn' && c.message.includes('workflow_path lookup failed'),
     );
     expect(warned).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fan-out stage scripts (dispatch === 'workflow')
+// ---------------------------------------------------------------------------
+
+/** The canonical sprint-ish fan-out spec, as a workflows.spec_json string. */
+function fanOutSpecJson(innerIds: string[]): string {
+  return JSON.stringify({
+    id: 'sprint',
+    phases: [
+      {
+        id: 'execute',
+        label: 'Execute',
+        color: '#c96442',
+        steps: [
+          {
+            id: 'execute-tasks',
+            name: 'Execute tasks',
+            agent: 'implement',
+            mcps: [],
+            retries: 0,
+            fanOut: {
+              over: 'tasks',
+              inner: innerIds.map((id) => ({ id, agent: id, name: id })),
+            },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+/** DB stub that answers BOTH the workflow_path lookup and the name/spec lookup. */
+function makeSpecDbStub(name: string, specJson: string): Database.Database {
+  return {
+    prepare: (sql: string) => ({
+      get: () =>
+        sql.includes('workflow_path')
+          ? { workflowPath: null }
+          : { name, specJson },
+    }),
+  } as unknown as Database.Database;
+}
+
+describe('workflowBundleInstall — fan-out stage scripts', () => {
+  let worktree: string;
+  const workflowsDir = () => path.join(worktree, '.claude', 'workflows');
+  const SCRIPT_GLOB = '.claude/workflows/cyboflow-*.js';
+
+  beforeEach(() => {
+    execFileSyncOverride.impl = null;
+    frozen.value = null;
+    worktree = tmpDir('cyboflow-stage-scripts-');
+    initGitRepo(worktree);
+    vi.clearAllMocks();
+  });
+
+  it('writes NOTHING and adds no exclude glob in the default prose mode', () => {
+    const db = makeSpecDbStub('sprint', fanOutSpecJson(['implement', 'write-tests']));
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree);
+
+    expect(fs.existsSync(workflowsDir())).toBe(false);
+    expect(fs.readFileSync(excludePath(worktree), 'utf8')).not.toContain(SCRIPT_GLOB);
+  });
+
+  it('renders one script per scriptable stage and excludes them from git', () => {
+    const db = makeSpecDbStub('sprint', fanOutSpecJson(['implement', 'write-tests', 'visual-verify']));
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree, undefined, 'workflow');
+
+    // ONE script for the whole non-gated run of stages (implement + write-tests),
+    // named for the batch's first stage. visual-verify is a firm gate, so it ends
+    // the batch and is never scripted.
+    const written = fs.readdirSync(workflowsDir()).sort();
+    expect(written).toEqual(['cyboflow-sprint-execute-tasks-implement.js']);
+    expect(fs.readFileSync(excludePath(worktree), 'utf8')).toContain(SCRIPT_GLOB);
+  });
+
+  it('the on-disk basename matches the name the prompt will invoke (drift guard)', () => {
+    const db = makeSpecDbStub('sprint', fanOutSpecJson(['implement']));
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree, undefined, 'workflow');
+
+    const invocable = fanOutBatchWorkflowName('sprint', 'execute-tasks', 'implement');
+    expect(invocable).not.toBeNull();
+    expect(fs.existsSync(path.join(workflowsDir(), `${invocable as string}.js`))).toBe(true);
+    // ...and the meta the tracker reads back agrees with both.
+    const source = fs.readFileSync(path.join(workflowsDir(), `${invocable as string}.js`), 'utf8');
+    expect(source).toContain(`name: ${JSON.stringify(invocable)}`);
+  });
+
+  it('renders from the FROZEN variant spec, not the live workflows row', () => {
+    // Live row says the chain is [implement]; the run's frozen variant says [beta].
+    const db = makeSpecDbStub('sprint', fanOutSpecJson(['implement']));
+    frozen.value = { workflowName: 'sprint', specJson: fanOutSpecJson(['beta']) };
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree, undefined, 'workflow');
+
+    expect(fs.readdirSync(workflowsDir())).toEqual(['cyboflow-sprint-execute-tasks-beta.js']);
+  });
+
+  it('an unparseable spec falls back to the built-in definition rather than rendering nothing', () => {
+    // resolveWorkflowDefinition treats spec_json as an OVERRIDE of the built-in
+    // seed, so a broken spec for a real flow name still resolves the seed graph —
+    // which is the correct floor: the run walks that graph, so its scripts must
+    // match it. (A run whose prompt cites scripts that were never written is the
+    // failure mode this guards against.)
+    const db = makeSpecDbStub('sprint', 'not json at all');
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree, makeSpyLogger(), 'workflow');
+
+    const written = fs.readdirSync(workflowsDir());
+    expect(written.length).toBeGreaterThan(0);
+    expect(written.every((f) => f.startsWith('cyboflow-sprint-') && f.endsWith('.js'))).toBe(true);
+    // The host-owned visual gate is never scripted, whatever the source of the graph.
+    expect(written.some((f) => f.includes('visual-verify'))).toBe(false);
+  });
+
+  it('renders nothing for a workflow with no resolvable definition', () => {
+    const db = makeSpecDbStub('not-a-real-flow', '{}');
+
+    installWorkflowBundle(db, new WorkflowBundleWriter(), 'run-1', worktree, makeSpyLogger(), 'workflow');
+
+    expect(fs.existsSync(workflowsDir())).toBe(false);
+    expect(fs.readFileSync(excludePath(worktree), 'utf8')).not.toContain(SCRIPT_GLOB);
   });
 });

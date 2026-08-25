@@ -21,6 +21,9 @@ function makeApproval(overrides: Partial<Approval> & { id: string }): Approval {
     rationale: null,
     createdAt: new Date().toISOString(),
     status: 'pending',
+    awaited: true,
+    sessionName: null,
+    agentProvider: null,
     ...overrides,
   };
 }
@@ -83,6 +86,22 @@ describe('sortQueueOldestFirst', () => {
 // ---------------------------------------------------------------------------
 
 describe('partitionBlockingItems', () => {
+  it('never blocks an un-awaited item, however old it is', () => {
+    // The omp-sdk gate hangs up at ~25s and the model moves on, so the row keeps
+    // ageing with nothing waiting on it. Age is only a proxy for "stuck" while
+    // someone is actually stuck; without this the card would wear a permanent
+    // red "blocked Nm" badge for a wait that ended minutes ago.
+    const now = Date.now();
+    const standing = makeApproval({
+      id: 'standing',
+      createdAt: new Date(now - 60 * 60_000).toISOString(),
+      awaited: false,
+    });
+    const { blocking, normal } = partitionBlockingItems([standing], now);
+    expect(blocking).toHaveLength(0);
+    expect(normal.map((a) => a.id)).toEqual(['standing']);
+  });
+
   it('places item 180001ms old in blocking bucket', () => {
     const now = Date.now();
     const old = makeApproval({ id: 'old', createdAt: new Date(now - 180_001).toISOString() });

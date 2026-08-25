@@ -376,7 +376,7 @@ describe('init()', () => {
       projectId: 1,
       status: 'pending',
       kind: 'finding',
-      requireMergedSession: true,
+      requireDeliveredSession: true,
     });
   });
 
@@ -492,7 +492,7 @@ describe('setProjectFilter()', () => {
       projectId: 7,
       status: 'pending',
       kind: 'finding',
-      requireMergedSession: true,
+      requireDeliveredSession: true,
     });
   });
 });

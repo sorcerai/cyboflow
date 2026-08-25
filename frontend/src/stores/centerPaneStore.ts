@@ -66,6 +66,19 @@ export interface OpenArtifactTabArgs {
   committed?: boolean;
   isNew?: boolean;
   /**
+   * The artifact's OWN run. Required alongside `external` — an external tab is
+   * resolved by `artifacts.get({ artifactId, runId, atype })`, whose runId is
+   * what lets it fall back to the committed on-disk snapshot.
+   */
+  runId?: string;
+  /**
+   * The backing row belongs to ANOTHER run/session (the idea canvas's
+   * idea-scoped artifact links). Keys the tab by artifact id for every atype
+   * and exempts it from useArtifactTabsSync's session-list prune — see
+   * `TabItem.external`.
+   */
+  external?: boolean;
+  /**
    * Whether opening/refreshing this tab should ALSO make it active. Defaults to
    * true (existing focus-on-open behaviour). Pass `false` for a freshly-arrived
    * MID-RUN artifact so it appears as a pulsing inactive tab without yanking the
@@ -170,21 +183,32 @@ export const useCenterPaneStore = create<CenterPaneStore>((set) => {
         // steal (a mid-run artifact arrives as a pulsing inactive tab instead).
         const focus = args.focus !== false;
 
+        // An EXTERNAL open (a cross-run artifact from the idea canvas) keys
+        // STRICTLY by artifact id and never participates in the per-entity
+        // placeholder adoption below: the placeholder belongs to THIS session's
+        // own run, so adopting it would silently retarget a local tab at another
+        // run's row (and vice versa).
+        const external = args.external === true;
+
         // The id this open should resolve TO. Per-entity atypes (idea-spec) key by
         // artifact id so a multi-idea batch surfaces one tab per idea; every other
-        // atype keys by atype alone.
-        let targetId = artifactTabId(args.atype, args.artifactId);
+        // atype keys by atype alone — unless the open is external.
+        let targetId = artifactTabId(args.atype, args.artifactId, external);
         // The id of an EXISTING tab to reuse (else null → create a new tab). An
         // exact target match is the default reuse.
         let matchId: string | null = cur.tabs.some((t) => t.id === targetId) ? targetId : null;
 
-        if (isPerEntityArtifact(args.atype)) {
+        if (!external && isPerEntityArtifact(args.atype)) {
           const plainId = artifactTabId(args.atype); // `art:<atype>` placeholder id
           if (args.artifactId === undefined) {
             // No-artifactId open (the Workflow Progress chip on a single-idea run):
             // focus the SOLE open per-entity tab of this atype if exactly one
             // exists (placeholder or id-keyed), else fall back to the plain id.
-            const openOfType = cur.tabs.filter((t) => t.kind === 'artifact' && t.atype === args.atype);
+            // EXTERNAL tabs are excluded — a cross-run row of the same atype is
+            // not this run's deliverable, so it must never be the "sole" match.
+            const openOfType = cur.tabs.filter(
+              (t) => t.kind === 'artifact' && t.atype === args.atype && t.external !== true,
+            );
             if (openOfType.length === 1) {
               matchId = openOfType[0].id;
               targetId = openOfType[0].id;
@@ -217,6 +241,8 @@ export const useCenterPaneStore = create<CenterPaneStore>((set) => {
                     label: args.label,
                     artifactId: args.artifactId ?? t.artifactId,
                     committed: args.committed ?? t.committed,
+                    runId: args.runId ?? t.runId,
+                    external: args.external ?? t.external,
                     // A focused open clears the pulse (it becomes active); a
                     // no-focus refresh keeps/sets it so the inactive tab pulses.
                     isNew: focus ? false : (args.isNew ?? t.isNew),
@@ -233,6 +259,8 @@ export const useCenterPaneStore = create<CenterPaneStore>((set) => {
           artifactId: args.artifactId,
           committed: args.committed ?? false,
           isNew: args.isNew ?? false,
+          ...(args.runId !== undefined ? { runId: args.runId } : {}),
+          ...(external ? { external: true } : {}),
         };
         return { ...cur, tabs: [...cur.tabs, tab], activeTabId: focus ? targetId : cur.activeTabId };
       }),

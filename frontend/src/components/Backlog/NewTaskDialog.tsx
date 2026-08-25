@@ -39,7 +39,7 @@ interface NewTaskDialogProps {
 }
 
 const TYPES: TaskType[] = ['idea', 'epic', 'task'];
-const PRIORITIES: Priority[] = ['P0', 'P1', 'P2'];
+const PRIORITIES: Priority[] = ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'];
 const CATEGORIES: EntityCategory[] = ['feature', 'bug', 'chore'];
 
 export function NewTaskDialog({ isOpen, projectId, onClose, onCreated }: NewTaskDialogProps): React.JSX.Element {

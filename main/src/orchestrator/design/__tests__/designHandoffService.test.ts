@@ -32,6 +32,8 @@ import { dbAdapter } from '../../__test_fixtures__/dbAdapter';
 import { TaskChangeRouter } from '../../taskChangeRouter';
 import { ArtifactRouter } from '../../artifactRouter';
 import { ReviewItemRouter } from '../../reviewItemRouter';
+import { IdeaComponentRouter } from '../../ideaComponents/ideaComponentRouter';
+import { resolveIdeaComponents } from '../../ideaComponents/resolveIdeaComponents';
 import type { DatabaseLike } from '../../types';
 import type { DesignHandoffRow } from '../../../database/models';
 import {
@@ -151,6 +153,12 @@ async function setup(): Promise<Harness> {
   TaskChangeRouter._resetForTesting();
   ArtifactRouter._resetForTesting();
   ReviewItemRouter._resetForTesting();
+  // Deliberately NOT initialized here (left null) — most tests in this file
+  // exercise approveDesign with the idea component ledger UNINITIALIZED,
+  // which is exactly the fail-soft path stampPrototypeComplete must survive
+  // (see designHandoffService.ts). Tests that need to observe an actual
+  // ledger stamp call IdeaComponentRouter.initialize(db) themselves.
+  IdeaComponentRouter._resetForTesting();
   const router = TaskChangeRouter.initialize(db);
   const created = await router.applyChange(projectId, {
     actor: 'user',
@@ -201,6 +209,7 @@ afterEach(() => {
   TaskChangeRouter._resetForTesting();
   ArtifactRouter._resetForTesting();
   ReviewItemRouter._resetForTesting();
+  IdeaComponentRouter._resetForTesting();
   if (active) {
     active.svc.close();
     rmSync(active.dir, { recursive: true, force: true });
@@ -619,5 +628,124 @@ describe('approveDesign — idempotency + integrity', () => {
     expect(result.code).toBe('link-broken');
     // No side effects.
     expect(getCurrentApprovedDesign(h.db, h.ideaId)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (g) Idea component ledger convergence — approval stamps `prototype`
+// complete through IdeaComponentRouter (the two-prototype-pathway
+// convergence fix). See stampPrototypeComplete in designHandoffService.ts.
+// ---------------------------------------------------------------------------
+
+describe('approveDesign — idea component ledger convergence (g)', () => {
+  it('a completed approval stamps the `prototype` component complete, source flow, against the post-fold idea version', async () => {
+    const h = await setup();
+    IdeaComponentRouter.initialize(h.db);
+
+    const result = await approveDesign(makeDeps(h), {
+      sessionId: SESSION,
+      draftRevision: 1,
+      expectedIdeaVersion: 1,
+    });
+    expect(result.ok).toBe(true);
+
+    const states = resolveIdeaComponents(h.db, h.ideaId);
+    const prototype = states.find((s) => s.component === 'prototype')!;
+    expect(prototype.state).toBe('complete');
+    expect(prototype.source).toBe('flow');
+    expect(prototype.sourceSessionId).toBe(SESSION);
+    expect(prototype.sourceRunId).toBe(CHAT_RUN);
+    expect(prototype.staleAt).toBeNull();
+    // The idea's version AFTER the Step 2 fold bumped it (1 -> 2) — "the
+    // version this component was built against", read fresh post-commit.
+    expect(prototype.builtAgainstVersion).toBe(2);
+  });
+
+  it('clears a pre-existing stale flag end to end — the design-mode convergence bug this fix closes', async () => {
+    const h = await setup();
+    const componentRouter = IdeaComponentRouter.initialize(h.db);
+
+    // A prior planner run already completed the prototype component...
+    await componentRouter.applyChange(h.projectId, {
+      op: 'set-component-state',
+      ideaId: h.ideaId,
+      component: 'prototype',
+      state: 'complete',
+      source: 'flow',
+      builtAgainstVersion: 1,
+    });
+    // ...then the idea's body changed, which (via taskChangeRouter.ts's
+    // staleness hook in production) flips prototype to stale+incomplete.
+    // Driven directly here so this test stays independent of that hook's own
+    // section-attribution logic — this test is about approveDesign's
+    // clearing behavior, not the hook that produced the stale flag.
+    await componentRouter.applyChange(h.projectId, {
+      op: 'mark-stale',
+      ideaId: h.ideaId,
+      staleReason: 'idea body changed',
+      components: ['prototype'],
+    });
+    const beforeApprove = resolveIdeaComponents(h.db, h.ideaId).find((s) => s.component === 'prototype')!;
+    expect(beforeApprove.state).toBe('incomplete');
+    expect(beforeApprove.staleAt).not.toBeNull();
+
+    // The user reopens design mode, iterates, and approves a fresh design —
+    // exactly the re-verification the stale flag was waiting for.
+    const result = await approveDesign(makeDeps(h), {
+      sessionId: SESSION,
+      draftRevision: 1,
+      expectedIdeaVersion: 1,
+    });
+    expect(result.ok).toBe(true);
+
+    const afterApprove = resolveIdeaComponents(h.db, h.ideaId).find((s) => s.component === 'prototype')!;
+    expect(afterApprove.state).toBe('complete');
+    expect(afterApprove.staleAt).toBeNull();
+    expect(afterApprove.staleReason).toBeNull();
+  });
+
+  it('an UNINITIALIZED IdeaComponentRouter does not fail the approval (getInstance throws synchronously)', async () => {
+    const h = await setup();
+    // Deliberately left uninitialized (setup()'s default) — getInstance()
+    // throws SYNCHRONOUSLY, which a bare `.catch()` would not catch; the
+    // stamp must be wrapped in a real try/catch around the whole call.
+    expect(() => IdeaComponentRouter.getInstance()).toThrow();
+
+    const result = await approveDesign(makeDeps(h), {
+      sessionId: SESSION,
+      draftRevision: 1,
+      expectedIdeaVersion: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    const handoff = handoffRow(h.db, (result as { ok: true; handoffId: string }).handoffId)!;
+    expect(handoff.state).toBe('complete');
+  });
+
+  it('a THROWING (initialized but broken) IdeaComponentRouter does not fail an already-committed approval', async () => {
+    const h = await setup();
+    // A router wired to a DB handle that throws on every prepare() — proves
+    // the fail-soft catch survives a genuine runtime failure, not just the
+    // "never initialized" case above.
+    const brokenDb = {
+      prepare: () => {
+        throw new Error('idea_components: database is locked');
+      },
+      transaction: <T>(fn: (...args: unknown[]) => T) => fn,
+    };
+    IdeaComponentRouter.initialize(brokenDb);
+
+    const result = await approveDesign(makeDeps(h), {
+      sessionId: SESSION,
+      draftRevision: 1,
+      expectedIdeaVersion: 1,
+    });
+
+    // The approval (already committed by the time the stamp runs) still succeeds.
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const handoff = handoffRow(h.db, result.handoffId)!;
+    expect(handoff.state).toBe('complete');
+    expect(getCurrentApprovedDesign(h.db, h.ideaId)).not.toBeNull();
   });
 });

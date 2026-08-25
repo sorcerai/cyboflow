@@ -25,6 +25,8 @@ import type {
   TrackerCredentialsInput,
   TrackerEntityLinkRef,
   TrackerEntityType,
+  TrackerFieldOptions,
+  TrackerGroupTree,
   TrackerIssue,
   TrackerReconcileItem,
   TrackerSettingsPatch,
@@ -33,6 +35,7 @@ import type {
   TrackerSourceTree,
   TrackerState,
   TrackerSyncPassSummary,
+  TrackerWizardSourceInput,
   TrackerWorkspaceIdentity,
 } from '../../../shared/types/trackerSync';
 
@@ -45,13 +48,22 @@ import type {
  * TrackerSyncService implements this directly (structurally AND nominally — it
  * declares `implements TrackerSyncFacade`).
  *
- * The five `wizard*` methods are STATELESS probes: they build a throwaway
+ * The seven `wizard*` methods are STATELESS probes: they build a throwaway
  * provider client from the credentials in hand, persist nothing, and are the
  * only methods that run before a connection row exists.
+ *
+ * Four of them (`wizardGroups` / `wizardStates` / `wizardFieldOptions` /
+ * `wizardIssues`) take a credential SOURCE rather than credentials, because
+ * MAPPING MANAGEMENT re-enters those steps from a connection the user already
+ * authorized and has no pasted key to offer — main resolves the stored one, so no key crosses IPC on that path at
+ * all. `wizardValidate` / `wizardContainers` / `wizardNarrows` keep taking bare
+ * credentials: they only ever run on the paste path, ahead of any connection.
  */
 export interface TrackerSyncFacade {
   /** Live credential probe — the wizard's "Authorized as …" card. Persists nothing. */
   wizardValidate(credentials: TrackerCredentialsInput): Promise<TrackerWorkspaceIdentity>;
+  /** The Map step's mappable tracker groups (Linear projects/teams, Plane projects, Dart spaces). */
+  wizardGroups(source: TrackerWizardSourceInput): Promise<TrackerGroupTree>;
   /** Wizard Step 1, top level (Linear teams / Plane projects). */
   wizardContainers(credentials: TrackerCredentialsInput): Promise<TrackerSourceTree>;
   /** Wizard Step 1, second level for one container (always includes 'all'). */
@@ -61,19 +73,31 @@ export interface TrackerSyncFacade {
   ): Promise<TrackerSourceNarrow[]>;
   /** Wizard Step 3's mapping table — the source's states with canonical groups. */
   wizardStates(
-    credentials: TrackerCredentialsInput,
+    source: TrackerWizardSourceInput,
     selection: TrackerSourceSelection,
   ): Promise<TrackerState[]>;
+  /**
+   * The mapping step's field vocabularies — the provider's priority tokens and
+   * (Dart only) type titles. Takes no selection, unlike `wizardStates`: none of
+   * the three providers scopes these lists to a container.
+   */
+  wizardFieldOptions(source: TrackerWizardSourceInput): Promise<TrackerFieldOptions>;
   /** Wizard Step 2 — the issues in the chosen source (assignee/manual pickers + Reconcile). */
   wizardIssues(
-    credentials: TrackerCredentialsInput,
+    source: TrackerWizardSourceInput,
     selection: TrackerSourceSelection,
   ): Promise<TrackerIssue[]>;
 
   /** Wizard Step 4 — the project's pre-existing backlog items with suggested matches. */
   reconcilePreview(projectId: number, issues: TrackerIssue[]): Promise<TrackerReconcileItem[]>;
 
-  /** Persist the connection (+ encrypted key + reconcile decisions) and kick the first pass. */
+  /**
+   * Persist the connection (+ encrypted key + reconcile decisions) and kick the
+   * first pass. The key is either pasted (`payload.credentials`) or borrowed from
+   * a connection already authorized for this workspace
+   * (`payload.sourceConnectionId`) — exactly one, and everything downstream of
+   * that resolution is identical either way.
+   */
   connect(payload: TrackerConnectPayload): Promise<{ connectionId: string }>;
 
   /**
@@ -95,6 +119,29 @@ export interface TrackerSyncFacade {
   /** The project's connected-view cards. */
   connections(projectId: number): Promise<TrackerConnectionSummary[]>;
 
+  /**
+   * Every LIVE mapping sharing this connection's tracker identity — `(provider,
+   * workspace, instance)` — ACROSS projects, which is what makes it a different
+   * question from {@link TrackerSyncFacade.connections}: one authorization mints
+   * one sibling row per (tracker group -> cyboflow project) pair, and the
+   * management view's object is that authorization, not any single row.
+   *
+   * The named connection is always present, retired included (a disconnected row
+   * leads the list); an unknown id rejects NOT_FOUND-shaped.
+   */
+  mappings(connectionId: string): Promise<TrackerConnectionSummary[]>;
+
+  /**
+   * ARM this mapping as the one its (project, provider) pair pushes new ideas
+   * through, demoting whichever sibling held the flag — the management view's
+   * edit for a choice the wizard's Map step otherwise makes exactly once.
+   *
+   * Rejects NOT_FOUND-shaped for an unknown or DISCONNECTED id: a retired row
+   * has no key and syncs nothing, so arming it would leave the project with no
+   * live pusher.
+   */
+  setPushTarget(connectionId: string): Promise<void>;
+
   /** Patch a connection's editable settings. Unknown id is a no-op. */
   updateSettings(connectionId: string, patch: TrackerSettingsPatch): Promise<void>;
 
@@ -110,11 +157,14 @@ export interface TrackerSyncFacade {
   /** Resolve one open conflict the user's way. Unknown/already-resolved id is a no-op. */
   resolveConflictChoice(conflictId: number, choice: TrackerConflictChoice): Promise<void>;
 
-  /** An entity's live tracker link, or null when it is not synced. */
-  linkForEntity(
+  /**
+   * EVERY live tracker link an entity has, one per provider at most — an empty
+   * array means it is not synced to any tracker.
+   */
+  linksForEntity(
     entityType: TrackerEntityType,
     entityId: string,
-  ): Promise<TrackerEntityLinkRef | null>;
+  ): Promise<TrackerEntityLinkRef[]>;
 
   /**
    * True when hard-deleting this entity would also remove other SYNCED entities
@@ -160,7 +210,7 @@ export interface TrackerSyncFacade {
    * callers with no confirm dialog left to dismiss.
    *
    * `unlinked: false` means the entity had no live link (the renderer's
-   * linkForEntity read was stale, or nothing was ever synced).
+   * linksForEntity read was stale, or nothing was ever synced).
    */
   unlinkEntity(
     entityType: TrackerEntityType,

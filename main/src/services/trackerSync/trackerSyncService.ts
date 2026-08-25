@@ -86,11 +86,15 @@ import type {
   TrackerConflictSummary,
   TrackerConnectPayload,
   TrackerConnectionSummary,
+  TrackerContentSyncMode,
   TrackerCredentialsInput,
   TrackerDirectionMode,
   TrackerEntityLinkRef,
   TrackerEntityType,
+  TrackerFieldOptions,
+  TrackerGroupTree,
   TrackerIssue,
+  TrackerNarrowKind,
   TrackerProvider,
   TrackerReconcileItem,
   TrackerSettingsPatch,
@@ -100,6 +104,7 @@ import type {
   TrackerState,
   TrackerSyncLogEntry,
   TrackerSyncPassSummary,
+  TrackerWizardSourceInput,
   TrackerWorkspaceIdentity,
 } from '../../../../shared/types/trackerSync';
 import type { LoggerLike } from '../../orchestrator/types';
@@ -111,15 +116,19 @@ import {
   type TrackerSyncFacade,
 } from '../../orchestrator/trackerSyncBridge';
 import type { TrackerAdapter } from './adapterTypes';
+import type { StoredSourceScope } from './store';
 import {
   TrackerAuthError,
   TrackerConnectionNotFoundError,
+  TrackerConnectionPausedError,
   TrackerIdentityMismatchError,
 } from './errors';
 import { LinearAdapter } from './linearAdapter';
 import { PlaneAdapter } from './planeAdapter';
+import { DartAdapter } from './dartAdapter';
 import { decryptTrackerSecret, encryptTrackerSecret } from './secrets';
 import {
+  cancelPendingKinds,
   clearSecret,
   connectionMatchesIdentity,
   enqueueOutbox,
@@ -132,6 +141,7 @@ import {
   insertConnection,
   listActiveLinksWithoutEntity,
   listConnections,
+  listConnectionsByIdentity,
   listLinks,
   listOpenConflicts,
   listUnresolvedOutbox,
@@ -141,6 +151,11 @@ import {
   requeueInFlightAsAmbiguous,
   resolveConflict,
   storeSecret,
+  claimPushTarget,
+  listConnectionsForProviderProject,
+  listDuplicatePushTargets,
+  sourceScopeEquals,
+  storedSourceScope,
   supersedeQueuedStateWrites,
   updateBaseline,
   updateConnectionSettings,
@@ -149,6 +164,7 @@ import {
 } from './store';
 import {
   joinBody,
+  readConflictRemoteLocal,
   readConflictRemoteState,
   runDeletionSweep,
   runInboundSync,
@@ -158,10 +174,14 @@ import {
   type InboundSyncReport,
   type ReviewFindingRouter,
 } from './inboundSync';
+import { isPriority, resolveEffectivePriorityMapping, seedDefaultPriorityMapping } from './priorityMapping';
+import { isCategory, resolveEffectiveCategoryMapping, seedDefaultCategoryMapping } from './categoryMapping';
 import { drainOutbox, processAmbiguous, toSqliteUtc, type OutboxDeps, type OutboxReport } from './outboxWorker';
 import { resolveEffectiveMapping, resolveStageIds } from './stateMapping';
 import {
   createWriteBackListener,
+  enqueueArchiveWrite,
+  enqueueContentWrite,
   parseJsonObject,
   readDesiredGroup,
   writeBackGroupForStage,
@@ -169,6 +189,7 @@ import {
   type WriteBackGroup,
   type WriteBackListener,
 } from './writeBack';
+import { removalWriteBackAction } from './providerCapabilities';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -234,6 +255,31 @@ function directionRuns(mode: TrackerDirectionMode, trigger: TrackerSyncTrigger):
 }
 
 /**
+ * The outbox kinds the CONTENT direction owns (field write-back, migration 118).
+ */
+const CONTENT_OUTBOX_KINDS = ['update_content'] as const;
+
+/**
+ * The outbox kinds the ARCHIVE direction owns (remote trash/archive, migration
+ * 112).
+ */
+const ARCHIVE_OUTBOX_KINDS = ['archive_issue'] as const;
+
+/**
+ * True when a {@link TrackerContentSyncMode} direction may run under `trigger`.
+ *
+ * `'off'` short-circuits BEFORE the `trigger === 'manual'` escape — the one
+ * place this differs from {@link directionRuns} — because "Sync now" must
+ * never drain a direction the user has declined altogether (invariant 5 of
+ * docs/proposals/tracker-field-writeback.md): unlike `auto`/`manual`, which
+ * only disagree about WHEN a direction runs, `'off'` disagrees about WHETHER
+ * it ever does.
+ */
+function contentDirectionRuns(mode: TrackerContentSyncMode, trigger: TrackerSyncTrigger): boolean {
+  return mode !== 'off' && (mode === 'auto' || trigger === 'manual');
+}
+
+/**
  * The outbox kinds this pass may CLAIM. Rows of every other kind stay `pending`
  * and in order until a pass whose filter includes them comes along — the whole
  * "manual delays work, it never drops it" contract, expressed as a claim
@@ -246,7 +292,40 @@ function drainKinds(
   const kinds: TrackerOutboxRow['kind'][] = [];
   if (directionRuns(connection.status_sync_mode, trigger)) kinds.push(...STATUS_OUTBOX_KINDS);
   if (directionRuns(connection.push_mode, trigger)) kinds.push(...PUSH_OUTBOX_KINDS);
+  if (contentDirectionRuns(connection.content_sync_mode, trigger)) kinds.push(...CONTENT_OUTBOX_KINDS);
+  if (contentDirectionRuns(connection.archive_sync_mode, trigger)) kinds.push(...ARCHIVE_OUTBOX_KINDS);
   return kinds;
+}
+
+/**
+ * The outbox kinds NO trigger can drain for this connection right now — the
+ * exact complement {@link drainKinds} can never include, whatever the trigger.
+ *
+ * Only the two migration-112 modes have an `'off'` state at all; the other
+ * three are binary (`TrackerDirectionMode = 'auto' | 'manual'`), so their kinds
+ * are always claimable by SOME trigger and can never become undrainable. That
+ * is a type-level guarantee, not a convention — which is why this reads the two
+ * content-sync modes directly rather than asking {@link drainKinds} what it
+ * left out.
+ */
+function undrainableKinds(connection: TrackerConnectionRow): {
+  kinds: TrackerOutboxRow['kind'][];
+  reason: string;
+}[] {
+  const off: { kinds: TrackerOutboxRow['kind'][]; reason: string }[] = [];
+  if (connection.content_sync_mode === 'off') {
+    off.push({
+      kinds: [...CONTENT_OUTBOX_KINDS],
+      reason: 'cancelled — content sync is off for this connection',
+    });
+  }
+  if (connection.archive_sync_mode === 'off') {
+    off.push({
+      kinds: [...ARCHIVE_OUTBOX_KINDS],
+      reason: 'cancelled — archive sync is off for this connection',
+    });
+  }
+  return off;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,21 +429,39 @@ export function defaultAdapterFactory(
   connection: TrackerConnectionRow,
   secret: string,
 ): TrackerAdapter {
-  if (connection.provider === 'linear') {
-    return new LinearAdapter({ apiKey: secret });
+  switch (connection.provider) {
+    case 'linear':
+      return new LinearAdapter({ apiKey: secret });
+    case 'dart':
+      // Dart is cloud-only and workspace-scoped by the token itself, so it needs
+      // neither a base URL nor a workspace slug — the key alone addresses
+      // everything.
+      return new DartAdapter({ apiKey: secret });
+    case 'plane': {
+      const workspaceSlug = (connection.workspace_id ?? '').trim();
+      if (workspaceSlug.length === 0) {
+        throw new TrackerCredentialsError(
+          `connection ${connection.id}: plane connections need a workspace slug in workspace_id`,
+        );
+      }
+      return new PlaneAdapter({
+        apiKey: secret,
+        workspaceSlug,
+        // undefined (not null) so PlaneAdapter's own `?? DEFAULT_BASE_URL` applies.
+        baseUrl: connection.base_url ?? undefined,
+      });
+    }
+    default: {
+      // Exhaustiveness guard: TrackerProvider gained a member and this factory
+      // did not. A `never` binding turns that into a COMPILE error, so the
+      // failure surfaces at the seam rather than as a connection silently
+      // adopting whichever adapter the old if/else fell through to.
+      const unreachable: never = connection.provider;
+      throw new TrackerCredentialsError(
+        `connection ${connection.id}: unsupported tracker provider ${String(unreachable)}`,
+      );
+    }
   }
-  const workspaceSlug = (connection.workspace_id ?? '').trim();
-  if (workspaceSlug.length === 0) {
-    throw new TrackerCredentialsError(
-      `connection ${connection.id}: plane connections need a workspace slug in workspace_id`,
-    );
-  }
-  return new PlaneAdapter({
-    apiKey: secret,
-    workspaceSlug,
-    // undefined (not null) so PlaneAdapter's own `?? DEFAULT_BASE_URL` applies.
-    baseUrl: connection.base_url ?? undefined,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +570,7 @@ export class TrackerSyncService implements TrackerSyncFacade {
     if (this.timer !== null) return;
 
     this.recoverInFlightWrites();
+    this.reconcilePushTargets();
 
     this.listener = createWriteBackListener({ db: this.db, nowIso: this.nowIso });
     this.subscription = (event: TaskChangedEvent): void => this.handleTaskChanged(event);
@@ -510,6 +608,36 @@ export class TrackerSyncService implements TrackerSyncFacade {
     }
     this.listener?.dispose();
     this.listener = null;
+  }
+
+  /**
+   * Boot repair for the one-pusher-per-(project, provider) invariant. connect()
+   * never leaves two armed rows behind, but a ledger-wiped migration replay
+   * can: 105's table recreate predates 109, so a full replay drops push_target
+   * and 109 re-adds it at DEFAULT 1 on EVERY row (109's header documents this).
+   * Left alone, the next pushed idea would file one remote issue per armed
+   * sibling. The oldest ARMED row keeps the flag — stable, and for any
+   * pre-replay state the row most likely to have held it; a row someone
+   * deliberately demoted is never re-armed by the repair.
+   */
+  private reconcilePushTargets(): void {
+    try {
+      for (const pair of listDuplicatePushTargets(this.db)) {
+        const rows = listConnectionsForProviderProject(this.db, pair.project_id, pair.provider);
+        const armed = rows.filter((row) => row.push_target === 1);
+        if (armed.length === 0) continue;
+        claimPushTarget(this.db, pair.project_id, pair.provider, armed[0].id);
+        this.logger?.warn('[trackerSync] boot recovery: demoted duplicate push targets', {
+          projectId: pair.project_id,
+          provider: pair.provider,
+          keptConnectionId: armed[0].id,
+        });
+      }
+    } catch (err) {
+      this.logger?.error('[trackerSync] boot recovery: push-target reconciliation failed', {
+        error: describeError(err),
+      });
+    }
   }
 
   /**
@@ -716,6 +844,10 @@ export class TrackerSyncService implements TrackerSyncFacade {
 
       if (!paused && inboundAllowed) {
         if (!this.isStillActive(connectionId)) return abandonedResult(connectionId, entries);
+        // THE LAST MOMENT BEFORE THE BLOCKER SCAN, and deliberately not earlier
+        // — see {@link settleUndrainableRows} for why every requeue source in
+        // this pass has to have run first.
+        this.settleUndrainableRows(connection, entries);
         entries.push({ marker: '▸', line: 'GET issues' });
         const inbound = await runInboundSync(
           {
@@ -798,7 +930,12 @@ export class TrackerSyncService implements TrackerSyncFacade {
     entries: TrackerSyncLogEntry[],
     allowedKinds: readonly TrackerOutboxRow['kind'][],
   ): Promise<WriteBackOutcome> {
-    const deps: OutboxDeps = { db: this.db, adapterFor: () => adapter, nowIso: this.nowIso };
+    const deps: OutboxDeps = {
+      db: this.db,
+      adapterFor: () => adapter,
+      router: this.router,
+      nowIso: this.nowIso,
+    };
     // DELIBERATELY NOT kind-filtered: an `ambiguous` row is a write whose
     // outcome nobody knows, and leaving one unreconciled halts the inbound
     // batch for every direction. Reconciling is establishing what already
@@ -848,7 +985,12 @@ export class TrackerSyncService implements TrackerSyncFacade {
     if (!hasUnresolvedCreateRecovery(this.db, connection.id, adapter)) {
       return { proceed: true, paused: false };
     }
-    const deps: OutboxDeps = { db: this.db, adapterFor: () => adapter, nowIso: this.nowIso };
+    const deps: OutboxDeps = {
+      db: this.db,
+      adapterFor: () => adapter,
+      router: this.router,
+      nowIso: this.nowIso,
+    };
     const recovered = await processAmbiguous(deps, connection);
     appendWriteBackLines(entries, recovered, null);
     if (recovered.authPaused) return { proceed: false, paused: true };
@@ -857,6 +999,66 @@ export class TrackerSyncService implements TrackerSyncFacade {
     }
     entries.push({ marker: '⚠', line: 'inbound deferred · unresolved create recovery' });
     return { proceed: false, paused: false };
+  }
+
+  /**
+   * SELF-HEALING GATE against a permanent inbound stall: settle every PENDING
+   * row whose direction is currently `'off'`, whatever kind it is.
+   *
+   * WHY THE FLIP-TIME SWEEP IS NOT ENOUGH, even though it exists and stays.
+   * `updateSettings` settles the rows that are pending AT THE MOMENT of the
+   * flip, which is the right thing to do for immediacy — but `pending` is not a
+   * terminal state, and rows keep ARRIVING in it from behind:
+   *
+   *   - an `in_flight` row (deliberately left alone by the flip, since its
+   *     request cannot be recalled) fails retryably afterwards, and
+   *     `resolveOutbox`'s retry arm puts it back to `pending`;
+   *   - an `ambiguous` row (likewise left alone) is requeued to `pending` by
+   *     {@link processAmbiguous} — every non-create kind takes that path by
+   *     design, because re-performing them is idempotent;
+   *   - a crash mid-flight demotes to `ambiguous` at boot and then follows the
+   *     same route.
+   *
+   * Each of those lands a claimable-looking row of a kind
+   * {@link claimNextPending} will never claim — and `collectOutboxBlockers` is
+   * KIND-AGNOSTIC, so `runInboundSync` halts at that issue on every pass,
+   * forever. Chasing the transitions individually would mean auditing every
+   * present and future path into `pending`; asking the question once per pass,
+   * where the modes are already resolved, cannot be forgotten by code written
+   * later.
+   *
+   * PLACED IMMEDIATELY BEFORE THE INBOUND FETCH, which is the only correct
+   * point and was worth getting wrong once to learn. It has to be LATE enough
+   * that every requeue source in this pass has already run — `processAmbiguous`
+   * fires twice per pass (once inside the write-back phase, once inside
+   * {@link recoverCreatesBeforeInbound}) and each one can move an off-kind row
+   * from `ambiguous` to `pending`, so a sweep at the top of the pass heals rows
+   * that are then re-stranded behind it. And EARLY enough to precede
+   * `runInboundSync`, which is where `collectOutboxBlockers` reads the queue
+   * and where the stall would otherwise materialize.
+   *
+   * The drain needs no protection from either side of that: `claimNextPending`
+   * is already filtered by {@link drainKinds}, so an off-kind row is invisible
+   * to it whether or not this has run. The debounced write-back drain
+   * ({@link drainConnection}) therefore does not call this at all — it performs
+   * no inbound fetch, so it has no blocker scan to protect, and the next full
+   * pass heals whatever it leaves.
+   */
+  private settleUndrainableRows(
+    connection: TrackerConnectionRow,
+    entries: TrackerSyncLogEntry[],
+  ): void {
+    let settled = 0;
+    for (const off of undrainableKinds(connection)) {
+      settled += cancelPendingKinds(this.db, connection.id, off.kinds, off.reason);
+    }
+    if (settled === 0) return;
+    // Loud, not silent: these are writes the user's own edits produced, and
+    // dropping them is a consequence of a setting they may not connect to it.
+    entries.push({
+      marker: '⚠',
+      line: `${plural(settled, 'queued write')} dropped · that direction is off`,
+    });
   }
 
   /**
@@ -1110,6 +1312,11 @@ export class TrackerSyncService implements TrackerSyncFacade {
       status_sync_mode: 'manual',
       pull_mode: 'manual',
       push_mode: 'manual',
+      push_target: 0,
+      content_sync_mode: 'off',
+      archive_sync_mode: 'off',
+      priority_mapping_json: '{}',
+      category_mapping_json: '{}',
       mirror_subissues: 0,
       conflict_mode: 'auto',
       cursor_updated_at: null,
@@ -1122,9 +1329,94 @@ export class TrackerSyncService implements TrackerSyncFacade {
     return this.adapterFactory(scratch, credentials.apiKey);
   }
 
+  /**
+   * The credentials an EXISTING connection already holds, decrypted — the
+   * "add another mapping to this connection" path's answer to "where is the key".
+   *
+   * Mapping management re-enters the wizard from a connection the user has
+   * already authorized, so re-asking for the key would be a worse question than
+   * not asking: the same key is sitting encrypted on the row, and every probe the
+   * wizard makes is against that same workspace and instance. Addressing
+   * (`baseUrl`) and Plane's slug (`workspaceSlug`) come off the ROW rather than
+   * from anything the renderer sends — this resolves a key, it never re-points a
+   * connection at a different instance.
+   *
+   * A DISCONNECTED row is treated as absent: `disconnect` deliberately clears the
+   * ciphertext, so there is no key to reuse and "not found" is the honest answer
+   * rather than an auth failure the user cannot act on.
+   *
+   * @throws {TrackerConnectionNotFoundError} unknown or retired connection id.
+   * @throws {TrackerAuthError} the stored key is missing or undecryptable
+   *   (mapped to UNAUTHORIZED — the actionable fix is pasting a fresh key).
+   */
+  private credentialsForConnection(connectionId: string): TrackerCredentialsInput {
+    const row = getConnection(this.db, connectionId);
+    if (row === null || row.status === 'disconnected') {
+      throw new TrackerConnectionNotFoundError(connectionId);
+    }
+    const cipher = readSecret(this.db, connectionId);
+    if (cipher === null || cipher.length === 0) {
+      throw new TrackerAuthError(
+        row.provider,
+        'stored API key for this connection is unusable — reconnect with a fresh key',
+      );
+    }
+    let secret: string;
+    try {
+      secret = decryptTrackerSecret(cipher);
+    } catch {
+      throw new TrackerAuthError(
+        row.provider,
+        'stored API key for this connection is unusable — reconnect with a fresh key',
+      );
+    }
+    return {
+      provider: row.provider,
+      apiKey: secret,
+      baseUrl: row.base_url ?? undefined,
+      workspaceSlug: row.workspace_id ?? undefined,
+    };
+  }
+
+  /**
+   * Resolve a wizard probe's credential SOURCE — a pasted key or an existing
+   * connection's stored one — into the credentials the probe runs with.
+   *
+   * EXACTLY ONE, enforced rather than defaulted: the two keys answer the same
+   * question, so a payload carrying both is a caller bug (which key did it mean?)
+   * and one carrying neither cannot probe anything. A plain Error, because there
+   * is no renderer-actionable distinction to make — the tRPC layer refines the
+   * same rule and rejects it as BAD_REQUEST before it reaches here.
+   */
+  private credentialsFromSource(source: TrackerWizardSourceInput): TrackerCredentialsInput {
+    if (source.credentials !== undefined) {
+      if (source.connectionId !== undefined) {
+        throw new Error('exactly one of credentials / connectionId');
+      }
+      return source.credentials;
+    }
+    if (source.connectionId === undefined) {
+      throw new Error('exactly one of credentials / connectionId');
+    }
+    return this.credentialsForConnection(source.connectionId);
+  }
+
   /** Live credential probe — the wizard's "Authorized as …" card. */
   async wizardValidate(credentials: TrackerCredentialsInput): Promise<TrackerWorkspaceIdentity> {
     return this.adapterForCredentials(credentials).validateCredentials();
+  }
+
+  /**
+   * The Map step's groups — every tracker grouping that can be mapped onto a
+   * cyboflow project, each carrying the source selection a `connect` for it
+   * would persist.
+   *
+   * Takes a credential SOURCE rather than credentials: mapping management
+   * re-enters this step from an already-authorized connection, and that run has
+   * no pasted key to offer (see {@link credentialsForConnection}).
+   */
+  async wizardGroups(source: TrackerWizardSourceInput): Promise<TrackerGroupTree> {
+    return this.adapterForCredentials(this.credentialsFromSource(source)).listGroups();
   }
 
   /** Wizard Step 1, top level (Linear teams / Plane projects). */
@@ -1140,24 +1432,52 @@ export class TrackerSyncService implements TrackerSyncFacade {
     return this.adapterForCredentials(credentials).listNarrows(containerId);
   }
 
-  /** Wizard Step 3 — the source's states, with canonical groups for the mapping table. */
+  /**
+   * Wizard Step 3 — the source's states, with canonical groups for the mapping
+   * table. Credential SOURCE, like {@link wizardGroups}.
+   */
   async wizardStates(
-    credentials: TrackerCredentialsInput,
+    source: TrackerWizardSourceInput,
     selection: TrackerSourceSelection,
   ): Promise<TrackerState[]> {
-    return this.adapterForCredentials(credentials).listStates(selection);
+    return this.adapterForCredentials(this.credentialsFromSource(source)).listStates(selection);
+  }
+
+  /**
+   * The provider's own priority and type vocabularies, backing the
+   * priority/category mapping tables. Credential SOURCE, like
+   * {@link wizardStates}: mapping management re-enters this step from an
+   * already-authorized connection with no pasted key to offer.
+   *
+   * NO SELECTION ARGUMENT, unlike wizardStates: none of the three providers
+   * scopes these lists to a container (Dart's are workspace-wide `/config`
+   * lists; Linear's and Plane's are fixed scales), so asking for one would
+   * invent a dependency the seam does not have.
+   *
+   * The seeded mappings are computed HERE, main-side, over the just-fetched
+   * live options — never left for the wizard to re-derive, which would
+   * duplicate priorityMapping.ts/categoryMapping.ts's seed tables client-side.
+   */
+  async wizardFieldOptions(source: TrackerWizardSourceInput): Promise<TrackerFieldOptions> {
+    const credentials = this.credentialsFromSource(source);
+    const options = await this.adapterForCredentials(credentials).listFieldOptions();
+    return {
+      ...options,
+      defaultPriorityMapping: seedDefaultPriorityMapping(credentials.provider, options.priorities),
+      defaultCategoryMapping: seedDefaultCategoryMapping(credentials.provider, options.categories),
+    };
   }
 
   /**
    * Wizard Step 2 — every issue in the chosen source (no `since` bound: the
    * wizard's pickers and the Reconcile suggestions need the full set, not an
-   * incremental slice).
+   * incremental slice). Credential SOURCE, like {@link wizardGroups}.
    */
   async wizardIssues(
-    credentials: TrackerCredentialsInput,
+    source: TrackerWizardSourceInput,
     selection: TrackerSourceSelection,
   ): Promise<TrackerIssue[]> {
-    return this.adapterForCredentials(credentials).listIssues(selection);
+    return this.adapterForCredentials(this.credentialsFromSource(source)).listIssues(selection);
   }
 
   // -------------------------------------------------------------------------
@@ -1207,7 +1527,10 @@ export class TrackerSyncService implements TrackerSyncFacade {
    * Persist a connection from the wizard's Review step and start syncing it.
    *
    * ORDER IS DELIBERATE:
-   *   1. Probe the key live, then encrypt it. The wizard validated it in Step 0,
+   *   0. Probe the key live, and if this exact mapping is ALREADY connected,
+   *      return its id and do nothing else — the multi-mapping wizard retries
+   *      failed connects by re-submitting the whole set (see below).
+   *   1. Then encrypt the key. The wizard validated it in Step 0,
    *      but the row's identity columns — and Plane's addressing slug — come
    *      from the LIVE identity, not from anything the renderer typed; and a
    *      safeStorage refusal must be known before anything is written.
@@ -1228,21 +1551,90 @@ export class TrackerSyncService implements TrackerSyncFacade {
    *      and connect then failed with no connection to show for them.
    *   4. Kick the first pass fire-and-forget: the wizard closes on the mutation's
    *      return, and the first pass is a full network round-trip.
+   *
+   * THE KEY may be pasted (`credentials`) or borrowed from a connection the user
+   * already authorized (`sourceConnectionId` — mapping management adding a second
+   * group to an existing connection). Exactly one, resolved once here; from that
+   * line on this method cannot tell which it was, so every behaviour below —
+   * the live probe, the idempotent re-submit, the revival, claimPushTarget — is
+   * byte-for-byte what a pasted key always did.
    */
   async connect(payload: TrackerConnectPayload): Promise<{ connectionId: string }> {
-    const identity = await this.adapterForCredentials(payload.credentials).validateCredentials();
-    const cipher = encryptTrackerSecret(payload.credentials.apiKey);
+    const credentials = this.credentialsFromSource({
+      credentials: payload.credentials,
+      connectionId: payload.sourceConnectionId,
+    });
+    const identity = await this.adapterForCredentials(credentials).validateCredentials();
+
+    // IDEMPOTENT RE-SUBMIT. The multi-mapping wizard calls connect once per
+    // mapping, sequentially, and offers a retry when one of them fails — so the
+    // retry re-runs the mappings that already SUCCEEDED. Without this, each
+    // re-run would mint a second row for the same (project, source) pair: two
+    // connections polling one scope, each importing the other's issues as new
+    // ideas, and each pushing its own copy back.
+    //
+    // The match is the mapping's full identity — project, provider, workspace,
+    // instance, and the FULL source scope (container + narrow + kind: every
+    // Linear project group under one team shares the team's containerId, so a
+    // container-only match would swallow the team's second mapping) — so it
+    // recognizes only a row this same submit would have created. The reconcile
+    // decisions are skipped, not re-run: the successful call applied them, and
+    // re-applying would re-archive rows the user has since restored. What IS
+    // re-applied is everything the re-submit legitimately carries fresh: the
+    // just-validated key (a paused row's whole problem is a stale one — resume
+    // it and kick a pass), and the push-target choice (the wizard recomputes it
+    // from the live radio, so a retry after re-picking must land the new
+    // choice; the early return used to drop it, leaving two armed siblings).
+    const cipher = encryptTrackerSecret(credentials.apiKey);
+    const incomingScope: StoredSourceScope = {
+      containerId: payload.source.containerId,
+      narrowId: payload.source.narrowId,
+      narrowKind: payload.source.narrowKind,
+    };
+    const existing = listConnectionsByIdentity(
+      this.db,
+      credentials.provider,
+      identity.workspaceId,
+      credentials.baseUrl ?? null,
+    ).find(
+      (row) =>
+        row.project_id === payload.projectId &&
+        sourceScopeEquals(storedSourceScope(row), incomingScope),
+    );
+    if (existing !== undefined) {
+      storeSecret(this.db, existing.id, cipher);
+      if (payload.pushTarget === false) {
+        updateConnectionSettings(this.db, existing.id, { push_target: 0 });
+      } else {
+        claimPushTarget(this.db, payload.projectId, credentials.provider, existing.id);
+      }
+      if (existing.status === 'paused') {
+        updateConnectionSettings(this.db, existing.id, {
+          status: 'active',
+          workspace_name: identity.workspaceName,
+          actor_label: identity.actorLabel,
+        });
+        void this.syncNow(existing.id).catch((err: unknown) => {
+          this.logger?.error('[trackerSync] sync after a paused mapping was re-connected failed', {
+            connectionId: existing.id,
+            error: describeError(err),
+          });
+        });
+      }
+      this.emitTrackerChange(payload.projectId, existing.id, 'connection');
+      return { connectionId: existing.id };
+    }
 
     // The row the wizard just described, composed ONCE so the insert and the
     // re-connect path below cannot drift apart.
     const row: Omit<NewConnectionRow, 'id'> = {
       project_id: payload.projectId,
-      provider: payload.credentials.provider,
+      provider: credentials.provider,
       status: 'active',
       workspace_id: identity.workspaceId,
       workspace_name: identity.workspaceName,
       actor_label: identity.actorLabel,
-      base_url: payload.credentials.baseUrl ?? null,
+      base_url: credentials.baseUrl ?? null,
       // Written by storeSecret below, never inline — the plaintext-never-touches
       // -sqlite invariant lives in exactly one call site.
       secret_ciphertext: null,
@@ -1258,6 +1650,18 @@ export class TrackerSyncService implements TrackerSyncFacade {
       status_sync_mode: payload.statusSyncMode,
       pull_mode: payload.pullMode,
       push_mode: payload.pushMode,
+      // Omitted = the push target, which is what a single-mapping connect (every
+      // pre-rev-4 one) means. Only the Map step's sibling mappings send false.
+      push_target: payload.pushTarget === false ? 0 : 1,
+      // Omitted = 'off' (the column default) — a pre-Phase-6 caller that never
+      // offered the control.
+      content_sync_mode: payload.contentSyncMode ?? 'off',
+      archive_sync_mode: payload.archiveSyncMode ?? 'off',
+      // Omitted = the seed only, no user override — same reasoning.
+      priority_mapping_json:
+        payload.priorityMapping !== undefined ? JSON.stringify(payload.priorityMapping) : '{}',
+      category_mapping_json:
+        payload.categoryMapping !== undefined ? JSON.stringify(payload.categoryMapping) : '{}',
       mirror_subissues: payload.mirrorSubissues ? 1 : 0,
       conflict_mode: payload.conflictMode,
       cursor_updated_at: null,
@@ -1283,24 +1687,35 @@ export class TrackerSyncService implements TrackerSyncFacade {
     // different workspace, a different INSTANCE of the same workspace slug, or
     // one whose identity was never recorded, still mints.
     //
-    // A different SOURCE (team/project/cycle) on the SAME workspace+instance is
-    // deliberately still a revival, because a narrowed scope cannot strand a
-    // link: the cursor reset re-fetches the new scope from the beginning, and a
-    // link whose issue now falls OUTSIDE it is protected by the deletion sweep's
-    // selection-independent point lookup — absence from a scoped listing is
-    // confirmed against getIssue before anything is archived, so out-of-scope
-    // reads as out-of-scope, not as deleted (see runDeletionSweep).
+    // A different SOURCE SCOPE is a different MAPPING under multi-project
+    // mapping and mints its own row, which is why the full scope triple joins
+    // the revival key — container alone would let a Linear team's second
+    // project group revive (and repoint) its sibling's retired row. The
+    // deliberate exceptions are store.revivableSourceMatch's WIDENING arms —
+    // a whole-container scope claims any narrow of that container, a Dart
+    // SPACE scope claims its member boards — because a superset scope cannot
+    // strand a retained link, and pre-rev-4 rows (board- or narrow-scoped)
+    // would otherwise re-import their whole backlog as duplicates.
     const revivable = findDisconnectedConnection(
       this.db,
       payload.projectId,
-      payload.credentials.provider,
+      credentials.provider,
       identity.workspaceId,
-      payload.credentials.baseUrl ?? null,
+      credentials.baseUrl ?? null,
+      incomingScope,
     );
     const connectionId = revivable?.id ?? `trk_${randomUUID()}`;
     if (revivable === null) insertConnection(this.db, { id: connectionId, ...row });
     else reactivateConnection(this.db, connectionId, row);
     storeSecret(this.db, connectionId, cipher);
+    // Enforce the one-pusher-per-(project, provider) invariant across WIZARD
+    // RUNS: a later run mapping a second group into an already-mapped project
+    // arrives here with pushTarget true (its own run's cluster default) while
+    // the earlier row is still armed — the newest choice wins and the sibling
+    // is demoted, else one new idea would file one remote issue per armed row.
+    if (payload.pushTarget !== false) {
+      claimPushTarget(this.db, payload.projectId, credentials.provider, connectionId);
+    }
 
     // OWNERSHIP FIRST. A reconcile decision names an entity by bare id, and the
     // payload is a wizard submission that can be minutes stale — composed
@@ -1371,7 +1786,7 @@ export class TrackerSyncService implements TrackerSyncFacade {
           connection_id: connectionId,
           entity_type: decision.entityType,
           entity_id: decision.entityId,
-          provider: payload.credentials.provider,
+          provider: credentials.provider,
           external_id: externalId,
           // BASELINE LEFT NULL on purpose: we hold no remote snapshot here, and
           // inbound's first pass ADOPTS the issue's current snapshot for a
@@ -1438,6 +1853,10 @@ export class TrackerSyncService implements TrackerSyncFacade {
    *      (outboxWorker.pauseConnection), which now replays in order.
    *   5. Kick a pass fire-and-forget, like connect, so the user sees it work.
    *
+   * Steps 3-5 run for EVERY live row sharing this key's (provider, workspace,
+   * instance) — the sibling mappings a multi-project connect minted — so one
+   * paste resumes all of them; see the fan-out note at the store call.
+   *
    * @throws {TrackerConnectionNotFoundError} unknown connection id.
    * @throws {TrackerIdentityMismatchError} the key authorizes another workspace.
    */
@@ -1459,22 +1878,44 @@ export class TrackerSyncService implements TrackerSyncFacade {
     }
 
     const cipher = encryptTrackerSecret(apiKey);
-    storeSecret(this.db, connectionId, cipher);
-    updateConnectionSettings(this.db, connectionId, {
-      status: 'active',
-      // The authorizing user can legitimately change with the key; the workspace
-      // cannot (step 2 just proved it).
-      workspace_name: identity.workspaceName,
-      actor_label: identity.actorLabel,
-    });
-    this.emitTrackerChange(connection.project_id, connectionId, 'connection');
-
-    void this.syncNow(connectionId).catch((err: unknown) => {
-      this.logger?.error('[trackerSync] sync after a credential rotation failed', {
-        connectionId,
-        error: describeError(err),
+    // FAN OUT ACROSS THE SIBLING MAPPINGS. Multi-project mapping mints one row
+    // per (tracker group -> cyboflow project) pair, each holding its OWN copy of
+    // the same encrypted key — so a rotation applied to the named row alone
+    // would leave every sibling paused on a key that no longer works, with the
+    // connected view offering no way to fix them but re-pasting the key once per
+    // mapping. The identity probe above already proved this key for the shared
+    // (provider, workspace, instance); each row gets exactly the treatment the
+    // single-row path always gave it.
+    //
+    // The NAMED row leads the list unconditionally, rather than being taken from
+    // the lookup: `listConnectionsByIdentity` skips disconnected rows (a
+    // rotation must not silently re-arm a connection someone retired), and the
+    // caller named this one explicitly.
+    const siblings = listConnectionsByIdentity(
+      this.db,
+      connection.provider,
+      identity.workspaceId,
+      connection.base_url,
+    );
+    const rotating = [connection, ...siblings.filter((row) => row.id !== connection.id)];
+    for (const sibling of rotating) {
+      storeSecret(this.db, sibling.id, cipher);
+      updateConnectionSettings(this.db, sibling.id, {
+        status: 'active',
+        // The authorizing user can legitimately change with the key; the
+        // workspace cannot (step 2 just proved it).
+        workspace_name: identity.workspaceName,
+        actor_label: identity.actorLabel,
       });
-    });
+      this.emitTrackerChange(sibling.project_id, sibling.id, 'connection');
+
+      void this.syncNow(sibling.id).catch((err: unknown) => {
+        this.logger?.error('[trackerSync] sync after a credential rotation failed', {
+          connectionId: sibling.id,
+          error: describeError(err),
+        });
+      });
+    }
 
     return identity;
   }
@@ -1482,6 +1923,87 @@ export class TrackerSyncService implements TrackerSyncFacade {
   /** The project's connected-view cards (disconnected connections are not listed). */
   async connections(projectId: number): Promise<TrackerConnectionSummary[]> {
     return listConnections(this.db, projectId).map((row) => this.summarizeConnection(row));
+  }
+
+  /**
+   * Every LIVE mapping sharing this connection's tracker identity — `(provider,
+   * workspace_id, base_url)` — ACROSS PROJECTS, which is what makes it a
+   * different question from {@link connections}.
+   *
+   * The management view's model. A rev-4 wizard run mints one sibling row per
+   * (tracker group -> cyboflow project) pair, all on one authorization, and the
+   * user's mental object is that authorization, not any one row: "which groups
+   * am I syncing, into which projects, and which one pushes?" A per-project
+   * listing can never answer it, because the siblings are in OTHER projects by
+   * construction.
+   *
+   * The NAMED row is always in the result, even retired: `listConnectionsByIdentity`
+   * deliberately skips disconnected rows (a rotation must not re-arm one), but a
+   * user who navigated to this connection is owed its own card back. It leads the
+   * list in that case; otherwise the store's own oldest-first order stands.
+   *
+   * A row whose `workspace_id` was never recorded has no identity to fan out on
+   * (see {@link connectionMatchesIdentity}: an identity we never learned cannot be
+   * claimed BY identity), so it is a mapping set of exactly itself.
+   *
+   * @throws {TrackerConnectionNotFoundError} unknown connection id. A DISCONNECTED
+   *   one is allowed through — it is a real row with a real mapping set.
+   */
+  async mappings(connectionId: string): Promise<TrackerConnectionSummary[]> {
+    const row = getConnection(this.db, connectionId);
+    if (row === null) throw new TrackerConnectionNotFoundError(connectionId);
+    if (row.workspace_id === null) return [this.summarizeConnection(row)];
+
+    const siblings = listConnectionsByIdentity(
+      this.db,
+      row.provider,
+      row.workspace_id,
+      row.base_url,
+    ).map((sibling) => this.summarizeConnection(sibling));
+    return row.status === 'disconnected'
+      ? [this.summarizeConnection(row), ...siblings]
+      : siblings;
+  }
+
+  /**
+   * ARM this mapping as its (project, provider) pair's one push target, demoting
+   * whichever sibling held it.
+   *
+   * The management view's edit for the choice the wizard's Map step makes once
+   * and then has no way to revisit: which of N mappings into one project files a
+   * locally-created idea as a new tracker issue. Enforced through the same
+   * {@link claimPushTarget} statement connect uses, so the "at most one pusher
+   * per (project, provider)" invariant has exactly one implementation — an
+   * `updateSettings`-style per-row write could leave two armed rows, and one new
+   * idea would file two remote issues.
+   *
+   * A DISCONNECTED row is refused: it has no key and syncs nothing, so arming it
+   * would leave the project with no live pusher at all.
+   *
+   * A PAUSED row is refused only while an ACTIVE sibling is carrying the role:
+   * the paused row enqueues nothing (write-back skips on status before
+   * push_target) and a locally-created idea is pushed exactly once, at creation
+   * — never back-filled — so the swap would drop every idea filed until the row
+   * reconnects. With NO active sibling (a key expiry paused the whole pair)
+   * the arm is allowed as pre-designation: it costs nothing now and self-heals
+   * the moment a fresh key lands.
+   *
+   * @throws {TrackerConnectionNotFoundError} unknown or retired connection id.
+   * @throws {TrackerConnectionPausedError} paused row while an active sibling pushes.
+   */
+  async setPushTarget(connectionId: string): Promise<void> {
+    const row = getConnection(this.db, connectionId);
+    if (row === null || row.status === 'disconnected') {
+      throw new TrackerConnectionNotFoundError(connectionId);
+    }
+    if (row.status !== 'active') {
+      const live = listConnectionsForProviderProject(this.db, row.project_id, row.provider);
+      if (live.some((sibling) => sibling.id !== row.id && sibling.status === 'active')) {
+        throw new TrackerConnectionPausedError(connectionId);
+      }
+    }
+    claimPushTarget(this.db, row.project_id, row.provider, row.id);
+    this.emitTrackerChange(row.project_id, row.id, 'connection');
   }
 
   /** Project one connection row onto its renderer-visible summary (never the key). */
@@ -1495,16 +2017,26 @@ export class TrackerSyncService implements TrackerSyncFacade {
       actorLabel: row.actor_label ?? '',
       baseUrl: row.base_url,
       sourceLabel: readSourceLabel(row),
+      sourceScope: readSourceScope(row),
       selectionMode: row.selection_mode,
       statusSyncMode: row.status_sync_mode,
       pullMode: row.pull_mode,
       pushMode: row.push_mode,
+      contentSyncMode: row.content_sync_mode,
+      archiveSyncMode: row.archive_sync_mode,
       mirrorSubissues: row.mirror_subissues === 1,
       conflictMode: row.conflict_mode,
+      pushTarget: row.push_target !== 0,
       // resolveEffectiveMapping over an EMPTY state list is exactly "the stored
       // overlay, filtered to valid targets" — the defensive parse we want, with
       // no network round-trip for the provider's live state list.
       stateMapping: resolveEffectiveMapping([], row.state_mapping_json),
+      // No live options round-trip for a summary read either — same
+      // no-network-call reasoning as stateMapping above; the seed's static
+      // canonical tokens (or, for Dart, whatever the overlay itself names)
+      // are what a summary can answer without probing the provider.
+      priorityMapping: resolveEffectivePriorityMapping(row.provider, null, row.priority_mapping_json),
+      categoryMapping: resolveEffectiveCategoryMapping(row.provider, null, row.category_mapping_json),
       lastSyncAt: row.last_sync_at,
       lastSyncLog: parseLogEntries(row.last_sync_log_json),
       linkedCount: listLinks(this.db, row.id, { activeOnly: true }).length,
@@ -1516,6 +2048,14 @@ export class TrackerSyncService implements TrackerSyncFacade {
    * Patch the connected view's editable settings. Only the keys present on
    * `patch` are written (mirroring the store's own patch semantics); an unknown
    * connection id is an idempotent no-op.
+   *
+   * TURNING A CONTENT DIRECTION OFF ALSO CLEARS ITS QUEUE — see
+   * {@link cancelPendingKinds}. Flipping `auto`/`manual` → `'off'` while rows
+   * are still pending would STRAND them: `'off'` is enforced at the claim, so
+   * nothing (not even "Sync now") would ever drain them, and the kind-agnostic
+   * inbound blocker would halt the pass at those issues forever. The sweep runs
+   * after the write so it can never settle rows for a mode the write then
+   * failed to apply, and only for the direction the user actually turned off.
    */
   async updateSettings(connectionId: string, patch: TrackerSettingsPatch): Promise<void> {
     const connection = getConnection(this.db, connectionId);
@@ -1524,6 +2064,14 @@ export class TrackerSyncService implements TrackerSyncFacade {
       ...(patch.statusSyncMode !== undefined ? { status_sync_mode: patch.statusSyncMode } : {}),
       ...(patch.pullMode !== undefined ? { pull_mode: patch.pullMode } : {}),
       ...(patch.pushMode !== undefined ? { push_mode: patch.pushMode } : {}),
+      ...(patch.contentSyncMode !== undefined ? { content_sync_mode: patch.contentSyncMode } : {}),
+      ...(patch.archiveSyncMode !== undefined ? { archive_sync_mode: patch.archiveSyncMode } : {}),
+      ...(patch.priorityMapping !== undefined
+        ? { priority_mapping_json: JSON.stringify(patch.priorityMapping) }
+        : {}),
+      ...(patch.categoryMapping !== undefined
+        ? { category_mapping_json: JSON.stringify(patch.categoryMapping) }
+        : {}),
       ...(patch.mirrorSubissues !== undefined
         ? { mirror_subissues: patch.mirrorSubissues ? 1 : 0 }
         : {}),
@@ -1539,6 +2087,24 @@ export class TrackerSyncService implements TrackerSyncFacade {
           }
         : {}),
     });
+
+    if (patch.contentSyncMode === 'off') {
+      cancelPendingKinds(
+        this.db,
+        connectionId,
+        CONTENT_OUTBOX_KINDS,
+        'cancelled — content sync was turned off for this connection',
+      );
+    }
+    if (patch.archiveSyncMode === 'off') {
+      cancelPendingKinds(
+        this.db,
+        connectionId,
+        ARCHIVE_OUTBOX_KINDS,
+        'cancelled — archive sync was turned off for this connection',
+      );
+    }
+
     this.emitTrackerChange(connection.project_id, connectionId, 'connection');
   }
 
@@ -1563,13 +2129,35 @@ export class TrackerSyncService implements TrackerSyncFacade {
   async disconnect(connectionId: string): Promise<void> {
     const connection = getConnection(this.db, connectionId);
     if (connection === null) return;
-    updateConnectionSettings(this.db, connectionId, { status: 'disconnected' });
+    // push_target cleared with the retirement so a later revival cannot
+    // resurrect a stale claim; the survivor promotion below is what keeps the
+    // (project, provider) pair pushing in the meantime.
+    updateConnectionSettings(this.db, connectionId, { status: 'disconnected', push_target: 0 });
     const timer = this.drainTimers.get(connectionId);
     if (timer !== undefined) {
       clearTimeout(timer);
       this.drainTimers.delete(connectionId);
     }
     clearSecret(this.db, connectionId);
+
+    // Retiring the ARMED mapping must not leave its (project, provider) pair
+    // with live rows and no pusher: writeBack.handleIdeaPush skips every
+    // push_target = 0 row, so the project would silently stop filing new ideas
+    // — no error, no repair (the boot reconciliation only fixes DUPLICATE
+    // claims). The oldest surviving live sibling inherits the flag, the same
+    // tie-break the boot repair uses; with no survivors this is a no-op.
+    if (connection.push_target === 1) {
+      const survivors = listConnectionsForProviderProject(
+        this.db,
+        connection.project_id,
+        connection.provider,
+      );
+      if (survivors.length > 0) {
+        claimPushTarget(this.db, connection.project_id, connection.provider, survivors[0].id);
+        this.emitTrackerChange(connection.project_id, survivors[0].id, 'connection');
+      }
+    }
+
     this.emitTrackerChange(connection.project_id, connectionId, 'connection');
   }
 
@@ -1655,12 +2243,12 @@ export class TrackerSyncService implements TrackerSyncFacade {
 
   /**
    * A three-way field conflict the Manual mode parked. 'remote' applies the
-   * stored `remote_value` to the entity; 'local' leaves the entity alone and —
-   * for a STAGE conflict only — queues the write-back that makes the tracker
-   * converge onto our stage. Title/description have no outbound path in v1 (the
-   * adapter seam writes state, not content), so accepting the local side of one
-   * is purely a "stop asking me" ruling. Either way the link's BASELINE has to
-   * move, or the ruling does not stick — see {@link acceptLocalFieldValue}.
+   * stored `remote_value` to the entity; 'local' leaves the entity alone and
+   * queues the write-back that makes the TRACKER converge onto our value — a
+   * state write for a stage conflict, a content write for the other four
+   * (title, description, priority, category). Either way the link's BASELINE
+   * has to move, or the ruling does not stick — see
+   * {@link acceptLocalFieldValue}.
    */
   private async resolveFieldConflict(
     connection: TrackerConnectionRow,
@@ -1690,6 +2278,14 @@ export class TrackerSyncService implements TrackerSyncFacade {
    * remote-unchanged + local-changed and lets the local value win silently,
    * while a LATER genuine remote edit still diverges from the stamp and
    * conflicts again — which is the whole point of keeping a baseline.
+   *
+   * STAMP BEFORE ENQUEUE, on every arm. The stamp is what the outbound content
+   * trigger diffs against, and the enqueue helpers dedupe against the rows that
+   * already exist — so stamping first means the ruling's own row is composed
+   * against a baseline that already tells the truth, and an entity event
+   * arriving in between cannot queue a second row for the same edit. It also
+   * mirrors {@link applyRemoteFieldValue}'s ordering, where the reason is
+   * sharper still (writeBack's listener runs INLINE inside applyChange).
    */
   private acceptLocalFieldValue(
     connection: TrackerConnectionRow,
@@ -1722,6 +2318,7 @@ export class TrackerSyncService implements TrackerSyncFacade {
       // A title conflict always carries the remote's title; a null would only
       // corrupt the baseline into unparseability, so it is left alone.
       if (conflict.remote_value !== null) this.stampBaseline(link, { title: conflict.remote_value });
+      this.enqueueContentWriteBack(connection, link);
       return;
     }
 
@@ -1729,7 +2326,25 @@ export class TrackerSyncService implements TrackerSyncFacade {
       // null is a legitimate remote description ("this issue has no body"), so
       // it is stamped as-is rather than guarded away.
       this.stampBaseline(link, { description: conflict.remote_value });
+      this.enqueueContentWriteBack(connection, link);
+      return;
     }
+
+    // MAPPED fields (priority / category). `remote_value` is the PROVIDER-RAW
+    // token, which is exactly what the baseline stores (invariant 2), so the
+    // stamp is a straight copy — no mapping is needed on this path at all. A
+    // null is legitimate (Dart spells a cleared priority as no value) and is
+    // stamped as-is, like a null description.
+    if (conflict.field === 'priority') this.stampBaseline(link, { priority: conflict.remote_value });
+    else if (conflict.field === 'category') {
+      this.stampBaseline(link, { category: conflict.remote_value });
+    } else {
+      // An unrecognized field (a row from a future build, or hand-edited): the
+      // conflict still resolves, but nothing is stamped and nothing is queued —
+      // guessing which field to write would be worse than doing nothing.
+      return;
+    }
+    this.enqueueContentWriteBack(connection, link);
   }
 
   /** Write one conflict's `remote_value` onto the linked entity, per field. */
@@ -1800,6 +2415,43 @@ export class TrackerSyncService implements TrackerSyncFacade {
         fields: { body: joinBody(remote, footer) },
       });
       this.stampBaseline(link, { description: remote });
+      return;
+    }
+
+    // MAPPED fields. The local value to write is NOT derived here: the pass that
+    // detected the conflict resolved it under the live mapping and recorded it
+    // on the payload, so this applies the pass's own answer rather than
+    // rebuilding a mapping (which would need the provider's live option list —
+    // a network call from a UI click, and one that could answer differently
+    // now). A row that carries none — written before this key existed, or
+    // hand-edited — applies nothing rather than guessing a level; the conflict
+    // still resolves and the next pass re-derives from the baseline.
+    const remoteLocal = readConflictRemoteLocal(conflict.payload_json);
+
+    if (conflict.field === 'priority') {
+      if (!isPriority(remoteLocal)) return;
+      // STAMP BEFORE APPLY, for the reason the stage arm above documents:
+      // writeBack's listener runs INLINE on TaskChangeRouter's post-commit emit,
+      // and from Phase 5 a content write-back triggers on the entity diverging
+      // from its baseline. A priority write that lands while the baseline still
+      // says otherwise reads as a LOCAL change and queues an echo of the value
+      // we just took FROM the tracker. A stamp left behind by a failed
+      // applyChange is still TRUE: it says only where the remote stands.
+      this.stampBaseline(link, { priority: remote });
+      await this.router.applyChange(connection.project_id, {
+        ...base,
+        fields: { priority: remoteLocal },
+      });
+      return;
+    }
+
+    if (conflict.field === 'category') {
+      if (!isCategory(remoteLocal)) return;
+      this.stampBaseline(link, { category: remote });
+      await this.router.applyChange(connection.project_id, {
+        ...base,
+        fields: { category: remoteLocal },
+      });
     }
   }
 
@@ -1875,6 +2527,63 @@ export class TrackerSyncService implements TrackerSyncFacade {
     return true;
   }
 
+  /**
+   * The remote write a "cancel it in the tracker" ruling turns into — see
+   * {@link dropLink} for the choice between the two and why the mode only gates
+   * the `'off'` end.
+   */
+  private enqueueRemovalWriteBack(
+    connection: TrackerConnectionRow,
+    link: EntityExternalLinkRow,
+  ): boolean {
+    // The SAME decision linksForEntity discloses to the removal dialog — the
+    // two must never disagree, or the dialog promises an action this enqueue
+    // does not perform.
+    const action = removalWriteBackAction(connection.provider, connection.archive_sync_mode);
+    if (action === 'archive') {
+      return enqueueArchiveWrite(
+        { db: this.db, nowIso: this.nowIso },
+        { link, connection },
+        link.entity_type,
+        link.entity_id,
+      );
+    }
+    return this.enqueueGroupWriteBack(connection, link, 'cancelled');
+  }
+
+  /**
+   * Queue ONE content write for a link's issue after the user accepts the LOCAL
+   * side of a title/description/priority/category conflict — the ruling's own
+   * convergence write, mirroring what {@link enqueueStageWriteBack} does for a
+   * stage conflict.
+   *
+   * GATED ON `content_sync_mode !== 'off'`, and this is the one enqueue site
+   * where that gate is easy to miss (invariant 5 calls it out by name). The
+   * `auto`/`manual` distinction says WHEN a ruling reaches the tracker and is
+   * therefore not consulted here — the enqueue is durable intent, and the drain
+   * is where a held direction waits. `'off'` says WHETHER, and an off-mode
+   * ruling must stamp the baseline ONLY: an `update_content` row it enqueued
+   * could not be claimed by any pass, not even "Sync now", while still halting
+   * the inbound batch at that issue forever.
+   *
+   * The payload is empty for the same reason writeBack's own content enqueue
+   * leaves it empty: the drain composes from the entity as it stands then.
+   */
+  private enqueueContentWriteBack(
+    connection: TrackerConnectionRow,
+    link: EntityExternalLinkRow,
+  ): void {
+    if (connection.content_sync_mode === 'off') return;
+    const entityType = link.entity_type;
+    if (entityType === 'epic') return;
+    enqueueContentWrite(
+      { db: this.db, nowIso: this.nowIso },
+      { link, connection },
+      entityType,
+      link.entity_id,
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Entity link lookup + the local-removal ruling
   //
@@ -1887,25 +2596,41 @@ export class TrackerSyncService implements TrackerSyncFacade {
   // -------------------------------------------------------------------------
 
   /**
-   * The live tracker link for one entity, or null when it is not synced.
-   * ORPHANED links read back as null: they point at an issue the remote no
-   * longer has, so an "open in Linear" affordance built on one would be a dead
-   * end.
+   * EVERY live tracker link for one entity — one per provider at most (the
+   * schema's `UNIQUE (entity_type, entity_id, provider)`). ORPHANED links are
+   * excluded: they point at an issue the remote no longer has, so an "open in
+   * Linear" affordance built on one would be a dead end.
+   *
+   * Was `linkForEntity`, returning only the FIRST provider's link: the removal
+   * dialog built on that shape disclosed one provider while
+   * {@link handleLocalRemoval}/{@link unlinkEntity} apply the ruling to EVERY
+   * live link — an entity synced to both Linear and Dart showed "Archive in
+   * Linear" while ALSO trashing the Dart task, undisclosed. The ruling itself
+   * stays global (a deleted entity must not leave a live link anywhere), so the
+   * fix is disclosure, not scoping.
    */
-  async linkForEntity(
+  async linksForEntity(
     entityType: TrackerEntityType,
     entityId: string,
-  ): Promise<TrackerEntityLinkRef | null> {
-    for (const provider of LINK_PROVIDERS) {
-      const link = getLinkByEntity(this.db, entityType, entityId, provider);
-      if (link === null || link.orphaned_at !== null) continue;
+  ): Promise<TrackerEntityLinkRef[]> {
+    return this.liveLinksForEntity(entityType, entityId).map((link) => {
+      const connection = getConnection(this.db, link.connection_id);
       return {
-        provider,
+        provider: link.provider,
         externalUrl: link.external_url,
         externalIdentifier: link.external_identifier,
+        // What a removal ruling would ACTUALLY do to this issue — the removal
+        // dialog's copy must promise the action enqueueRemovalWriteBack
+        // performs, not assume the archive path (adversarial round 3, finding
+        // 2: under the default archive_sync_mode 'off' every ruling falls back
+        // to the cancelled-state write). A connection row that vanished mid-read
+        // gets the conservative 'cancel'.
+        removalAction:
+          connection === null
+            ? ('cancel' as const)
+            : removalWriteBackAction(connection.provider, connection.archive_sync_mode),
       };
-    }
-    return null;
+    });
   }
 
   /**
@@ -1914,7 +2639,7 @@ export class TrackerSyncService implements TrackerSyncFacade {
    * asks so its copy can say the one ruling covers those children too — which is
    * exactly what {@link handleLocalRemoval} then does.
    *
-   * Deliberately its own call rather than a field on {@link linkForEntity}'s
+   * Deliberately its own call rather than a field on {@link linksForEntity}'s
    * result: that shape is the "open in Linear" chip's data, and a cascade
    * question has no business being answered on every read of it.
    */
@@ -2007,27 +2732,42 @@ export class TrackerSyncService implements TrackerSyncFacade {
   }
 
   /**
-   * Orphan ONE link, first queueing the cancelled-group write when the ruling
-   * asked for it.
+   * Orphan ONE link, first queueing the remote write the ruling asked for.
    *
    * ORDER IS LOAD-BEARING: the enqueue reads the LIVE link (it needs the
    * external id, and the dedup scan is against rows for that issue), and a
-   * half-applied ruling — orphaned but never cancelled — is exactly the outcome
-   * the user asked us to avoid.
+   * half-applied ruling — orphaned but never acted on — is exactly the outcome
+   * the user asked us to avoid. The outbox row addresses `(connection,
+   * external_id)`, so the drain does not need the link to still be live; only
+   * this enqueue does.
    *
-   * `status_sync_mode` is NOT consulted for the cancel. That mode governs the
-   * AUTOMATIC cadence — whether stage moves stream out on their own — whereas
-   * this is a direct instruction about the one issue in front of the user,
-   * answered in a dialog that named it, and it lands in the outbox either way.
-   * A disconnected connection is skipped instead: its stored key is gone, so
-   * the row could never drain.
+   * WHICH WRITE, and why it is no longer always the cancelled-state one. The
+   * locked scope decision is that a local removal becomes a remote TRASH or
+   * ARCHIVE — never a delete, and no longer a mere status change where the
+   * provider offers something better. So a provider with a real archive
+   * endpoint (Linear, Dart) gets `archive_issue`; `archive: 'none'` (Plane)
+   * keeps the cancelled-state write, which is the strongest thing its API can
+   * actually do.
+   *
+   * `archive_sync_mode` GATES ONLY THE `'off'` END OF THAT CHOICE, for
+   * invariant 5's reason and no other: an `archive_issue` row whose direction
+   * is off can never be claimed, and an unclaimable row halts inbound for that
+   * issue forever. An off connection therefore falls back to the cancelled
+   * -state write too — the user's explicit ruling still reaches the tracker,
+   * through a direction that can carry it. `auto` vs `manual` is NOT consulted,
+   * exactly as `status_sync_mode` is not: those modes govern the AUTOMATIC
+   * cadence, whereas this is a direct instruction about the one issue in front
+   * of the user, answered in a dialog that named it.
+   *
+   * A disconnected connection is skipped entirely: its stored key is gone, so
+   * no row of any kind could drain.
    */
   private dropLink(link: EntityExternalLinkRow, cancelRemote: boolean): void {
     const connection = getConnection(this.db, link.connection_id);
 
     if (cancelRemote && connection !== null && connection.status !== 'disconnected') {
-      if (this.enqueueGroupWriteBack(connection, link, 'cancelled')) {
-        // Same 2s nudge a stage move gets — without it the cancel would sit
+      if (this.enqueueRemovalWriteBack(connection, link)) {
+        // Same 2s nudge a stage move gets — without it the write would sit
         // until the next 5-minute poll, long after the entity is gone.
         this.armDrainTimer(connection.id);
       }
@@ -2218,6 +2958,9 @@ function appendWriteBackLines(
   const created = ambiguous.created + (drained?.created ?? 0);
   const pushed = ambiguous.pushedIdeas + (drained?.pushedIdeas ?? 0);
   const mirrored = created - pushed;
+  const contentWritten = ambiguous.contentWritten + (drained?.contentWritten ?? 0);
+  const contentWithheld = ambiguous.contentWithheld + (drained?.contentWithheld ?? 0);
+  const archived = ambiguous.archived + (drained?.archived ?? 0);
   const recovered = ambiguous.ambiguousResolved;
   const retries = ambiguous.retriesScheduled + (drained?.retriesScheduled ?? 0);
   const failed = ambiguous.failedTerminal + (drained?.failedTerminal ?? 0);
@@ -2230,8 +2973,24 @@ function appendWriteBackLines(
   if (sent > 0) entries.push({ marker: '✓', line: `wrote ${plural(sent, 'issue state')}` });
   if (pushed > 0) entries.push({ marker: '✓', line: `pushed ${plural(pushed, 'idea')}` });
   if (mirrored > 0) entries.push({ marker: '✓', line: `mirrored ${plural(mirrored, 'sub-issue')}` });
+  if (contentWritten > 0) {
+    entries.push({ marker: '✓', line: `updated ${plural(contentWritten, 'issue')} in the tracker` });
+  }
+  // The lost-update guard fired: a tracker-side edit landed after the baseline
+  // stamp, so the write was withheld and the inbound conflict machinery owns it.
+  if (contentWithheld > 0) {
+    entries.push({
+      marker: '⚠',
+      line: `held back ${plural(contentWithheld, 'write')} · concurrent tracker edit — next sync resolves it`,
+    });
+  }
+  // "archived" is the local vocabulary; what the provider actually performs is
+  // its trash or archive, never a delete — see the locked scope decision.
+  if (archived > 0) {
+    entries.push({ marker: '✓', line: `archived ${plural(archived, 'issue')} in the tracker` });
+  }
   if (superseded > 0) {
-    entries.push({ marker: '·', line: `${plural(superseded, 'stale state write')} superseded` });
+    entries.push({ marker: '·', line: `${plural(superseded, 'stale write')} superseded` });
   }
   // The ONLY surface that names a remote issue we created and can no longer
   // point at — see outboxWorker.adoptOrOrphanPush. The row's `last_error`
@@ -2323,6 +3082,30 @@ function appendHeldDirectionLines(
   for (const direction of held) {
     entries.push({ marker: '·', line: `${direction} held · manual — use Sync now` });
   }
+
+  // The two content-sync-mode directions get their OWN phrasing rather than
+  // reusing the loop above: 'off' is not something "Sync now" can unstick (it
+  // gates at the enqueue, never the drain — invariant 5), so a held line that
+  // said "use Sync now" for an 'off' direction would promise a fix that does
+  // nothing.
+  appendContentModeLine(entries, 'content changes', connection.content_sync_mode, trigger);
+  appendContentModeLine(entries, 'archive', connection.archive_sync_mode, trigger);
+}
+
+/** One {@link appendHeldDirectionLines} line for a single content-sync-mode direction, or none. */
+function appendContentModeLine(
+  entries: TrackerSyncLogEntry[],
+  label: string,
+  mode: TrackerContentSyncMode,
+  trigger: TrackerSyncTrigger,
+): void {
+  if (mode === 'off') {
+    entries.push({ marker: '·', line: `${label} off` });
+    return;
+  }
+  if (mode === 'manual' && trigger !== 'manual') {
+    entries.push({ marker: '·', line: `${label} held (manual) · use Sync now` });
+  }
 }
 
 /** Phase 3's counters. */
@@ -2339,6 +3122,12 @@ function appendInboundLines(entries: TrackerSyncLogEntry[], report: InboundSyncR
   }
   const conflicts = report.conflictsOpened + report.autoResolved;
   if (conflicts > 0) entries.push({ marker: '✎', line: `conflicts ${conflicts}` });
+  if (report.crossScopeSkips > 0) {
+    entries.push({
+      marker: '·',
+      line: `${plural(report.crossScopeSkips, 'cross-scope duplicate')} skipped`,
+    });
+  }
   if (report.stageDeferred > 0) {
     entries.push({
       marker: '·',
@@ -2349,6 +3138,28 @@ function appendInboundLines(entries: TrackerSyncLogEntry[], report: InboundSyncR
     entries.push({
       marker: '·',
       line: `${plural(report.importDeferred, 'new issue')} held — use Sync now`,
+    });
+  }
+  if (report.contentDeferred > 0) {
+    entries.push({
+      marker: '·',
+      line: `${plural(report.contentDeferred, 'content change')} waiting on an open conflict`,
+    });
+  }
+  if (report.entityLocked > 0) {
+    entries.push({
+      marker: '·',
+      line: `${plural(report.entityLocked, 'status change')} waiting on an active run`,
+    });
+  }
+  if (report.unmappedFieldValues > 0) {
+    // A '⚠' rather than a '·': this is the loud-failure convention for a value
+    // the tracker renamed out from under a mapping (Dart addresses priorities
+    // and types by title). Nothing was applied, and it stays reported on every
+    // pass until the mapping is confirmed.
+    entries.push({
+      marker: '⚠',
+      line: `${plural(report.unmappedFieldValues, 'unmapped remote value')} · confirm the mapping`,
     });
   }
   if (report.archivedRemotely > 0) {
@@ -2366,6 +3177,12 @@ function appendSweepLines(entries: TrackerSyncLogEntry[], sweep: InboundSweepRep
   }
   if (sweep.outOfScope > 0) {
     entries.push({ marker: '·', line: `${plural(sweep.outOfScope, 'issue')} out of scope · left linked` });
+  }
+  if (sweep.entityLocked > 0) {
+    entries.push({
+      marker: '·',
+      line: `${plural(sweep.entityLocked, 'deleted issue')} waiting on an active run`,
+    });
   }
   if (sweep.conflictsOpened > 0) {
     entries.push({ marker: '✎', line: `conflicts ${sweep.conflictsOpened}` });
@@ -2411,7 +3228,7 @@ function isLogEntry(value: unknown): value is TrackerSyncLogEntry {
 // ---------------------------------------------------------------------------
 
 /** Link lookup order for an entity whose provider we do not know up front. */
-const LINK_PROVIDERS: readonly TrackerProvider[] = ['linear', 'plane'];
+const LINK_PROVIDERS: readonly TrackerProvider[] = ['linear', 'plane', 'dart'];
 
 /** The connected view's source label, read back off `source_json`. */
 function readSourceLabel(connection: TrackerConnectionRow): string {
@@ -2422,6 +3239,33 @@ function readSourceLabel(connection: TrackerConnectionRow): string {
   if (typeof parsed.narrowId === 'string' && parsed.narrowId.length > 0) return parsed.narrowId;
   if (typeof parsed.containerId === 'string') return parsed.containerId;
   return '';
+}
+
+/** The narrow kinds the wire type admits, as a runtime set. */
+const NARROW_KINDS: readonly TrackerNarrowKind[] = [
+  'all',
+  'project',
+  'view',
+  'cycle',
+  'module',
+  'space',
+];
+
+/**
+ * The connected view's source SCOPE, read back off `source_json` — the mapping
+ * identity the management view groups and de-duplicates rows by, where
+ * {@link readSourceLabel} is only what it prints.
+ *
+ * `storedSourceScope` types `narrowKind` as a bare string on purpose (it is
+ * parsing an arbitrary persisted blob), so an unrecognized value is normalized
+ * to 'all' rather than cast: 'all' is the same fallback parseSourceSelection
+ * applies, and a scope that lies about its kind would be worse than a wide one.
+ */
+function readSourceScope(row: TrackerConnectionRow): TrackerConnectionSummary['sourceScope'] {
+  const scope = storedSourceScope(row);
+  if (scope === null) return null;
+  const narrowKind = NARROW_KINDS.find((kind) => kind === scope.narrowKind) ?? 'all';
+  return { containerId: scope.containerId, narrowId: scope.narrowId, narrowKind };
 }
 
 /** An entity's display identity + body, for conflict rows and description merges. */

@@ -4,7 +4,7 @@
  * The canonical agent key is the bundled agent's FILE BASENAME — the stem of each
  * `main/src/orchestrator/workflows/<wf>/agents/<key>.md` (equivalently the
  * frontmatter `name:` with the `cyboflow-` prefix stripped; a unit test asserts
- * the two agree for all 19 files, including launch's `interview` agent at
+ * the two agree for all 20 files, including launch's `interview` agent at
  * `main/src/orchestrator/workflows/launch/agents/interview.md`). This single
  * key is used by:
  *   (i)   `WorkflowStep.agent` in WORKFLOW_DEFINITIONS,
@@ -50,6 +50,15 @@ export const CANONICAL_AGENT_KEYS = [
   // a second thing to remember. Ordered last, mirroring how every earlier flow's
   // agents were appended as their flow landed.
   'verify-setup',
+  // The lane runbook BOOTSTRAP agent (docs/proposals/lane-runbook-bootstrap.md
+  // §8). Unlike every key above it, this agent is bound to NO workflow step: the
+  // main-process controller deploys it directly, at the enqueue seam, when a
+  // sprint/ship lane's visual verification would be skipped for want of a
+  // runbook. It is still a canonical key because it is a bundled agent like any
+  // other — it appears in the catalogue and the gallery, and its model and
+  // prompt are overridable per workflow, which is the whole reason the key
+  // vocabulary exists.
+  'runbook-bootstrap',
 ] as const;
 
 export type CanonicalAgentKey = (typeof CANONICAL_AGENT_KEYS)[number];

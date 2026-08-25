@@ -23,6 +23,8 @@ export interface FeatureControlsSettingsProps {
   artifactCommitDir: string;
   onArtifactCommitDirChange: (dir: string) => void;
   visualVerifyEnabled: boolean;
+  autoBootstrapRunbook: boolean;
+  onAutoBootstrapRunbookChange: (value: boolean) => void;
   onVisualVerifyEnabledChange: (enabled: boolean) => void;
   idleReviewEnabled: boolean;
   onIdleReviewEnabledChange: (enabled: boolean) => void;
@@ -41,6 +43,8 @@ export function FeatureControlsSettings({
   artifactCommitDir,
   onArtifactCommitDirChange,
   visualVerifyEnabled,
+  autoBootstrapRunbook,
+  onAutoBootstrapRunbookChange,
   onVisualVerifyEnabledChange,
   idleReviewEnabled,
   onIdleReviewEnabledChange,
@@ -71,7 +75,7 @@ export function FeatureControlsSettings({
         </SettingsSection>
 
         {/* A Feature control, not a session default: this answers "is the SDK
-            substrate available in this app at all". Locking it to the PTY also
+            substrate available in this app at all". Locking it to the CLI also
             hides the Session settings group's per-session runtime picker — the
             note below spells that dependency out. */}
         <SettingsSection
@@ -82,7 +86,7 @@ export function FeatureControlsSettings({
           <div className="flex flex-col gap-1.5">
             {([
               { ptyOnly: false, label: 'Allow SDK', hint: 'Default · pick per run' },
-              { ptyOnly: true, label: 'Interactive PTY only', hint: 'Force the live terminal' },
+              { ptyOnly: true, label: 'Interactive CLI only', hint: 'Force the live terminal' },
             ] as const).map(({ ptyOnly, label, hint }) => (
               <button
                 key={label}
@@ -106,7 +110,7 @@ export function FeatureControlsSettings({
             ))}
           </div>
           <p className="text-xs text-text-tertiary mt-2">
-            "Interactive PTY only" forces every new run and quick session onto the live terminal
+            "Interactive CLI only" forces every new run and quick session onto the live terminal
             substrate and hides the per-run picker. Pause/Resume (SDK-only) become unavailable, and
             the interactive substrate carries v1 limits. Only affects runs started after you save;
             demo mode always uses the SDK.
@@ -178,17 +182,31 @@ export function FeatureControlsSettings({
             checked={visualVerifyEnabled}
             onChange={(e) => onVisualVerifyEnabledChange(e.target.checked)}
           />
-          <p className="text-xs text-text-tertiary mt-1">
+          <p className="text-xs text-text-tertiary mt-1 mb-3">
             When enabled, workflow runs can request a visual check of a UI deliverable: Cyboflow
             captures a screenshot (offscreen render, headless browser, or the live app) and a
             vision model judges it against the stated intent. Off by default; no captures run
             while disabled.
           </p>
+          <Checkbox
+            label="Let runs set up verification themselves"
+            checked={autoBootstrapRunbook}
+            disabled={!visualVerifyEnabled}
+            onChange={(e) => onAutoBootstrapRunbookChange(e.target.checked)}
+          />
+          <p className="text-xs text-text-tertiary mt-1">
+            A check that has to build or serve your project is skipped unless the project has a
+            verification runbook that was proven by an actual run — which today only the Verify
+            Setup flow produces. With this on, a sprint or ship run that hits that wall derives a
+            runbook itself, commits it to its own branch, and proves it before verifying; if the
+            proof fails, the run advances exactly as it does now. Off by default: unlike the switch
+            above, this lets a run commit to your branch on its own.
+          </p>
         </SettingsSection>
 
         <SettingsSection
           title="Idle Session Review"
-          description="Surface quiet PTY quick sessions in the human review queue"
+          description="Surface quiet CLI quick sessions in the human review queue"
           icon={<AlarmClock className="w-4 h-4" />}
         >
           <Checkbox

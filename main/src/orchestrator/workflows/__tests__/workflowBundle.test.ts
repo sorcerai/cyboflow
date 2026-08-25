@@ -63,13 +63,13 @@ describe('resolveWorkflowBundle', () => {
   });
 
   it('(d) fail-soft empty bundle for null / empty / no-sibling-dir', () => {
-    expect(resolveWorkflowBundle(null)).toEqual({ commands: [], agents: [] });
-    expect(resolveWorkflowBundle('')).toEqual({ commands: [], agents: [] });
-    expect(resolveWorkflowBundle('   ')).toEqual({ commands: [], agents: [] });
+    expect(resolveWorkflowBundle(null)).toEqual({ commands: [], agents: [], scripts: [] });
+    expect(resolveWorkflowBundle('')).toEqual({ commands: [], agents: [], scripts: [] });
+    expect(resolveWorkflowBundle('   ')).toEqual({ commands: [], agents: [], scripts: [] });
 
     // A .md that exists but has no sibling bundle dir.
     const lonely = path.join(root, 'custom.md');
     fs.writeFileSync(lonely, '# custom', 'utf8');
-    expect(resolveWorkflowBundle(lonely)).toEqual({ commands: [], agents: [] });
+    expect(resolveWorkflowBundle(lonely)).toEqual({ commands: [], agents: [], scripts: [] });
   });
 });

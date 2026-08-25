@@ -15,6 +15,7 @@ import type { SessionManager } from '../../../sessionManager';
 import { OMP_RAW_EVENT_TYPE } from '../ompRawEventSink';
 import {
   assertOmpSdkSpawnFlags,
+  OMP_TURN_TIMEOUT_MS,
   OmpSdkManager,
   type OmpRpcClientLike,
   type OmpSdkManagerDeps,
@@ -22,6 +23,8 @@ import {
 import {
   OMP_RPC_UI_MODE_ARGS,
   type OmpAgentEndEvent,
+  type OmpExtensionUiRequestEvent,
+  type OmpExtensionUiResponse,
   type OmpRpcClientOptions,
   type OmpRpcEvent,
   type OmpTurnOutcome,
@@ -92,6 +95,8 @@ interface FakeClientConfig {
   localTurn?: boolean;
   /** Extra events emitted before the terminal agent_end. */
   extraEvents?: OmpRpcEvent[];
+  /** A blocking content dialog; runTurn waits until the host responds. */
+  questionEvent?: OmpExtensionUiRequestEvent;
   /** Never settle `runTurn` until `releaseTurn` is called. */
   hangTurn?: boolean;
   sessionFile?: string | undefined;
@@ -103,11 +108,13 @@ interface FakeClientConfig {
   assistantText?: string | null;
   /** What `get_last_assistant_text` answers; omitted ⇒ the method is absent. */
   lastAssistantText?: string | null;
+  /** Provider error text for an error turn. */
+  errorMessage?: string;
 }
 
 class FakeOmpClient implements OmpRpcClientLike {
   readonly listeners = new Set<(event: OmpRpcEvent) => void>();
-  readonly uiResponses: unknown[] = [];
+  readonly uiResponses: OmpExtensionUiResponse[] = [];
   readonly stop = vi.fn(async () => undefined);
   readonly abort = vi.fn(async () => {
     this.releaseTurn();
@@ -148,6 +155,7 @@ class FakeOmpClient implements OmpRpcClientLike {
 
   private turnIndex = 0;
   private release: (() => void) | null = null;
+  private releaseUiRequest: (() => void) | null = null;
 
   constructor(
     readonly options: OmpRpcClientOptions,
@@ -174,8 +182,10 @@ class FakeOmpClient implements OmpRpcClientLike {
     return sessionFile === undefined ? {} : { sessionFile };
   }
 
-  respondToExtensionUi(response: unknown): void {
+  respondToExtensionUi(response: OmpExtensionUiResponse): void {
     this.uiResponses.push(response);
+    this.releaseUiRequest?.();
+    this.releaseUiRequest = null;
   }
 
   releaseTurn(): void {
@@ -192,6 +202,12 @@ class FakeOmpClient implements OmpRpcClientLike {
       });
     }
     for (const event of this.config.extraEvents ?? []) this.emit(event);
+    if (this.config.questionEvent) {
+      this.emit(this.config.questionEvent);
+      await new Promise<void>((resolve) => {
+        this.releaseUiRequest = resolve;
+      });
+    }
     if (this.config.localTurn) return { completion: 'local' };
 
     const usage = this.config.usagePerTurn?.[index] ?? DEFAULT_USAGE;
@@ -209,7 +225,7 @@ class FakeOmpClient implements OmpRpcClientLike {
               role: 'assistant',
               content: [],
               stopReason: 'error',
-              errorMessage: 'omp turn blew up',
+              errorMessage: this.config.errorMessage ?? 'omp turn blew up',
             },
           ]
         : [
@@ -273,6 +289,7 @@ interface ResultRecord {
   usage?: Record<string, number>;
   is_error: boolean;
   session_id?: string;
+  result?: string;
 }
 
 interface Harness {
@@ -448,7 +465,10 @@ describe('OmpSdkManager — the spawn', () => {
       };
       expect(gateConfig.permissionMode).toBe('acceptEdits');
       expect(gateConfig.editTools).toContain('write');
-      expect(gateConfig.denyTaskTool).toBe(true);
+      // False since the subagent hook-scope premise was measured — see
+      // ompGateConfigBuilder's doc block. What this assertion is really here
+      // for is that the field is CARRIED into the spawn env at all.
+      expect(gateConfig.denyTaskTool).toBe(false);
       expect(gateConfig.cyboflowMcpToolNames).toContain('mcp__cyboflow_report_finding');
       await manager.killAllProcesses();
     } finally {
@@ -641,6 +661,74 @@ describe('OmpSdkManager — the turn contract', () => {
         { type: 'extension_ui_response', id: 'ui-9', value: 'Approve' },
       ]);
       await manager.killAllProcesses();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('routes an OMP content picker through QuestionRouter and resumes the turn with the answer', async () => {
+    const db = createDb();
+    try {
+      const title = 'Where should the Blog card link?';
+      const { manager, clients } = makeManager(db, {
+        questionEvent: {
+          type: 'extension_ui_request',
+          id: 'question-1',
+          method: 'select',
+          title,
+          options: ['/changelog (Recommended)', '/blog', 'Other (type your own)'],
+        },
+      });
+      const requestQuestion = vi.fn(async () => ({
+        answers: { [title]: '/changelog (Recommended)' },
+      }));
+      manager.setQuestionRouterProvider(() => ({ requestQuestion }));
+
+      await manager.spawnCliProcess(turn());
+
+      expect(requestQuestion).toHaveBeenCalledWith(
+        'run-1',
+        'question-1',
+        [expect.objectContaining({ question: title })],
+        expect.any(Function),
+      );
+      expect(clients[0].uiResponses).toEqual([{
+        type: 'extension_ui_response',
+        id: 'question-1',
+        value: '/changelog (Recommended)',
+      }]);
+      await manager.killAllProcesses();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('replaces OMP user-interrupt text when Cyboflow question routing caused the cancellation', async () => {
+    const db = createDb();
+    try {
+      const { manager, results, errors } = makeManager(db, {
+        questionEvent: {
+          type: 'extension_ui_request',
+          id: 'question-2',
+          method: 'select',
+          title: 'Pick one',
+          options: ['A', 'B'],
+        },
+        errorTurn: true,
+        errorMessage: 'Interrupted by user',
+      });
+      manager.setQuestionRouterProvider(() => ({
+        requestQuestion: vi.fn(async () => {
+          throw new Error('run is not active');
+        }),
+      }));
+
+      await expect(manager.spawnCliProcess(turn())).rejects.toThrow(/question routing failed/i);
+      expect(results).toHaveLength(1);
+      expect(results[0].result).toContain('OMP question routing failed');
+      expect(results[0].result).not.toBe('Interrupted by user');
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('run is not active');
     } finally {
       db.close();
     }
@@ -1151,6 +1239,64 @@ describe('OmpSdkManager — concurrent fan-out lanes', () => {
       const args = clients[0].options.args ?? [];
       expect(args[args.indexOf('--session-dir') + 1]).toContain('panel-1');
       await manager.killAllProcesses();
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The turn ceiling
+// ---------------------------------------------------------------------------
+
+describe('OmpSdkManager — the turn ceiling', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('names itself as the cause instead of reporting OMP\'s "Interrupted by user"', async () => {
+    vi.useFakeTimers();
+    const db = createDb();
+    try {
+      // `hangTurn` parks the turn; the ceiling's own `abort()` releases it, and
+      // the fake then ends the turn the way OMP really does — an error result
+      // reading "Interrupted by user", which is the text under test.
+      const { manager, results, clients } = makeManager(db, {
+        hangTurn: true,
+        errorTurn: true,
+        errorMessage: 'Interrupted by user',
+      });
+
+      const spawned = manager.spawnCliProcess(turn());
+      const settled = spawned.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(OMP_TURN_TIMEOUT_MS);
+      const outcome = await settled;
+
+      expect(clients[0].abort).toHaveBeenCalledOnce();
+      expect(results).toHaveLength(1);
+      expect(results[0].is_error).toBe(true);
+      expect(results[0].result).not.toBe('Interrupted by user');
+      expect(results[0].result).toContain('NOT a user interrupt');
+      expect(results[0].result).toContain('30-minute');
+      // The wall-clock property is the one a reader has to know to act on this.
+      expect(results[0].result).toContain('human tool approvals');
+      expect(String(outcome)).toContain('NOT a user interrupt');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('leaves a real user interrupt attributed to the user', async () => {
+    const db = createDb();
+    try {
+      const { manager, results } = makeManager(db, {
+        errorTurn: true,
+        errorMessage: 'Interrupted by user',
+      });
+
+      await expect(manager.spawnCliProcess(turn())).rejects.toThrow(/interrupted by user/i);
+      expect(results).toHaveLength(1);
+      expect(results[0].result).toBe('Interrupted by user');
     } finally {
       db.close();
     }

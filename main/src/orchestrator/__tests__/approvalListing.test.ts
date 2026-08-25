@@ -11,7 +11,7 @@
  * All tests use an in-memory better-sqlite3 instance via createTestDb.
  */
 import { describe, it, expect } from 'vitest';
-import { selectPendingApprovals } from '../approvalListing';
+import { selectPendingApprovals, toApprovalAttribution } from '../approvalListing';
 import { dbAdapter } from '../__test_fixtures__/dbAdapter';
 import { createTestDb, seedRun, seedApproval } from '../__test_fixtures__/orchestratorTestDb';
 
@@ -107,5 +107,49 @@ describe('selectPendingApprovals', () => {
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('approval-pending');
     expect(result[0].status).toBe('pending');
+  });
+});
+
+describe('selectPendingApprovals — attribution', () => {
+  it('degrades to nulls when the sessions join is unavailable', () => {
+    // The orchestrator fixture builds no `sessions` table. An unconditional
+    // LEFT JOIN would make this a SQL error rather than a null.
+    const db = createTestDb();
+    const adapter = dbAdapter(db);
+    seedRun(db, { id: 'run-attr' });
+    seedApproval(db, {
+      id: 'approval-attr',
+      runId: 'run-attr',
+      toolName: 'Bash',
+      toolInputJson: '{}',
+      createdAt: '2026-01-01T00:00:00Z',
+    });
+
+    const [approval] = selectPendingApprovals(adapter);
+    expect(approval.sessionName).toBeNull();
+    expect(approval.agentProvider).toBeNull();
+  });
+});
+
+describe('toApprovalAttribution', () => {
+  it('reads a runtime into its provider', () => {
+    expect(toApprovalAttribution('sess', 'omp-sdk')).toEqual({
+      sessionName: 'sess',
+      agentProvider: 'omp',
+    });
+    expect(toApprovalAttribution(null, 'claude-interactive').agentProvider).toBe('claude');
+    expect(toApprovalAttribution(null, 'codex-pty').agentProvider).toBe('codex');
+  });
+
+  it('leaves an absent runtime null rather than flooring it to claude', () => {
+    // providerForRuntimeValue floors null to the Claude default, which would be
+    // a guess. A card must not claim a provider the row never recorded.
+    expect(toApprovalAttribution(null, null).agentProvider).toBeNull();
+    expect(toApprovalAttribution(null, '').agentProvider).toBeNull();
+  });
+
+  it('treats an empty session name as absent', () => {
+    expect(toApprovalAttribution('', 'omp-sdk').sessionName).toBeNull();
+    expect(toApprovalAttribution(42, 'omp-sdk').sessionName).toBeNull();
   });
 });

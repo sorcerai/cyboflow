@@ -75,7 +75,7 @@ function buildDb(): Database.Database {
   db.exec(readFileSync(join(migDir, '046_notification_kind.sql'), 'utf-8'));
   // workflow_runs.session_id (migration 019) — added directly here: 019's backfill
   // UPDATE reads a `sessions` table this minimal fixture doesn't create, so we add
-  // just the column the requireMergedSession merge-gate join needs (mirrors the
+  // just the column the requireDeliveredSession delivery-gate join needs (mirrors the
   // workflowRegistry fixture's seed_finding_ids ALTER).
   db.exec(`ALTER TABLE workflow_runs ADD COLUMN session_id TEXT`);
   // Migration 059: category (feature|bug|chore) — an unconditional column in
@@ -261,7 +261,7 @@ describe('cyboflow.reviewItems.list / get', () => {
     expect(ids).not.toContain(untriaged.reviewItemId); // untriaged on a dead run stays hidden
   });
 
-  it('requireMergedSession surfaces a finding from a MERGED session, hides an unmerged one', async () => {
+  it('requireDeliveredSession surfaces a finding from a DELIVERED session, hides a discarded one', async () => {
     const { caller, db } = buildCaller();
 
     db.prepare(`INSERT INTO workflows (id, project_id, name) VALUES ('wf-1-sprint', 1, 'sprint')`).run();
@@ -289,16 +289,16 @@ describe('cyboflow.reviewItems.list / get', () => {
     expect(orphanIds).not.toContain(merged.reviewItemId);
     expect(orphanIds).not.toContain(unmerged.reviewItemId);
 
-    // requireMergedSession: the merged-session finding surfaces; the unmerged stays hidden.
+    // requireDeliveredSession: the delivered-session finding surfaces; the discarded stays hidden.
     const mergedOnly = await caller.cyboflow.reviewItems.list({
-      projectId: 1, kind: 'finding', status: 'pending', requireMergedSession: true,
+      projectId: 1, kind: 'finding', status: 'pending', requireDeliveredSession: true,
     });
     const ids = mergedOnly.map((i) => i.id);
     expect(ids).toContain(merged.reviewItemId);
     expect(ids).not.toContain(unmerged.reviewItemId);
   });
 
-  it('requireMergedSession keeps the gate orphan-hide intact (a gate on a terminal run stays hidden)', async () => {
+  it('requireDeliveredSession keeps the gate orphan-hide intact (a gate on a terminal run stays hidden)', async () => {
     const { caller, db } = buildCaller();
 
     db.prepare(`INSERT INTO workflows (id, project_id, name) VALUES ('wf-1-sprint', 1, 'sprint')`).run();
@@ -317,11 +317,33 @@ describe('cyboflow.reviewItems.list / get', () => {
     });
 
     const items = await caller.cyboflow.reviewItems.list({
-      projectId: 1, status: 'pending', requireMergedSession: true,
+      projectId: 1, status: 'pending', requireDeliveredSession: true,
     });
     const ids = items.map((i) => i.id);
     expect(ids).toContain(finding.reviewItemId); // finding from merged session surfaces
     expect(ids).not.toContain(gate.reviewItemId); // gate on a terminal run stays orphan-hidden
+  });
+
+  it("requireDeliveredSession accepts the Mark-complete stamp (outcome='completed')", async () => {
+    // The agent merged the work in chat, so our merge path never ran and no
+    // 'merged' stamp exists — the human's Mark-complete action stamps
+    // 'completed' instead. Its findings describe code that IS in the tree.
+    const { caller, db } = buildCaller();
+
+    db.prepare(`INSERT INTO workflows (id, project_id, name) VALUES ('wf-1-sprint', 1, 'sprint')`).run();
+    db.prepare(
+      `INSERT INTO workflow_runs (id, workflow_id, project_id, worktree_path, branch_name, status, outcome, session_id, policy_json)
+       VALUES ('run-complete', 'wf-1-sprint', 1, '/w/c', 'b/c', 'canceled', 'completed', 'sess-complete', '{}')`,
+    ).run();
+
+    const finding = await ReviewItemRouter.getInstance().applyReviewItem(1, {
+      op: 'create', actor: 'agent:executor', kind: 'finding', title: 'landed outside our merge path', runId: 'run-complete',
+    });
+
+    const items = await caller.cyboflow.reviewItems.list({
+      projectId: 1, kind: 'finding', status: 'pending', requireDeliveredSession: true,
+    });
+    expect(items.map((i) => i.id)).toContain(finding.reviewItemId);
   });
 
   it('get returns the single item, or null when absent', async () => {

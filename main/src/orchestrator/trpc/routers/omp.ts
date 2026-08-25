@@ -19,7 +19,7 @@ import type {
   OmpFleetViewSnapshot,
   OmpSnapshotResult,
 } from '../../../../../shared/types/omp';
-import { resolveOmpBridgeCommandConfig } from '../../omp/ompBridgeConfig';
+import { hasSupervise } from '../../../../../shared/types/ompCommand';
 
 /** Map a full snapshot to the renderer-safe view projection. */
 function toViewSnapshot(result: OmpSnapshotResult): OmpFleetViewResult {
@@ -46,13 +46,26 @@ function toViewSnapshot(result: OmpSnapshotResult): OmpFleetViewResult {
 
 export const ompRouter = router({
   /**
-   * Whether the OMP fleet runtime is launchable from this app: the bridge
-   * command config resolved at query time. The renderer picker ANDs this with
-   * the `omp` provider toggle (useIsAgentProviderEnabled) to decide whether to
-   * offer the entry — a read-only availability probe, never a command.
+   * What the OMP picker may offer.
+   *
+   * `launchable` asks the boot-built fleet manager whether it EXISTS, rather
+   * than re-deriving "bridge config resolved" here. The manager owns long-lived
+   * remote workers, so it is constructed once at boot; re-deriving would let the
+   * picker offer OMP fleet the instant Aria mode is toggled, while dispatch
+   * still answered "the bridge is not configured" until the next launch. Asking
+   * the manager keeps the picker and the dispatch seam telling the same story.
+   *
+   * `ariaMode` says WHICH OMP flavor this install runs — the renderer shows the
+   * local runtimes (`omp-sdk`/`omp-pty`) or the fleet supervisor, never both.
+   * Reported live from config, so the picker reflects a toggle immediately even
+   * though `launchable` waits for the relaunch.
+   *
+   * Both are read-only probes. The renderer ANDs them with the `omp` provider
+   * toggle; none of it is enforcement — the main side fails closed regardless.
    */
-  availability: protectedProcedure.query(() => ({
-    launchable: resolveOmpBridgeCommandConfig() !== undefined,
+  availability: protectedProcedure.query(({ ctx }) => ({
+    launchable: ctx.ompFleetLaunchable?.() === true && hasSupervise(ctx.principal),
+    ariaMode: ctx.ompAriaMode?.() === true,
   })),
   /**
    * The latest fleet summary (redacted), or a discriminated failure.

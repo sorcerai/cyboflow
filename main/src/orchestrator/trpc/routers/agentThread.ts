@@ -308,7 +308,13 @@ export const agentThreadRouter = router({
         'message',
         abortSignal,
       );
-      for await (const ev of throttleAsyncIterator(filterThread(all, input.threadId), 60)) {
+      // Signal threaded through: between emissions the throttle parks at an
+      // internal await, where `.return()` alone cannot run its teardown.
+      for await (const ev of throttleAsyncIterator(
+        filterThread(all, input.threadId),
+        60,
+        abortSignal,
+      )) {
         yield ev.envelope;
       }
     }),

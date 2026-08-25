@@ -4,8 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { glob } from 'glob';
 import { appendCommitFooter } from '../utils/commitFooter';
-import { escapeShellArgs } from '../utils/shellEscape';
-import { runGitAsync } from '../utils/runGit';
+import { runGitAsync, runGitCapture, assertNotOptionLike, END_OF_OPTIONS } from '../utils/runGit';
 import type { AppServices } from './types';
 import type { Session } from '../types/session';
 
@@ -116,6 +115,98 @@ async function resolveForContainment(target: string): Promise<string> {
   }
 }
 
+/**
+ * Resolve `fullPath` for containment inside `root` and return the RESOLVED path,
+ * throwing if it escapes. Callers must then operate on the returned path — the
+ * whole point is that the checked path and the used path are the same string, so
+ * a symlink can't be validated in its lexical form and followed in its real one.
+ *
+ * Both sides go through realpath (`root` too — a project or worktree that itself
+ * lives under a symlinked parent, e.g. macOS `/tmp` → `/private/tmp`, would
+ * otherwise fail containment against its own children).
+ */
+async function resolveWithinRoot(root: string, fullPath: string, label: string): Promise<string> {
+  const resolvedRoot = await fs.realpath(root).catch(() => root);
+  const resolved = await resolveForContainment(fullPath);
+  if (!isWithin(resolved, resolvedRoot)) {
+    throw new Error(`${label} is outside ${root}`);
+  }
+  return resolved;
+}
+
+// ===========================================================================
+// `git:execute-project` SUBCOMMAND ALLOWLIST — SECURITY BOUNDARY.
+//
+// This channel is the only renderer-facing handler that takes an arbitrary git
+// argv. Before TASK-680 it ran `execSync(\`git ${escapeShellArgs(args)}\`)`:
+// shell-escaped, so not injectable as a SHELL command, but still "any git
+// subcommand the renderer asks for" — `push`, `config --global`,
+// `-c core.pager=…`, `clone` of an attacker URL, and so on, all inside the
+// user's real project directory.
+//
+// The renderer's ACTUAL usage is two calls, both in
+// frontend/src/components/panels/SetupTasksPanel.tsx: staging `.gitignore`
+// (`['add', '.gitignore']`) and committing it (`['commit', '-m', <message>]`).
+// So the allowlist is not "read-only subcommands" but exactly those two argv
+// SHAPES — each entry validates its own arguments and returns the final argv
+// the runner executes, rather than passing the renderer's array through.
+//
+// Adding an entry means "a compromised renderer may run this git command in the
+// user's project". Prefer a purpose-built IPC channel over widening this.
+// ===========================================================================
+
+/** Validates one subcommand's renderer-supplied args and returns the argv to run. */
+type ProjectGitArgvBuilder = (args: readonly string[]) => string[];
+
+const PROJECT_GIT_SUBCOMMANDS: Readonly<Record<string, ProjectGitArgvBuilder>> = {
+  // `git add -- <pathspec…>`. END_OF_OPTIONS forces every pathspec into a value
+  // position, and assertNotOptionLike rejects an option-shaped one outright, so
+  // neither git's own parser nor a future git version can reinterpret one as a
+  // flag. Paths cannot escape the repo: git rejects a pathspec outside it.
+  add: (args) => {
+    const pathspecs = args.slice(1);
+    if (pathspecs.length === 0) {
+      throw new Error('git add requires at least one pathspec');
+    }
+    pathspecs.forEach((pathspec, i) => assertNotOptionLike(pathspec, `pathspec[${i}]`));
+    return ['add', END_OF_OPTIONS, ...pathspecs];
+  },
+
+  // `git commit -m <message>` and nothing else — no --amend, no --author, no
+  // -F <file>, no pathspecs. The message is bound to `-m`, which takes a
+  // required value, so git consumes the next argv element as that value even if
+  // it begins with `-`; there is no positional left for END_OF_OPTIONS to guard.
+  commit: (args) => {
+    const rest = args.slice(1);
+    if (rest.length !== 2 || rest[0] !== '-m') {
+      throw new Error('git commit is only permitted in the exact form: commit -m <message>');
+    }
+    return ['commit', '-m', rest[1]];
+  },
+};
+
+/**
+ * Resolve a renderer-supplied argv to the argv that may actually run, or throw
+ * with a message naming the offending subcommand and the permitted set.
+ */
+function resolveProjectGitArgv(args: readonly string[]): string[] {
+  if (!Array.isArray(args) || args.length === 0) {
+    throw new Error('git args are required');
+  }
+  const subcommand = args[0];
+  const build = Object.prototype.hasOwnProperty.call(PROJECT_GIT_SUBCOMMANDS, subcommand)
+    ? PROJECT_GIT_SUBCOMMANDS[subcommand]
+    : undefined;
+  if (!build) {
+    throw new Error(
+      `git subcommand "${subcommand}" is not permitted on this channel. ` +
+        `Allowed: ${Object.keys(PROJECT_GIT_SUBCOMMANDS).join(', ')}. ` +
+        `See PROJECT_GIT_SUBCOMMANDS in main/src/ipc/file.ts.`,
+    );
+  }
+  return build(args);
+}
+
 export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): void {
   const { sessionManager, databaseService, gitStatusManager, configManager } = services;
 
@@ -184,7 +275,6 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       }
 
       const fullPath = path.join(session.worktreePath, normalizedPath);
-      const dirPath = path.dirname(fullPath);
 
       // Verify the target is within the worktree BEFORE any mkdir/write side
       // effect. Containment is judged on the realpath of the target (the leaf
@@ -197,12 +287,14 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
         throw new Error('File path is outside worktree');
       }
 
-      // Create directory if it doesn't exist
-      await fs.mkdir(dirPath, { recursive: true });
+      // mkdir + write go to the RESOLVED target, not the lexical one: writing to
+      // `fullPath` would re-follow the leaf symlink at write time, so the path
+      // checked and the path written would be different strings.
+      await fs.mkdir(path.dirname(resolvedTarget), { recursive: true });
 
       // Write the file
-      await fs.writeFile(fullPath, request.content, 'utf-8');
-      
+      await fs.writeFile(resolvedTarget, request.content, 'utf-8');
+
       return { success: true };
     } catch (error) {
       console.error('Error writing file:', error);
@@ -228,7 +320,11 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       }
 
       const fullPath = path.join(session.worktreePath, normalizedPath);
-      return { success: true, path: fullPath };
+      // Hand back only paths that actually resolve inside the worktree — the
+      // returned string is used as an absolute path by callers, so a symlinked
+      // escape here launders one past the checks the I/O handlers do.
+      const resolvedPath = await resolveWithinRoot(session.worktreePath, fullPath, 'File path');
+      return { success: true, path: resolvedPath };
     } catch (error) {
       console.error('Error getting file path:', error);
       return { 
@@ -335,14 +431,17 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
         throw new Error('Commit hash is required');
       }
 
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
       try {
-        // Create a revert commit
-        const command = `git revert ${request.commitHash} --no-edit`;
-        await execAsync(command, { cwd: session.worktreePath });
+        // Create a revert commit. argv form (no shell), with the caller's hash
+        // pinned into a value position: END_OF_OPTIONS after our own flags, plus
+        // an explicit reject of an option-shaped hash. The previous form
+        // interpolated request.commitHash straight into a shell string.
+        await runGitCapture(session.worktreePath, [
+          'revert',
+          '--no-edit',
+          END_OF_OPTIONS,
+          assertNotOptionLike(request.commitHash, 'commit hash'),
+        ]);
 
         return { success: true };
       } catch (error: unknown) {
@@ -365,16 +464,12 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
         throw new Error(`Session not found: ${request.sessionId}`);
       }
 
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
       try {
         // Reset all changes to the last commit
-        await execAsync('git reset --hard HEAD', { cwd: session.worktreePath });
-        
+        await runGitCapture(session.worktreePath, ['reset', '--hard', 'HEAD']);
+
         // Clean untracked files
-        await execAsync('git clean -fd', { cwd: session.worktreePath });
+        await runGitCapture(session.worktreePath, ['clean', '-fd']);
 
         return { success: true };
       } catch (error: unknown) {
@@ -403,23 +498,25 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
         throw new Error('Invalid file path');
       }
 
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
       try {
         // Default to HEAD if no revision specified
         const revision = request.revision || 'HEAD';
-        
-        // Use git show to get file content at specific revision
-        const { stdout } = await execAsync(
-          `git show ${revision}:${normalizedPath}`,
-          { 
-            cwd: session.worktreePath,
-            encoding: 'utf8',
-            maxBuffer: 10 * 1024 * 1024 // 10MB buffer
-          }
-        );
+        // The revision is renderer-supplied and gets concatenated with the path
+        // into a single `<rev>:<path>` object spec. Reject an option-shaped one,
+        // and reject an embedded ':' — git splits on the FIRST colon, so a
+        // revision carrying one would silently re-aim the path half of the spec.
+        assertNotOptionLike(revision, 'revision');
+        if (revision.includes(':')) {
+          throw new Error(`Invalid revision "${revision}": must not contain ":"`);
+        }
+
+        // Use git show to get file content at specific revision. argv form (no
+        // shell), with END_OF_OPTIONS pinning the spec into a value position.
+        const { stdout } = await runGitCapture(session.worktreePath, [
+          'show',
+          END_OF_OPTIONS,
+          `${revision}:${normalizedPath}`,
+        ]);
 
         return { success: true, content: stdout };
       } catch (error: unknown) {
@@ -462,18 +559,26 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
         }
       }
 
-      const targetPath = relativePath ? path.join(session.worktreePath, relativePath) : session.worktreePath;
-      
+      const lexicalTarget = relativePath ? path.join(session.worktreePath, relativePath) : session.worktreePath;
+      // Realpath containment, like file:read/file:write — the lexical check above
+      // does not stop a directory symlink inside the worktree from listing an
+      // arbitrary directory outside it. The returned paths are relative to the
+      // RESOLVED root (targetPath is now resolved, so relating it to the lexical
+      // worktree path would emit `../…` whenever the worktree itself sits under
+      // a symlinked parent — e.g. macOS /tmp → /private/tmp).
+      const resolvedRoot = await fs.realpath(session.worktreePath).catch(() => session.worktreePath);
+      const targetPath = await resolveWithinRoot(session.worktreePath, lexicalTarget, 'Path');
+
       // Read directory contents
       const entries = await fs.readdir(targetPath, { withFileTypes: true });
-      
+
       // Process each entry
       const files: FileItem[] = await Promise.all(
         entries
           .filter(entry => entry.name !== '.git') // Exclude .git directory only
           .map(async (entry) => {
             const fullPath = path.join(targetPath, entry.name);
-            const relativePath = path.relative(session.worktreePath, fullPath);
+            const relativePath = path.relative(resolvedRoot, fullPath);
             
             try {
               const stats = await fs.stat(fullPath);
@@ -594,13 +699,28 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       // Normalize the pattern for searching
       const searchPattern = request.pattern.replace(/^@/, '').toLowerCase();
       
-      // If the pattern contains a path separator, search from that path
+      // If the pattern contains a path separator, search from that path. The
+      // leading segments come straight from the renderer's search box, so they
+      // are joined and then CONTAINMENT-CHECKED: `@../../../../etc/pass` would
+      // otherwise walk the glob root right out of the worktree/project.
       const pathParts = searchPattern.split(/[/\\]/);
-      const searchDir = pathParts.length > 1 
+      const lexicalSearchDir = pathParts.length > 1
         ? path.join(searchDirectory, ...pathParts.slice(0, -1))
         : searchDirectory;
       const filePattern = pathParts[pathParts.length - 1] || '';
-      
+
+      // Resolve the search root and the glob root through realpath together, so
+      // the relative paths reported below stay relative to the same root.
+      const resolvedSearchDirectory = await fs.realpath(searchDirectory).catch(() => searchDirectory);
+      let searchDir: string;
+      try {
+        searchDir = await resolveWithinRoot(searchDirectory, lexicalSearchDir, 'Search path');
+      } catch {
+        // An escaping pattern is not an error the user can act on — it simply
+        // matches nothing, same as a nonexistent directory below.
+        return { success: true, files: [] };
+      }
+
       // Check if searchDir exists
       try {
         await fs.access(searchDir);
@@ -609,19 +729,12 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       }
 
       // Get list of tracked files (not gitignored) using git
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-      
-      let gitTrackedFiles = new Set<string>();
+      const gitTrackedFiles = new Set<string>();
       let isGitRepo = true;
       try {
         // Get list of all tracked files in the repository
-        const { stdout: trackedStdout } = await execAsync('git ls-files', {
-          cwd: searchDirectory,
-          maxBuffer: 10 * 1024 * 1024 // 10MB buffer
-        });
-        
+        const { stdout: trackedStdout } = await runGitCapture(searchDirectory, ['ls-files']);
+
         if (trackedStdout) {
           trackedStdout.split('\n').forEach((file: string) => {
             if (file.trim()) {
@@ -629,13 +742,14 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
             }
           });
         }
-        
+
         // Also get untracked files that are not ignored
-        const { stdout: untrackedStdout } = await execAsync('git ls-files --others --exclude-standard', {
-          cwd: searchDirectory,
-          maxBuffer: 10 * 1024 * 1024 // 10MB buffer
-        });
-        
+        const { stdout: untrackedStdout } = await runGitCapture(searchDirectory, [
+          'ls-files',
+          '--others',
+          '--exclude-standard',
+        ]);
+
         if (untrackedStdout) {
           untrackedStdout.split('\n').forEach((file: string) => {
             if (file.trim()) {
@@ -670,7 +784,7 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       const results = await Promise.all(
         files.map(async (file) => {
           const fullPath = path.join(searchDir, file);
-          const relativePath = path.relative(searchDirectory, fullPath);
+          const relativePath = path.relative(resolvedSearchDirectory, fullPath);
           
           // Skip worktree directories
           if (relativePath.includes('worktrees/') || relativePath.startsWith('worktrees/')) {
@@ -749,10 +863,16 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
 
       const fullPath = path.join(project.path, normalizedPath);
       console.log('[file:read-project] Full path:', fullPath);
-      
+
+      // Containment is judged on the REALPATH, matching the session-scoped
+      // handlers above: the `..`/absolute rejection is lexical only, so a
+      // symlink committed inside the project (`docs/out -> /Users/me/.ssh`)
+      // would otherwise read straight through it.
+      const resolvedPath = await resolveWithinRoot(project.path, fullPath, 'File path');
+
       // Check if file exists
       try {
-        await fs.access(fullPath);
+        await fs.access(resolvedPath);
         console.log('[file:read-project] File exists');
       } catch {
         // File doesn't exist, return null
@@ -761,7 +881,7 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       }
 
       // Read the file
-      const content = await fs.readFile(fullPath, 'utf-8');
+      const content = await fs.readFile(resolvedPath, 'utf-8');
       console.log('[file:read-project] Read', content.length, 'bytes');
       return { success: true, data: content };
     } catch (error) {
@@ -793,14 +913,20 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
 
       const fullPath = path.join(project.path, normalizedPath);
       console.log('[file:write-project] Full path:', fullPath);
-      
+
+      // Containment on the REALPATH, BEFORE any mkdir/write side effect — and
+      // the write then goes to that same resolved path, so an existing symlink
+      // that escapes the project is rejected rather than written through.
+      // resolveForContainment also chases a DANGLING link chain, which matters
+      // here: writeFile through one creates the target wherever it points.
+      const resolvedTarget = await resolveWithinRoot(project.path, fullPath, 'File path');
+
       // Ensure directory exists
-      const dir = path.dirname(fullPath);
-      await fs.mkdir(dir, { recursive: true });
-      
+      await fs.mkdir(path.dirname(resolvedTarget), { recursive: true });
+
       // Write the file
-      await fs.writeFile(fullPath, request.content, 'utf-8');
-      console.log('[file:write-project] Successfully wrote', request.content.length, 'bytes to', fullPath);
+      await fs.writeFile(resolvedTarget, request.content, 'utf-8');
+      console.log('[file:write-project] Successfully wrote', request.content.length, 'bytes to', resolvedTarget);
       
       return { success: true };
     } catch (error) {
@@ -823,35 +949,33 @@ export function registerFileHandlers(ipcMain: IpcMain, services: AppServices): v
       }
 
       console.log('[git:execute-project] Project path:', project.path);
-      console.log('[git:execute-project] Git command:', 'git', request.args.join(' '));
 
-      // Import execSync from child_process
-      const { execSync } = require('child_process');
-      
-      // Execute git command — use escapeShellArgs to safely quote every argument
-      // and prevent shell injection from user-supplied request.args values.
-      // TODO(TASK-680): migrate to runGit(cwd, args[]) — see main/src/utils/runGit.ts
-      const result = execSync(`git ${escapeShellArgs(request.args)}`, {
-        cwd: project.path,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 10 // 10MB buffer
-      });
+      // Validate against the subcommand allowlist BEFORE anything runs, and use
+      // the argv it returns rather than the renderer's array — see
+      // PROJECT_GIT_SUBCOMMANDS above. argv form (execFile, no shell) also means
+      // no argument is ever parsed by a shell.
+      const argv = resolveProjectGitArgv(request.args);
+      console.log('[git:execute-project] Git command:', 'git', argv.join(' '));
+
+      const { stdout } = await runGitCapture(project.path, argv);
 
       console.log('[git:execute-project] Command successful');
-      return { success: true, output: result };
+      return { success: true, output: stdout };
     } catch (error) {
       console.error('[git:execute-project] Error:', error);
 
-      // Extract error message from execSync error
+      // Surface git's own output as the error. `git commit` reports "nothing to
+      // commit" on STDOUT with a non-zero exit, and SetupTasksPanel matches on
+      // that string, so the stderr-then-stdout fallback order is load-bearing —
+      // an empty stderr must fall through rather than win.
       let errorMessage = 'Unknown error';
       if (error instanceof Error) {
         errorMessage = error.message;
-        // If it's an execSync error, it may have stderr/stdout buffers
-        interface ExecSyncError extends Error {
-          stderr?: Buffer;
-          stdout?: Buffer;
+        interface ExecError extends Error {
+          stderr?: string | Buffer;
+          stdout?: string | Buffer;
         }
-        const execError = error as ExecSyncError;
+        const execError = error as ExecError;
         if (execError.stderr) {
           errorMessage = execError.stderr.toString();
         } else if (execError.stdout) {

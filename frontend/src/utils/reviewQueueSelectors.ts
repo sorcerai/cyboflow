@@ -46,6 +46,14 @@ const DEFAULT_THRESHOLD_MS = 3 * 60 * 1000;
 /**
  * Split approvals into blocking (age > thresholdMs) and normal buckets.
  *
+ * Age is a proxy for "this agent has been stuck a while", and the proxy only
+ * holds while age implies waiting. An `awaited: false` approval breaks that: the
+ * omp-sdk gate hung up at ~25s and the model moved on, so the row keeps ageing
+ * with nothing blocked on it — it would cross the threshold every time and paint
+ * a permanent red "blocked Nm" badge for a wait that ended minutes ago. Such an
+ * item is never blocking, whatever its age; it is a standing question a later
+ * retry can still collect an answer to.
+ *
  * @param items      Pre-sorted approval list.
  * @param now        Current timestamp in ms (injectable for testing).
  * @param thresholdMs Age threshold in ms (default: 3 minutes).
@@ -60,7 +68,7 @@ export function partitionBlockingItems(
 
   for (const item of items) {
     const age = now - new Date(item.createdAt).getTime();
-    if (age > thresholdMs) {
+    if (item.awaited !== false && age > thresholdMs) {
       blocking.push(item);
     } else {
       normal.push(item);

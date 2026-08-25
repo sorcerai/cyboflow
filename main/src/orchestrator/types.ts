@@ -6,7 +6,8 @@
  * main/src/services/*. Only primitive types are allowed.
  */
 import type { RunQueueRegistry } from './RunQueueRegistry';
-import type { ClaudeManagerLike, PermissionServerLike } from './stuckDetector';
+import type { ClaudeManagerLike } from './stuckDetector';
+import type { StuckDetectedEvent } from '../../../shared/types/stuckDetection';
 import type { ReviewItemCreate, ReviewItemTriage } from './reviewItemRouter';
 import type { OmpControlPlaneAdapter } from '../../../shared/types/omp';
 
@@ -79,12 +80,6 @@ export interface OrchestratorDeps {
    */
   claudeManager?: ClaudeManagerLike;
   /**
-   * Optional: narrow interface for querying whether a permission-socket
-   * client is connected for a given run ID.  When omitted, stale_socket
-   * classification is disabled with a one-time WARN logged.
-   */
-  permissionServer?: PermissionServerLike;
-  /**
    * Optional: the review-item write chokepoint (ReviewItemRouter.applyReviewItem).
    * Used at orchestrator start to drain LEGACY idle-session review items (the mint
    * was retired for the live QuickSessionsTable — see drainLegacyIdleReviewItems).
@@ -96,8 +91,28 @@ export interface OrchestratorDeps {
   ) => Promise<{ reviewItemId: string; event: { id: number; seq: number } }>;
   /** Read-only OMP fleet adapter. Optional (absent => no OMP awareness at the orchestrator layer). */
   omp?: OmpControlPlaneAdapter;
+  /**
+   * Optional: the main-process sink for stuck-run notifications (the tRPC
+   * router's `stuckEvents`). StuckDetector emits 'runs:stuck' on its own
+   * per-instance emitter; Orchestrator.start() forwards those onto this sink
+   * as 'detected', which is the event name `events.onStuckDetected` subscribes
+   * to. When omitted the detector still writes the DB and emits telemetry —
+   * only the renderer push is skipped.
+   *
+   * Injected rather than imported so the orchestrator subtree keeps its
+   * standalone-typecheck invariant.
+   */
+  stuckEvents?: StuckEventSink;
+}
+
+/**
+ * The narrow emit surface Orchestrator needs from the stuck-event sink. Any
+ * Node EventEmitter satisfies it structurally.
+ */
+export interface StuckEventSink {
+  emit(event: string, payload: StuckDetectedEvent): boolean;
 }
 
 // Re-export narrow interfaces so callers that only need the interface shapes
 // do not need to import from stuckDetector.ts directly.
-export type { ClaudeManagerLike, PermissionServerLike };
+export type { ClaudeManagerLike };

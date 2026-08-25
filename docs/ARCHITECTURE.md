@@ -549,12 +549,12 @@ implementations wired today:
   and badge management.
 - `cyboflow.tasks.*` — entity-model reads + writes (board buckets across ideas/epics/tasks,
   detail editors, lineage edits). All writes delegate to `TaskChangeRouter.applyChange`.
-- `cyboflow.tracker.*` — the Linear/Plane sync surface: stateless wizard probes, `connect`,
+- `cyboflow.tracker.*` — the Linear/Plane/Dart sync surface: stateless wizard probes, `connect`,
   connected-view reads (`connections` / `conflicts`), settings/disconnect/`syncNow`,
   `resolveConflict`, and the `onTrackerChanged` project subscription. The router reaches the
   sync service through the injectable facade in `main/src/orchestrator/trackerSyncBridge.ts`
   (its standalone-typecheck invariant forbids importing `services/`); entity writes still land
-  through `TaskChangeRouter.applyChange` with a `linear`/`plane` actor.
+  through `TaskChangeRouter.applyChange` with a `linear`/`plane`/`dart` actor.
 - `cyboflow.reviewItems.list` / `.get` — project review-inbox reads; `.resolve` / `.dismiss` —
   triage mutations through `ReviewItemRouter` (resolve returns `{ reviewItemId, resumed }`
   where `resumed` reflects aggregate-unblock); `.promoteToTask` — the only TWO-chokepoint
@@ -774,6 +774,35 @@ actually merges — see `recomputeTaskExecutionStage` / `recomputeEpicStage` in 
   - **notification** — non-blocking FYI rows (migration 046; e.g. dynamic-workflow
     notifications formerly filed as `human_task`).
 
+##### Session close-out and the delivered-session invariant
+
+Archiving a session (`sessions:delete`) dismisses its pending review items —
+`dismissPendingReviewItemsForSession`, with `backfillArchivedSessionReviewItems` as the
+boot-time backstop. That seam is reached by a plain dismiss AND by the merge / create-PR
+close-outs, whose dialogs delete the session once the work is away.
+
+Gates are dismissed unconditionally: a permission prompt or human gate on an archived
+session has no live run to resume. **Findings are not**, when the session's work was
+DELIVERED — `workflow_runs.outcome IN DELIVERED_RUN_OUTCOMES`
+(`merged` | `integrated` | `completed` | `pr_open`, `shared/types/cyboflow.ts`). A finding
+describes code, and delivered code is in the tree, so the finding still applies. Before
+this carve-out existed, a merge destroyed the findings it had just produced milliseconds
+later, and the Insights compounding surface — which only offers findings from a delivered
+session — was unreachable by construction. Migration 106 restored the rows already lost.
+
+The invariant: `reviewItems.list({ requireDeliveredSession: true })` (what SHOWS findings)
+and `DELIVERED_SESSION_FINDING_CARVE_OUT` (what KEEPS them) read the SAME outcome set. If
+they drift, findings are either kept and never shown, or shown after being swept.
+
+`'completed'` is the human's Mark-complete stamp for work that landed by a path the app
+never observed (the agent merged it in chat). It is written only by
+`stampSessionRunsCompleted`, whose guard is "not already delivered" rather than the
+`outcome IS NULL` used elsewhere — the runs needing this correction have almost always
+already recorded `canceled` / `interrupted`. The close-out dialogs decide whether to offer
+it from `sessions:get-delivery-state`, which pairs that DB stamp with a git probe
+(`WorktreeManager.getBranchLandingState`) covering fast-forward, cherry-pick, and squash
+landings.
+
 #### Run artifacts (migration 029)
 
 - **`artifacts`** — run-scoped deliverables surfaced as center-pane tabs + a right-rail Artifacts
@@ -862,9 +891,26 @@ is the manual post-merge-bug attribution link.
 
 **Pairwise grading (050).** `experiment_comparisons` (UNIQUE per experiment) is a
 self-contained verdict row: both arms' diffs are FROZEN onto it at capture (worktree-
-independent), K=3 position-randomized judge samples aggregate to a `preference A|B|tie`, and
+independent), position-randomized judge samples aggregate to a `preference A|B|tie`, and
 completion mints a blocking `kind='decision'` review item (gate `experiment-comparison`)
-resolved by `decide`. The trigger is a workflow-agnostic terminal-status subscriber
+resolved by `decide`. The judge is an **ordered heterogeneous panel** of
+`PairwisePanelSlot`s (mirroring `EvalWorker`'s rubric jury) — 2×Claude + 1×Codex in
+production, wired at `index.ts`; **K is the panel's LENGTH**, one sample per slot in order,
+and both Claude slots share ONE `ClaudePairwiseJudge` while the Codex slot gets its own
+`makeCodexEvalJudgeQuery` closure (no `timeoutMs` override, so it inherits the 600s Codex
+deadline against the Claude judge's 180s). The row-level `judge_model` scalar is stamped
+from the FIRST Claude slot (a Claude judge resolves its model in its constructor; the Codex
+one only after its first grade) — per-slot models live on each `per_sample_json` entry.
+A slot failure is classified like the rubric jury's (`unavailable` / deterministic
+`timeout`,`max-turns` / retryable `failed`) and the slot is dropped; if any sample survived,
+a **bounded backfill** (≤2 extra draws, from the first Claude slot that graded OK) repairs
+the ballot up to `min(3, panel.length)`, since an even 2-sample ballot turns a 1A/1B split
+into an artificial tie. Backfill samples take `sampleIndex = panel.length + ordinal` (panel
+survivors keep their gapped SLOT index — `sampleIndex` is a key, not a dense ordinal), and a
+one-line degradation note naming each dropped slot is persisted into the `error` column
+**on the complete row** (so `error IS NOT NULL` there is a healthy-but-degraded verdict, not
+a failure). If NO sample survived and every failure was non-retryable, the whole-comparison
+retry loop is skipped outright. The trigger is a workflow-agnostic terminal-status subscriber
 (`terminalEvalSubscriber.ts` on `runStatusEvents`, all four settled statuses) that also
 widens the run-eval snapshot to variant/experiment-tagged runs — gated by a run_evals
 row-existence pre-check plus a step-ownership predicate so `human_influenced` is never

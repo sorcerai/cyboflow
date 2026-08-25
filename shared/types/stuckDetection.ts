@@ -21,9 +21,14 @@
  *                          first such run found.
  *   orphan_pty           — Claude's process/SDK run for this session is no longer
  *                          alive (absent from ClaudeCodeManager's active runs map).
- *   stale_socket         — no permission-socket client is connected for this run's
- *                          session (the UI or approval bridge disconnected without
- *                          resolving the pending approval).
+ *   stale_socket         — RETIRED (2026-08-21). Formerly: no permission-socket
+ *                          client connected for this run's session. Never fired
+ *                          in any build; the classification is gone, and the
+ *                          reasoning is recorded at the retired rung's tombstone
+ *                          in stuckDetector.ts. The VARIANT is kept so a
+ *                          historical row carrying stuck_reason='stale_socket'
+ *                          still type-checks and still renders a label rather
+ *                          than falling off a switch. Nothing produces it now.
  */
 export type StuckReason =
   | { kind: 'self_deadlock' }

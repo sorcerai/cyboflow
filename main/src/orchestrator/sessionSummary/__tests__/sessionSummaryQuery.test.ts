@@ -133,6 +133,59 @@ describe('makeSessionSummarizer', () => {
     ).rejects.toThrow(/history_sentences/);
   });
 
+  /**
+   * A query that yields `messages` and THEN rejects — the shape the real SDK
+   * produces when a run ends in an error result after the model already spoke
+   * (it replaces the exit error with the error-result text and throws out of
+   * the iterator, so the terminal `result` message is never delivered).
+   */
+  function yieldsThenRejects(messages: readonly SDKMessage[], error: Error): void {
+    install(function* stubbornQuery() {
+      for (const m of messages) yield m;
+      throw error;
+    } as unknown as FakeQueryFn);
+  }
+
+  it('salvages a complete summary when the iterator throws after the model answered', async () => {
+    // The observed production case: maxTurns:1 overruns, the SDK throws, and the
+    // fully-formed JSON the model already emitted used to be discarded.
+    yieldsThenRejects(
+      [sdkAssistantText('{"summary": "S.", "history_sentences": ["H."]}')],
+      new Error('Claude Code returned an error result: Reached maximum number of turns (1)'),
+    );
+    const summarize = makeSessionSummarizer(baseDeps());
+
+    await expect(
+      summarize({ previousSummary: '', segments: [[msg(1, 'assistant', 'hi')]] }),
+    ).resolves.toMatchObject({ summary: 'S.', historySentences: ['H.'] });
+  });
+
+  it('salvages a complete summary from a non-success terminal result', async () => {
+    yieldsMessages([
+      sdkAssistantText('{"summary": "S.", "history_sentences": ["H."]}'),
+      sdkResultError({ subtype: 'error_max_turns' }),
+    ]);
+    const summarize = makeSessionSummarizer(baseDeps());
+
+    await expect(
+      summarize({ previousSummary: '', segments: [[msg(1, 'assistant', 'hi')]] }),
+    ).resolves.toMatchObject({ summary: 'S.', historySentences: ['H.'] });
+  });
+
+  it('rethrows the original failure when the salvaged text is incomplete', async () => {
+    // Truncated JSON must NOT be papered over; the run-ending error is the
+    // honest verdict and the scheduler's retry is the right response.
+    yieldsThenRejects(
+      [sdkAssistantText('{"summary": "S.", "history_sen')],
+      new Error('Reached maximum number of turns (1)'),
+    );
+    const summarize = makeSessionSummarizer(baseDeps());
+
+    await expect(
+      summarize({ previousSummary: '', segments: [[msg(1, 'assistant', 'hi')]] }),
+    ).rejects.toThrow(/maximum number of turns/);
+  });
+
   it('throws when the SDK iterator itself throws', async () => {
     install(makeRejectingQuery(new Error('sdk boom')));
     const summarize = makeSessionSummarizer(baseDeps());

@@ -17,6 +17,7 @@ Agents in this repo usually run *inside* a cyboflow session while editing cybofl
 - `docs/cyboflow_system_design.md` — product spec and scope decisions.
 - `docs/RELEASE-RUNBOOK.md` + `docs/signing/APPLE_DEVELOPER_SETUP.md` — load before any build, packaging, or release task.
 - `docs/VISUAL-VERIFICATION-SETUP.md` — how to see/drive the UI (CDP attach on :9223 is the primary path; Peekaboo is the fallback, with TCC diagnostics).
+- `docs/PERFORMANCE.md` — the CPU/memory harness (`pnpm dev:perf`, `scripts/profile-electron.mjs`), baselines, and the measurement traps (main-process timer wakeups cost more than their callbacks; dev-mode renderer profiles are inflated by `jsxDEV`).
 - `docs/PROVENANCE.md` — fork lineage; standing rule: never merge or cherry-pick from Nimbalyst.
 - `docs/crystal-legacy/` and `docs/workflows-future/` — historical reference, not current truth.
 
@@ -33,10 +34,12 @@ Agents in this repo usually run *inside* a cyboflow session while editing cybofl
 
 ```bash
 pnpm dev               # Electron dev (run `pnpm build:main` at least once first)
+pnpm dev:perf          # dev + main-process perf tracer/timer census + --inspect (docs/PERFORMANCE.md)
 pnpm typecheck && pnpm lint
 pnpm test:unit         # THE headless AC gate — for a SETTLED tree, not per-change (see below)
 pnpm test:integration  # Mocked-SDK itest suite (required for panels/claude changes)
-pnpm test:e2e          # Built-bundle Playwright; needs a real display — NOT an AC gate
+pnpm test:e2e          # Built-bundle Playwright; needs a real display. The minimal
+                       # smoke tier (test:ci:minimal) IS blocking: PR CI + release gate
 pnpm test:gate         # Day-gate integration; needs `claude` on PATH — manual only
 node scripts/ensure-sqlite-abi.mjs <host|electron>   # better-sqlite3 ABI (normally automatic)
 ```

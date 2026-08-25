@@ -462,11 +462,62 @@ export class WorkflowRegistry {
     return row ?? null;
   }
 
-  /** List a workflow's variants, newest-first. */
-  listVariants(workflowId: string): WorkflowVariantRow[] {
+  /**
+   * List a workflow's variants, newest-first. ARCHIVED variants (migration 116)
+   * are excluded unless `includeArchived` — mirroring listWorkflows' own
+   * archived-row clause, so the default list is the live set.
+   */
+  listVariants(workflowId: string, opts?: { includeArchived?: boolean }): WorkflowVariantRow[] {
+    const archivedClause = opts?.includeArchived === true ? '' : ' AND archived_at IS NULL';
     return this.db
-      .prepare('SELECT * FROM workflow_variants WHERE workflow_id = ? ORDER BY created_at DESC, id DESC')
+      .prepare(
+        `SELECT * FROM workflow_variants
+          WHERE workflow_id = ?${archivedClause}
+          ORDER BY created_at DESC, id DESC`,
+      )
       .all(workflowId) as WorkflowVariantRow[];
+  }
+
+  /**
+   * Archive a variant (migration 116): stamps `archived_at` so it drops out of
+   * the management list, the launch pickers and the rotation pool, WITHOUT
+   * touching its status, weight or run history. Idempotent — re-archiving an
+   * archived variant re-stamps and is otherwise a no-op.
+   *
+   * Rotation-lifecycle chokepoint (migration 058): archiving an ACTIVE weight>0
+   * variant removes an arm, so the reconcile runs atomically with the write,
+   * exactly as pausing it would. Throws 'not found' when the variant is missing.
+   */
+  archiveVariant(variantId: string): void {
+    this.setVariantArchived(variantId, true);
+  }
+
+  /**
+   * Reverse {@link archiveVariant}: clears `archived_at` back to NULL. The
+   * variant returns with the status it was archived under — so unarchiving one
+   * that was ACTIVE puts it straight back into rotation, which is why this
+   * reconciles too. Throws 'not found' when the variant is missing.
+   */
+  unarchiveVariant(variantId: string): void {
+    this.setVariantArchived(variantId, false);
+  }
+
+  private setVariantArchived(variantId: string, archived: boolean): void {
+    const existing = this.getVariantById(variantId);
+    if (!existing) {
+      const verb = archived ? 'archiveVariant' : 'unarchiveVariant';
+      throw new Error(`WorkflowRegistry.${verb}: variant ${variantId} not found`);
+    }
+    const stmt = this.db.prepare(
+      archived
+        ? "UPDATE workflow_variants SET archived_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+        : "UPDATE workflow_variants SET archived_at = NULL, updated_at = datetime('now') WHERE id = ?",
+    );
+    const tx = this.db.transaction(() => {
+      stmt.run(variantId);
+      reconcileRotationExperiment(this.db, existing.workflow_id);
+    });
+    tx();
   }
 
   /**

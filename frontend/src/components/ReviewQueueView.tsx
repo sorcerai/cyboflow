@@ -24,6 +24,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useReviewQueueStore, useReviewQueueView } from '../stores/reviewQueueStore';
 import { PendingApprovalCard } from './ReviewQueue/PendingApprovalCard';
 import { ReviewItemCard } from './ReviewQueue/ReviewItemCard';
+import { ProviderUsageCards } from './ReviewQueue/ProviderUsageCards';
 import { useReviewQueueKeyboard } from '../hooks/useReviewQueueKeyboard';
 import type { QueueItem } from '../utils/reviewQueueSelectors';
 import { useReviewQueueSlice } from '../stores/reviewQueueSlice';
@@ -153,6 +154,11 @@ export default function ReviewQueueView({ projectId = null }: ReviewQueueViewPro
 
       <div className="flex-1 overflow-y-auto px-7 py-4">
         <div className="mx-auto w-full max-w-[860px]">
+          {/* Subscription headroom sits ABOVE the queue and outside the isEmpty
+              branch: "no pending reviews" and "no quota left to run anything"
+              are different facts, and the second one still matters when the
+              queue is empty. */}
+          <ProviderUsageCards />
           {isEmpty ? (
             <div className="py-16 text-center text-sm text-text-muted">
               <b className="mb-1.5 block text-base text-text-primary">No pending reviews</b>

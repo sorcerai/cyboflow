@@ -26,6 +26,7 @@ import {
 } from '../utils/railExperimentGrouping';
 import { experimentDisplayName } from '../utils/experimentDisplay';
 import { ExperimentCancelDialog } from './cyboflow/ExperimentCancelDialog';
+import { groupIdeaSessions } from '../utils/ideaSessionGrouping';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,6 +114,19 @@ function allProjectIds(projects: ProjectWithRuns[]): Set<number> {
   return new Set(projects.map((p) => p.id));
 }
 
+/**
+ * Shared no-op for SessionRow's required drag-handler props on grouped
+ * idea-session rows (home + children — idea sessions plan, Stage 6), which
+ * are NOT draggable in v1. Paired with `isDraggable={false}` (drops the
+ * `draggable` attribute so no dragstart ever fires) — this keeps those rows
+ * out of the flat-list reorder state (sessionDragState /
+ * flatSessionsByProjectRef, which only ever see `flatSessions` — the
+ * post-idea-grouping ungrouped list) without needing per-handler stubs.
+ * TypeScript accepts a zero-arg function wherever a handler with unused
+ * parameters is expected.
+ */
+function noopSessionRowDragHandler(): void {}
+
 // ---------------------------------------------------------------------------
 // SessionRow — extracted + memoized so a git-status update to ONE session
 // (allSessions gets a new array reference, but unrelated Session objects keep
@@ -140,6 +154,17 @@ export interface SessionRowProps {
   onDragEnter: (e: React.DragEvent) => void;
   onDragLeave: (e: React.DragEvent) => void;
   onActiveRunClick: (runId: string, projectId: number) => void;
+  /**
+   * Idea-session home-row marker (idea sessions plan, Stage 6): prefixes the
+   * name with a '◈ ' glyph. Unset/false for ordinary rail sessions.
+   */
+  ideaGlyph?: boolean;
+  /**
+   * Set false to render a grouped idea-session row (home or child) as
+   * non-draggable — v1 grouped rows never join the flat-list reorder.
+   * Unset/true for ordinary flat rail sessions (default behavior unchanged).
+   */
+  isDraggable?: boolean;
 }
 
 function childRunsEqual(a: ActiveRunRow[], b: ActiveRunRow[]): boolean {
@@ -170,6 +195,8 @@ export function sessionRowPropsEqual(prev: SessionRowProps, next: SessionRowProp
     prev.onDragEnter === next.onDragEnter &&
     prev.onDragLeave === next.onDragLeave &&
     prev.onActiveRunClick === next.onActiveRunClick &&
+    prev.ideaGlyph === next.ideaGlyph &&
+    prev.isDraggable === next.isDraggable &&
     childRunsEqual(prev.childRuns, next.childRuns)
   );
 }
@@ -191,6 +218,8 @@ export const SessionRow = memo(function SessionRow({
   onDragEnter,
   onDragLeave,
   onActiveRunClick,
+  ideaGlyph,
+  isDraggable = true,
 }: SessionRowProps) {
   return (
     <div className="relative" style={{ marginLeft: '16px' }}>
@@ -204,7 +233,10 @@ export const SessionRow = memo(function SessionRow({
         />
       </div>
 
-      {/* Session row — draggable within this project's flat session list. */}
+      {/* Session row — draggable within this project's flat session list.
+          Grouped idea-session rows (home/child) pass isDraggable={false}: no
+          `draggable` attribute means dragstart never fires for them, so the
+          handlers below stay wired (required props) but are unreachable. */}
       <div
         className={`group/session relative flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer transition-colors ${
           isActive ? 'bg-interactive/10' : 'hover:bg-surface-hover'
@@ -212,7 +244,7 @@ export const SessionRow = memo(function SessionRow({
           sessionDropIndicator === 'after' ? 'border-b-2 border-interactive' : ''
         }`}
         style={{ paddingLeft: '24px' }}
-        draggable
+        draggable={isDraggable}
         onDragStart={(e) => onDragStart(e, session, projectId)}
         onDragOver={(e) => onDragOver(e, session)}
         onDrop={(e) => onDrop(e, session, projectId)}
@@ -224,9 +256,11 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSessionClick(session); }}
       >
-        <div className="opacity-0 group-hover/session:opacity-100 transition-opacity cursor-move">
-          <GripVertical className="w-3 h-3 text-text-tertiary" />
-        </div>
+        {isDraggable && (
+          <div className="opacity-0 group-hover/session:opacity-100 transition-opacity cursor-move">
+            <GripVertical className="w-3 h-3 text-text-tertiary" />
+          </div>
+        )}
         {/* Status indicator dot */}
         <span
           className={`w-2 h-2 rounded-full flex-shrink-0 ${statusDotClass(session.status)}`}
@@ -236,6 +270,12 @@ export const SessionRow = memo(function SessionRow({
           className={`text-sm truncate ${isActive ? 'font-semibold text-interactive' : 'text-text-primary'}`}
           title={session.name}
         >
+          {/* Idea-session home marker (idea sessions plan, Stage 6). */}
+          {ideaGlyph && (
+            <span aria-hidden className="text-interactive mr-1">
+              ◈
+            </span>
+          )}
           {session.name || session.id.slice(0, 8)}
         </span>
         <span className="text-xs text-text-tertiary truncate ml-auto">
@@ -1554,16 +1594,30 @@ function DraggableProjectTreeViewImpl(_props: DraggableProjectTreeViewProps) {
               // stays the FULL session set above so their runs still resolve as
               // non-parentless — they never re-appear as orphan run rows.
               const projectExperiments = experimentsByProject[project.id];
-              const { groups: railGroups, ungroupedSessions: flatSessions } = groupRailExperiments(
+              const { groups: railGroups, ungroupedSessions: postExperimentSessions } = groupRailExperiments(
                 projectSessions,
                 projectExperiments?.experiments ?? [],
                 projectExperiments?.summariesById ?? {},
               );
-              // Stash this project's flat list on the ref every render (this component
-              // is NOT memoized, so this always runs) — handleSessionDropForRow reads it
-              // at drop time so a memoized SessionRow's onDrop never closes over a stale
-              // ordering even when that particular row was skipped by memo.
+              // Idea-session groups (idea sessions plan, Stage 6): nest each idea's
+              // persistent home session + the sessions its launches minted, ONE level
+              // down from the flat rail. Composed AFTER experiment grouping, on ITS
+              // ungroupedSessions — an idea-launched experiment arm session is already
+              // claimed above, so it renders once (as an arm row) and never again as an
+              // idea-group child.
+              const { groups: ideaGroups, ungroupedSessions: flatSessions } =
+                groupIdeaSessions(postExperimentSessions);
+              // Stash this project's final flat list on the ref every render (this
+              // component is NOT memoized, so this always runs) — handleSessionDropForRow
+              // reads it at drop time so a memoized SessionRow's onDrop never closes over
+              // a stale ordering even when that particular row was skipped by memo. Grouped
+              // idea-session home/child rows are excluded here by construction (claimed by
+              // groupIdeaSessions above), which is what keeps them out of the flat reorder.
               flatSessionsByProjectRef.current[project.id] = flatSessions;
+              const sessionRelativeTime = (s: Session): string => {
+                const lastActivityAt = s.lastActivity ?? s.createdAt;
+                return lastActivityAt ? formatDistanceToNow(lastActivityAt) : '';
+              };
               const folderCount = project.folders?.length ?? 0;
               // railGroups counts too: a running/grading experiment whose two arm
               // sessions were both merged/dismissed leaves a group with `arms: []`
@@ -1813,6 +1867,105 @@ function DraggableProjectTreeViewImpl(_props: DraggableProjectTreeViewProps) {
                                 </div>
                               )}
                             </div>
+                          </div>
+                        );
+                      })}
+
+                      {/* Idea-session groups (idea sessions plan, Stage 6): a persistent
+                          idea home row (◈ marker, normal statusDotClass dot, same
+                          handleSessionClick) with the sessions its launches minted
+                          nested beneath it. See groupIdeaSessions above for the
+                          claim/detach rules and the composition-with-experiments note. */}
+                      {ideaGroups.map((group, groupIndex) => {
+                        const homeSession = group.homeSession;
+                        // Mirrors the flatSessions "is this the last top-level row"
+                        // check below: the home's own internal connector (drawn inside
+                        // SessionRow) only needs to continue past the row when
+                        // something else still follows it — its own children, a later
+                        // idea group, a flat session, or a parentless run row.
+                        const isLastIdeaGroup = groupIndex === ideaGroups.length - 1;
+                        const homeIsLastSession =
+                          group.children.length === 0 &&
+                          isLastIdeaGroup &&
+                          flatSessions.length === 0 &&
+                          parentlessRunCount === 0;
+
+                        return (
+                          <div key={`idea-${group.ideaId}`}>
+                            <SessionRow
+                              session={homeSession}
+                              projectId={project.id}
+                              isLastSession={homeIsLastSession}
+                              isActive={selectedSessionId === homeSession.id}
+                              relativeTime={sessionRelativeTime(homeSession)}
+                              sessionDropIndicator={null}
+                              childRuns={runsForSession(homeSession.id)}
+                              activeRunId={activeRunId}
+                              onSessionClick={handleSessionClick}
+                              onDragStart={noopSessionRowDragHandler}
+                              onDragOver={noopSessionRowDragHandler}
+                              onDrop={noopSessionRowDragHandler}
+                              onDragEnd={noopSessionRowDragHandler}
+                              onDragEnter={noopSessionRowDragHandler}
+                              onDragLeave={noopSessionRowDragHandler}
+                              onActiveRunClick={handleActiveRunClick}
+                              ideaGlyph
+                              isDraggable={false}
+                            />
+
+                            {/* Origin-linked sessions, indented beneath the home —
+                                mirrors the childRuns connector pattern above (a
+                                marginLeft:24 wrapper per item, with the same
+                                vertical/horizontal connector divs), but each item is a
+                                FULL SessionRow (not a leaf status row) so a child's own
+                                nested workflow runs still render. SessionRow's own
+                                internal marginLeft:16 nests inside this wrapper's
+                                marginLeft:24, giving children a deeper indent than the
+                                home row; SessionRow also draws its own (here largely
+                                decorative) top connector — an accepted v1 cosmetic
+                                seam in exchange for reusing the full row unchanged. */}
+                            {group.children.length > 0 && (
+                              <div className="relative mt-1 space-y-1">
+                                {group.children.map((child, childIndex) => {
+                                  const isLastChild = childIndex === group.children.length - 1;
+                                  return (
+                                    <div key={child.id} className="relative" style={{ marginLeft: '24px' }}>
+                                      <div className="absolute inset-0 pointer-events-none">
+                                        {!isLastChild && (
+                                          <div
+                                            className="absolute top-0 bottom-0 w-px bg-border-secondary"
+                                            style={{ left: '8px' }}
+                                          />
+                                        )}
+                                        <div
+                                          className="absolute h-px bg-border-secondary"
+                                          style={{ left: '8px', right: 'calc(100% - 16px)', top: '16px' }}
+                                        />
+                                      </div>
+                                      <SessionRow
+                                        session={child}
+                                        projectId={project.id}
+                                        isLastSession
+                                        isActive={selectedSessionId === child.id}
+                                        relativeTime={sessionRelativeTime(child)}
+                                        sessionDropIndicator={null}
+                                        childRuns={runsForSession(child.id)}
+                                        activeRunId={activeRunId}
+                                        onSessionClick={handleSessionClick}
+                                        onDragStart={noopSessionRowDragHandler}
+                                        onDragOver={noopSessionRowDragHandler}
+                                        onDrop={noopSessionRowDragHandler}
+                                        onDragEnd={noopSessionRowDragHandler}
+                                        onDragEnter={noopSessionRowDragHandler}
+                                        onDragLeave={noopSessionRowDragHandler}
+                                        onActiveRunClick={handleActiveRunClick}
+                                        isDraggable={false}
+                                      />
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         );
                       })}

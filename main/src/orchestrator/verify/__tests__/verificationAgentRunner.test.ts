@@ -36,6 +36,7 @@ import {
 } from '../verificationAgentRunner';
 import { SnapshotProvisionError, type SnapshotProvision } from '../snapshotProvisioner';
 import type { PinnedRunbookRecord } from '../runbookStore';
+import type { VerifyRunbookV1 } from '../../../../../shared/types/verifyRunbook';
 import { setSeamErrorSink } from '../../telemetrySink';
 import type { EffectiveAgent } from '../../agents/effectiveAgents';
 import type {
@@ -272,6 +273,31 @@ describe('resolveVerifyModel', () => {
       runModel: 'claude-run',
     };
     expect(resolveVerifyModel(r, () => null, CLAUDE_DEFAULT)).toBe(CLAUDE_DEFAULT);
+  });
+
+  // The picker sentinel is a REAL stored run model (migration 037: "NULL/'auto'
+  // = SDK default"; the config default is 'auto'), and inheriting it verbatim
+  // killed every visual verification on such a run with "There's an issue with
+  // the selected model (auto)" — CYBOFLOW-APP-11.
+  it.each(['auto', 'AUTO', 'default', '   '])(
+    'falls back to the Claude default rather than inheriting the %j sentinel',
+    (sentinel) => {
+      const r: ResolvedVerifyAgent = {
+        agent: makeAgent({ model: null }),
+        runProvider: 'claude',
+        runModel: sentinel,
+      };
+      expect(resolveVerifyModel(r, alias, CLAUDE_DEFAULT)).toBe(CLAUDE_DEFAULT);
+    },
+  );
+
+  it('falls back to the Claude default when a Claude run carries a stale gpt model', () => {
+    const r: ResolvedVerifyAgent = {
+      agent: makeAgent({ model: null }),
+      runProvider: 'claude',
+      runModel: 'gpt-5.4',
+    };
+    expect(resolveVerifyModel(r, alias, CLAUDE_DEFAULT)).toBe(CLAUDE_DEFAULT);
   });
 });
 
@@ -1701,6 +1727,85 @@ describe('VerificationAgentRunner — runbook pin enforcement', () => {
     expect(result.status).toBe('skipped');
     expect(result.runbookMismatch).toBe(true);
     expect(result.errorMessage).toContain('setup-proof request pinned');
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DECLARED LEVERS ARE EXPORTED (first-live-smoke finding, 2026-08-20)
+//
+// `levers` was parsed, hashed and documented while being read by nothing, so
+// whether the served surface bound the LEASED port and carried THIS request's
+// nonce came down to what the verification agent inferred from the runbook's
+// prose — which is not reproducible, and failed in the direction that marks a
+// runbook proven when only an embellishing agent can execute it.
+// ---------------------------------------------------------------------------
+
+describe('VerificationAgentRunner — the pinned runbook levers reach the agent env', () => {
+  const entry = {
+    build: ['pnpm run build:web'],
+    serve: { cmd: 'pnpm run preview' },
+    attestation: { kind: 'http-endpoint' as const, urlPath: '/__cyboflow_verify__' },
+  };
+  const pinnedTask = makeTask({ build: entry.build, serve: entry.serve, attestation: entry.attestation });
+  const HASH = 'c'.repeat(64);
+  const withLevers = (levers: VerifyRunbookV1['levers']): PinnedRunbookRecord => ({
+    runbook: { version: 1, modalities: { web: entry }, ...(levers ? { levers } : {}) },
+    version: 2,
+    status: 'proven',
+  });
+  const runWith = async (levers: VerifyRunbookV1['levers']) => {
+    const { runner, query, warn } = makeRunner({
+      resolveRunbookByHash: () => withLevers(levers),
+      ...servedBy(entry.serve.cmd),
+    });
+    const result = await runner.run(makeReq({ task: pinnedTask, runbookHash: HASH, runbookLocalVersion: 2 }));
+    return { result, env: query.mock.calls[0][0].env, warn };
+  };
+
+  it('binds a declared portEnv to the leased port and nonceEnv to this request nonce', async () => {
+    const { env } = await runWith({ portEnv: 'PORT', nonceEnv: 'APP_BUILD_ID' });
+    expect(env.PORT).toBe(env.VERIFY_PORT);
+    expect(env.APP_BUILD_ID).toBe(env.VERIFY_ATTEST_NONCE);
+  });
+
+  it('exports no extra names when the runbook declares no levers', async () => {
+    const { env } = await runWith(undefined);
+    expect(env.PORT).toBeUndefined();
+    expect(env.APP_BUILD_ID).toBeUndefined();
+  });
+
+  // Rule 1 — the harness contract is not a runbook's to rewrite.
+  it('never lets a lever overwrite a harness variable, and says so', async () => {
+    const { env, warn } = await runWith({ nonceEnv: 'VERIFY_PORT' });
+    expect(env.VERIFY_PORT).not.toBe(env.VERIFY_ATTEST_NONCE);
+    expect(warn).toHaveBeenCalledWith(
+      '[VerificationAgentRunner] runbook lever(s) not exported',
+      expect.objectContaining({
+        dropped: [{ lever: 'nonceEnv', name: 'VERIFY_PORT', reason: 'shadows-harness' }],
+      }),
+    );
+  });
+
+  // Rule 2 — a machine-authored name that configures execution is not a lever.
+  it('drops a lever naming the execution environment', async () => {
+    const { env } = await runWith({ portEnv: 'PATH' });
+    expect(env.PATH).toBeUndefined();
+  });
+
+  // An UNPINNED request has no runbook to read levers from; it must still run.
+  it('runs normally when the request carries no pin at all', async () => {
+    const { runner, query } = makeRunner({ ...servedBy(entry.serve.cmd) });
+    const result = await runner.run(makeReq({ task: pinnedTask }));
+    expect(result.status).toBe('passed');
+    expect(query.mock.calls[0][0].env.PORT).toBeUndefined();
+  });
+
+  // A REJECTED pin never reaches the env, so its levers must not either.
+  it('does not export levers from a revision whose pin was refused', async () => {
+    const { runner, query } = makeRunner({ resolveRunbookByHash: () => null });
+    const result = await runner.run(makeReq({ task: pinnedTask, runbookHash: HASH, runbookLocalVersion: 2 }));
+    expect(result.runbookMismatch).toBe(true);
     expect(query).not.toHaveBeenCalled();
   });
 });

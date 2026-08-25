@@ -183,13 +183,20 @@ export interface VerifyRunbookV1 {
    * from, `dataDirEnv` the one that redirects the app's state directory (the
    * fix for §1's root cause (b): cyboflow's own single-instance lock is keyed
    * on `CYBOFLOW_DIR`, defeating `--user-data-dir`), `cdpPortFlag` the CLI flag
-   * that pins the app's CDP port. The VALUES bound to them are request-scoped
-   * and resolved after lease acquisition.
+   * that pins the app's CDP port, and `nonceEnv` the one the build or serve step
+   * reads this request's attestation nonce from. The VALUES bound to them are
+   * request-scoped and resolved after lease acquisition.
+   *
+   * `portEnv` and `nonceEnv` are the two the harness EXPORTS (see
+   * `resolveLeverEnv`); declaring either is what makes the runbook self-
+   * sufficient, because it moves the port binding and the attestation marker off
+   * whatever the verification agent inferred from `notes` and onto the harness.
    */
   levers?: {
     portEnv?: string;
     dataDirEnv?: string;
     cdpPortFlag?: string;
+    nonceEnv?: string;
     notes?: string;
   };
 }
@@ -381,7 +388,7 @@ export function parseVerifyRunbookV1(
   if (value.levers !== undefined) {
     if (!isRecord(value.levers)) return { ok: false, error: 'levers: expected an object' };
     const l = value.levers;
-    for (const field of ['portEnv', 'dataDirEnv', 'cdpPortFlag', 'notes'] as const) {
+    for (const field of ['portEnv', 'dataDirEnv', 'cdpPortFlag', 'nonceEnv', 'notes'] as const) {
       if (l[field] !== undefined && typeof l[field] !== 'string') {
         return { ok: false, error: `levers.${field}: expected string` };
       }
@@ -390,6 +397,7 @@ export function parseVerifyRunbookV1(
       ...(typeof l.portEnv === 'string' ? { portEnv: l.portEnv } : {}),
       ...(typeof l.dataDirEnv === 'string' ? { dataDirEnv: l.dataDirEnv } : {}),
       ...(typeof l.cdpPortFlag === 'string' ? { cdpPortFlag: l.cdpPortFlag } : {}),
+      ...(typeof l.nonceEnv === 'string' ? { nonceEnv: l.nonceEnv } : {}),
       ...(typeof l.notes === 'string' ? { notes: l.notes } : {}),
     };
   }

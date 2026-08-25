@@ -1,3 +1,9 @@
+// FIRST import, deliberately: the timer census can only attribute timers
+// scheduled AFTER it patches the globals, and several services schedule one at
+// module-import time. A no-op unless CYBOFLOW_PERF_TRACE=1.
+import { installTimerCensus } from './services/timerCensus';
+installTimerCensus();
+
 import {
   app,
   BrowserWindow,
@@ -36,6 +42,7 @@ import { registerArtifactHtmlHandlers, loadCanonicalPrototypeHtml } from './ipc/
 import {
   shouldBlockArtifactFrameNavigation,
   isExternallyOpenable,
+  isSafeExternalOpenTarget,
   shouldBlockScriptedFrameNavigationFromRegistry,
 } from './ipc/artifactFrameGuard';
 import { registerDesignPrototypeServerHandlers } from './ipc/designPrototypeServer';
@@ -91,9 +98,12 @@ import { OmpBridgeHttpClient } from './orchestrator/omp/ompBridgeClient';
 import { resolveOmpBridgeCommandConfig } from './orchestrator/omp/ompBridgeConfig';
 import { resolveOmpPrincipal } from './orchestrator/omp/ompPrincipal';
 import { OmpCommandStub } from './orchestrator/omp/ompCommandStub';
-import type { OmpCommandAdapter } from '../../shared/types/ompCommand';
+import type { OmpCommandAdapter, OmpPrincipal } from '../../shared/types/ompCommand';
 import { OmpSessionManager } from './orchestrator/omp/ompSessionManager';
+import { OmpSupervisedAdapter, type OmpSupervisedAuditEntry } from './orchestrator/omp/ompSupervisedAdapter';
+import { hasSupervise } from '../../shared/types/ompCommand';
 import { FeedbackRouter } from './orchestrator/feedbackRouter';
+import { IdeaComponentRouter } from './orchestrator/ideaComponents/ideaComponentRouter';
 import { setRevisionLauncher } from './orchestrator/sendFeedbackHandler';
 import { runRevisionBatch } from './orchestrator/feedback/revisionWorker';
 import { makeRevisionQuery } from './orchestrator/feedback/revisionQuery';
@@ -122,6 +132,7 @@ import {
 } from './orchestrator/programmatic/monitor';
 import { retryRunHandler, type RetryRunDeps } from './orchestrator/retryRunHandler';
 import { rewindRunHandler, type RewindRunDeps } from './orchestrator/rewindRunHandler';
+import { laneRewindHandler, type LaneRewindDeps } from './orchestrator/laneRewindHandler';
 import { makeSdkStructuredQuery, makeSdkTextQuery } from './orchestrator/programmatic/monitorQuery';
 import { StepResultStore } from './orchestrator/stepResultStore';
 import { DynamicWorkflowTracker } from './orchestrator/dynamicWorkflows';
@@ -144,6 +155,13 @@ import {
 import { VerificationAgentRunner } from './orchestrator/verify/verificationAgentRunner';
 import { VerifyCapabilityStore } from './orchestrator/verify/capabilityStore';
 import { VerifyRunbookStore } from './orchestrator/verify/runbookStore';
+import { RunbookBootstrapStampStore } from './orchestrator/verify/bootstrapStampStore';
+import { BootstrapSuppressionStore } from './orchestrator/verify/bootstrapSuppressionStore';
+import { MAX_BOOTSTRAP_ROUNDS, runRunbookBootstrap } from './orchestrator/verify/runbookBootstrapRunner';
+import { makeRunbookDraftQuery } from './orchestrator/verify/runbookDraftAgentQuery';
+import { composeRunbookDraftPrompt } from './orchestrator/verify/runbookDraftPrompt';
+import { commitPathspec } from './orchestrator/verify/bootstrapCommit';
+import { enqueueTaskVerification } from './orchestrator/verify/enqueueFromTask';
 import { VERIFY_RUNBOOK_RELATIVE_PATH } from '../../shared/types/verifyRunbook';
 import { probeChromiumExecutable } from './orchestrator/verify/driver/driverCore';
 import { makeVerificationAgentQuery } from './orchestrator/verify/verificationAgentQuery';
@@ -163,6 +181,7 @@ import { VlmJudgeImpl, DEFAULT_JUDGE_MODEL } from './services/visualVerify/vlmJu
 import { findNodeExecutable } from './utils/nodeFinder';
 import * as net from 'node:net';
 import type { AgentProvider } from '../../shared/types/agentRuntime';
+import type { ClaudePanelState } from '../../shared/types/panels';
 import { isAgentProvider, providerForRuntime } from '../../shared/types/agentRuntime';
 import { setAgentProviderAccessResolver } from './services/agentProviderGuard';
 import { DevServerManager } from './services/visualVerify/devServerManager';
@@ -172,6 +191,7 @@ import { CodexBrokerReaper } from './services/codexBrokerReaper';
 import { VitestOrphanReaper } from './services/vitestOrphanReaper';
 import { McpOrphanTripwire } from './services/mcpOrphanTripwire';
 import { TrackerSyncService } from './services/trackerSync/trackerSyncService';
+import { DatabaseBackupService } from './services/databaseBackupService';
 import { setTrackerSyncFacade } from './orchestrator/trackerSyncBridge';
 import { FsBaselineStore } from './services/visualVerify/baselineStore';
 import { comparePngFiles } from './services/visualVerify/pixelDiff';
@@ -183,6 +203,10 @@ import type {
   VlmJudge,
 } from '../../shared/types/visualVerification';
 import { setHealthProvider } from './orchestrator/trpc/routers/health';
+import { setProviderUsageSource } from './orchestrator/trpc/routers/providerUsage';
+import { initProviderUsageStore, tryGetProviderUsageStore } from './services/providerUsage/providerUsageStore';
+import { ProviderUsagePoller } from './services/providerUsage/providerUsagePoller';
+import { pollClaudeUsage, pollCodexRateLimits } from './services/providerUsage/providerUsagePollAdapters';
 import {
   setReviewItemsRunProbe,
   setResolveVerdictNudgeDeps,
@@ -206,7 +230,7 @@ import { OrchestratorHealth } from './orchestrator/health';
 import { McpServerLifecycle } from './orchestrator/mcpServer/mcpServerLifecycle';
 import { resolveMcpServerScriptPath } from './orchestrator/mcpServer/scriptPath';
 import { OrchSocketServer } from './orchestrator/mcpServer/orchSocketServer';
-import { approvalEvents, experimentEvents, questionEvents, runStatusEvents, stepTransitionEvents } from './orchestrator/trpc/routers/events';
+import { approvalEvents, experimentEvents, questionEvents, runStatusEvents, stepTransitionEvents, stuckEvents } from './orchestrator/trpc/routers/events';
 import { EvalWorker } from './orchestrator/eval/evalWorker';
 import { ClaudeJudge } from './orchestrator/eval/evalJury';
 import { CodexJudge } from './orchestrator/eval/codexJudge';
@@ -214,6 +238,7 @@ import { makeEvalJudgeQuery } from './orchestrator/eval/evalJudgeQuery';
 import { makeCodexEvalJudgeQuery } from './services/panels/codex/codexEvalJudgeQuery';
 import { PairwiseJudgeWorker } from './orchestrator/eval/pairwiseJudgeWorker';
 import { ClaudePairwiseJudge } from './orchestrator/eval/pairwiseJudge';
+import { CodexPairwiseJudge } from './orchestrator/eval/codexPairwiseJudge';
 import { makePairwiseJudgeQuery } from './orchestrator/eval/pairwiseJudgeQuery';
 import { handleTerminalStatusEvent } from './orchestrator/terminalEvalSubscriber';
 import { resolveRunFrozenSpec } from './orchestrator/runFrozenSpec';
@@ -233,6 +258,18 @@ import {
   type ProposalExecutorDeps,
   type TaskFieldsSnapshot,
 } from './orchestrator/agentThread/proposalExecutor';
+import {
+  DESIGN_MODE_KICKOFF_PROMPT,
+  finishDesignSessionCreate,
+  type DesignSessionLaunchDeps,
+} from './orchestrator/designSessionLaunch';
+import { validateDesignIdeaLink } from './services/designIdeaValidation';
+import {
+  runClaudeSdkSessionPreflights,
+  type ClaudeSdkPreflightFailure,
+} from './services/claudeSdkSessionPreflight';
+import { findIdeaBusyReason } from './orchestrator/ideaBusy';
+import { setOpenIdeaSessionDeps } from './services/openIdeaSessionCore';
 import { agentThreadEvents } from './orchestrator/trpc/routers/agentThread';
 import type { ApprovalRequest } from './orchestrator/approvalRouter';
 import type { QuestionRequest } from './orchestrator/questionRouter';
@@ -270,6 +307,7 @@ import {
   backfillArchivedSessionReviewItems,
   backfillInterruptedOutcomes,
   backfillTerminalOutcomes,
+  backfillRunUsageRollups,
   stampSessionRunsOutcome,
 } from './orchestrator/runRecovery';
 import { setExperimentsDeps } from './orchestrator/trpc/routers/experiments';
@@ -286,6 +324,22 @@ import { getBootDatabasePath, getDemoBootEnvironment, getDemoBootError } from '.
 import { runGitAsync } from './utils/runGit';
 
 export let mainWindow: BrowserWindow | null = null;
+
+/**
+ * Design-mode-FORK wording for each rung of the shared SDK-pinned pre-flight
+ * ladder (services/claudeSdkSessionPreflight.ts). Deliberately terser than the
+ * `sessions:create-quick` handler's copy — this fork has no renderer client, so
+ * the text lands in a review-queue finding rather than a toast. Kept
+ * byte-identical to what createDesignSession threw before the ladder was
+ * extracted.
+ */
+const DESIGN_FORK_PREFLIGHT_MESSAGES: Readonly<Record<ClaudeSdkPreflightFailure, string>> = {
+  provider_disabled: 'Design sessions require Claude, which is turned off in Settings → Integrations.',
+  claude_not_detected:
+    'Design sessions require the Claude SDK substrate — Claude credentials/binary not detected.',
+  interactive_pty_only:
+    'Design sessions cannot run on the interactive substrate, but this app is locked to interactive-PTY-only mode.',
+};
 
 // Strip PER-RUN cyboflow env inherited from a HOSTING cyboflow session
 // (dogfooding: `pnpm dev` launched from a shell inside another cyboflow
@@ -359,10 +413,41 @@ let orchestrator: Orchestrator | null = null;
 const fleetRegistryReader = new FleetRegistryReader();
 
 /**
+ * The OMP command principal and audit sink, at module scope so the tRPC context
+ * and the fleet session manager share ONE identity and ONE trail.
+ *
+ * Resolved lazily rather than as a module-scope const: the supervise capability
+ * comes from Aria mode (`configManager.getAriaMode()`), and configManager is not
+ * constructed at module-evaluation time.
+ *
+ * Every consumer takes this FUNCTION, never a snapshot of its result — the tRPC
+ * context calls it per request, and both `OmpSupervisedAdapter` instances hold
+ * the thunk and resolve per command. So flipping Aria mode takes effect on the
+ * next call in either direction, with no relaunch: granting it makes fleet
+ * sessions launchable, revoking it forbids the very next command.
+ */
+function currentOmpPrincipal(): OmpPrincipal {
+  // Guarded: a caller before initializeServices() gets the fail-closed answer
+  // rather than a crash.
+  let ariaMode = false;
+  try {
+    ariaMode = configManager.getAriaMode();
+  } catch {
+    ariaMode = false;
+  }
+  return resolveOmpPrincipal(ariaMode);
+}
+const auditOmp = (entry: OmpSupervisedAuditEntry): void => {
+  logger.info(
+    `omp:audit ${entry.outcome} ${entry.verb} op=${entry.operationId} by=${entry.principal} ${entry.detail}`,
+  );
+};
+
+/**
  * Build the privileged OMP command adapter: a real bridge client when the
- * bridge is configured, else the fail-closed stub. Resolved per construction so
- * tests and the standalone composition root can inject whichever they like; the
- * Electron path uses the environment/pointer config.
+ * bridge is configured, else the fail-closed stub. Always wrapped in
+ * `OmpSupervisedAdapter`, so the capability gate and the audit trail hold for
+ * every caller rather than only for the ones that remember to check.
  */
 function buildOmpCommandAdapter(): OmpCommandAdapter {
   const config = resolveOmpBridgeCommandConfig();
@@ -371,7 +456,14 @@ function buildOmpCommandAdapter(): OmpCommandAdapter {
     return new OmpCommandStub();
   }
   logger.info(`omp:command adapter configured for session ${config.sessionId}`);
-  return new OmpBridgeCommandAdapter(new OmpBridgeHttpClient(config.url, config.token, config.sessionId));
+  return new OmpSupervisedAdapter(
+    new OmpBridgeCommandAdapter(new OmpBridgeHttpClient(config.url, config.token, config.sessionId)),
+    // The THUNK, not a snapshot: this adapter is built once per window attach
+    // and retained, so a captured principal would freeze the capability at
+    // whatever Aria mode was when the window opened.
+    currentOmpPrincipal,
+    auditOmp,
+  );
 }
 // OMP fleet runtime manager (omp-phase4-coexistence-adr.md increment 4). Built
 // fail-closed in initializeServices(): present ONLY when the bridge command
@@ -409,12 +501,12 @@ let monitorRetryStep: ((runId: string, stepId?: string) => Promise<MonitorAction
 let monitorSwitchToOrchestrated:
   | ((runId: string, reason: string) => Promise<MonitorActionResult>)
   | null = null;
-// Monitor-actuation seam (the 9 confirm-gated steering actions: add/remove/edit
-// task, skip/unskip/steer step, the whole-run rewind, resolve review item, file
-// note). Same late-binding pattern as the two above — bound in the tRPC
-// dep-wiring block where db / runExecutor / the routers are all live. Grouped
-// into one holder object (rather than 9 separate module vars) since they share a
-// wiring site. Null until wired → each action reports "not available yet"
+// Monitor-actuation seam (the 10 confirm-gated steering actions: add/remove/edit
+// task, skip/unskip/steer step, the whole-run rewind, the PER-LANE rewind,
+// resolve review item, file note). Same late-binding pattern as the two above —
+// bound in the tRPC dep-wiring block where db / runExecutor / the routers are all
+// live. Grouped into one holder object (rather than 10 separate module vars)
+// since they share a wiring site. Null until wired → each action reports "not available yet"
 // instead of acting.
 interface MonitorSteeringActions {
   addTask(runId: string, input: { title: string; body?: string; priority?: string }): Promise<MonitorActionResult>;
@@ -430,6 +522,10 @@ interface MonitorSteeringActions {
     input: { stepId: string; guidance: string; taskRef?: string },
   ): Promise<MonitorActionResult>;
   rewindToStep(runId: string, input: { stepId: string }): Promise<MonitorActionResult>;
+  rewindLaneToStep(
+    runId: string,
+    input: { taskRef: string; stepId: string },
+  ): Promise<MonitorActionResult>;
   resolveReviewItem(
     runId: string,
     input: { reviewItemId: string; outcome?: 'approve' | 'reject'; resolution?: string },
@@ -551,6 +647,13 @@ let mcpOrphanTripwire: McpOrphanTripwire | null = null;
 // initializeServices (it needs the sqlite handle plus TaskChangeRouter), so it is
 // null until boot finishes wiring.
 let trackerSyncService: TrackerSyncService | null = null;
+
+// Daily sessions.db backup service (7-day retention). Module-level so the
+// before-quit handler can stop it; constructed + started in initializeServices
+// (it needs the open sqlite handle), so it is null until boot finishes wiring,
+// and stays null in demo mode (demo.db is reset every launch — nothing worth
+// backing up).
+let databaseBackupService: DatabaseBackupService | null = null;
 
 // Store original console methods before overriding
 // These must be captured immediately when the module loads
@@ -789,12 +892,10 @@ let verifyRunbookStatus: VerifyRunbookStatusLike | undefined;
 function attachOrchestratorTrpcToWindow(win: BrowserWindow): void {
   const db = makeDatabaseLike(databaseService);
   // Privileged OMP commands: a real bridge adapter when configured, else the
-  // fail-closed stub. The supervise capability is OFF for the v1 'local'
-  // principal either way, so every command is FORBIDDEN until v2 grants it.
+  // fail-closed stub — supervise-gated and audited either way by the wrapper
+  // buildOmpCommandAdapter applies. The capability is OFF unless the operator
+  // set CYBOFLOW_OMP_SUPERVISE, so every command is FORBIDDEN by default.
   const ompCommand = buildOmpCommandAdapter();
-  const auditOmp = (entry: { verb: string; principal: string; outcome: string; operationId: string; detail: string }) => {
-    logger.info(`omp:audit ${entry.outcome} ${entry.verb} op=${entry.operationId} by=${entry.principal} ${entry.detail}`);
-  };
   attachOrchestratorTrpc({
     window: win,
     router: appRouter,
@@ -807,8 +908,22 @@ function attachOrchestratorTrpcToWindow(win: BrowserWindow): void {
         getForcedSubstrate: () => configManager.getForcedSubstrate(),
         omp: fleetRegistryReader,
         ompCommand,
-        principal: resolveOmpPrincipal(),
+        // The THUNK, not a snapshot: createContext resolves it per request, so
+        // granting or revoking Aria mode takes effect on the next call in both
+        // directions — no relaunch (the frozen-value bug this PR fixes).
+        principal: currentOmpPrincipal,
         auditOmp,
+        // The manager exists iff the BRIDGE is configured — a boot-time,
+        // env-driven fact, so the picker asks whether it exists rather than
+        // re-deriving the config. The other half of `launchable` is the live
+        // `hasSupervise(ctx.principal)` check in the availability query, which
+        // is what makes the Aria toggle take effect without a relaunch.
+        ompFleetLaunchable: () => ompSessionManager !== undefined,
+        ompAriaMode: () => configManager.getAriaMode(),
+        // The per-substrate sprint task-cap override (Settings → Sessions), read
+        // LIVE per request so raising the cap takes effect without a restart —
+        // runs.start layers it over the built-in defaults.
+        getSprintMaxTasks: () => configManager.getSprintMaxTasks(),
         // Run-scoped Diff tab: closure over GitDiffManager keeps the standalone
         // runs router free of a services/* import. Narrow the GitDiffResult down
         // to the RunGitDiff wire shape (diff + stats + changedFiles).
@@ -1064,8 +1179,17 @@ async function createWindow() {
   // Set the app title based on development mode and worktree
   setAppTitle();
 
+  // Every `target=_blank` / `window.open` in the renderer is denied a popup and
+  // offered to the OS instead — so the url reaching `shell.openExternal` is
+  // whatever the renderer put in the link. Gate it on scheme: `shell.openExternal`
+  // is an OS launcher, not a browser, so `file:`/`javascript:`/custom schemes
+  // would otherwise be launchable from a renderer XSS. See artifactFrameGuard.ts.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isSafeExternalOpenTarget(url)) {
+      void shell.openExternal(url);
+    } else {
+      console.warn('[Main] Blocked window-open to non-web scheme:', url);
+    }
     return { action: 'deny' };
   });
 
@@ -1562,14 +1686,39 @@ async function initializeServices(): Promise<boolean> {
   // silently authorizes a session.
   {
     const ompBridgeConfig = resolveOmpBridgeCommandConfig();
-    ompSessionManager = ompBridgeConfig
-      ? new OmpSessionManager(
-          new OmpBridgeCommandAdapter(
-            new OmpBridgeHttpClient(ompBridgeConfig.url, ompBridgeConfig.token, ompBridgeConfig.sessionId),
-          ),
-          cyboflowLogger,
-        )
-      : undefined;
+    // TWO gates, both required. The bridge config says the fleet is REACHABLE;
+    // the supervise capability says this operator authorized Cyboflow to drive
+    // it. Spawning and killing remote workers is the same privileged surface
+    // the ompCommand router refuses without the capability, so the manager that
+    // drives it from the panel seams must refuse on the same terms — otherwise
+    // the product's actual path sits outside the authorization model.
+    if (ompBridgeConfig !== undefined && !hasSupervise(currentOmpPrincipal())) {
+      logger.info(
+        'omp:fleet bridge is configured but the supervise capability is absent ' +
+          '(turn on Aria mode in Settings → Advanced Options, or set CYBOFLOW_OMP_SUPERVISE ' +
+          'on a headless host) — fleet sessions stay unavailable until it is granted',
+      );
+    }
+    // Constructed on the BRIDGE CONFIG alone. The supervise capability is
+    // deliberately NOT a construction condition: it comes from Aria mode, which
+    // the user flips at runtime, and gating construction on it froze the answer
+    // at launch — granting Aria appeared to do nothing until a restart. The
+    // capability is enforced per call by OmpSupervisedAdapter instead, which is
+    // strictly stronger: revoking Aria now forbids the very next command rather
+    // than leaving an already-built manager authorized for the rest of the run.
+    ompSessionManager =
+      ompBridgeConfig !== undefined
+        ? new OmpSessionManager(
+            new OmpSupervisedAdapter(
+              new OmpBridgeCommandAdapter(
+                new OmpBridgeHttpClient(ompBridgeConfig.url, ompBridgeConfig.token, ompBridgeConfig.sessionId),
+              ),
+              currentOmpPrincipal,
+              auditOmp,
+            ),
+            cyboflowLogger,
+          )
+        : undefined;
   }
 
   // Inject the global-config provider so createRun resolves the global default
@@ -1613,6 +1762,19 @@ async function initializeServices(): Promise<boolean> {
   // the seam. See main/src/orchestrator/trackerSyncBridge.ts.
   setTrackerSyncFacade(trackerSyncService);
 
+  // Daily sessions.db backup (7-day retention) — see databaseBackupService.ts
+  // for why hourly-tick + file-existence-guard rather than a 24h timer.
+  // Skipped in demo mode: demoBootEnv's database is a throwaway reset on every
+  // launch, so backing it up is pure waste.
+  if (!demoBootEnv) {
+    databaseBackupService = new DatabaseBackupService({
+      db: databaseService.getDb(),
+      backupsDir: path.join(path.dirname(dbPath), 'backups'),
+      logger: cyboflowLogger,
+    });
+    databaseBackupService.start();
+  }
+
   // Sprint-lane write chokepoint (feat/parallel-sprint, migrations 022 + 023).
   // The single serialized writer for `sprint_batches`/`sprint_batch_tasks`;
   // injected (structurally, as narrow slices) into RunLauncher (createForRun at
@@ -1636,6 +1798,12 @@ async function initializeServices(): Promise<boolean> {
   // (it binds makeRevisionQuery + TaskChangeRouter, both off-limits to the
   // standalone tRPC router) and read by sendFeedbackHandler via getRevisionLauncher.
   FeedbackRouter.initialize(cyboflowDb);
+
+  // Idea component ledger write chokepoint (migration 101) — the single
+  // serialized writer for `idea_components`; the cyboflow.ideaComponents tRPC
+  // router reaches it via getInstance() for the card's manual-override path.
+  IdeaComponentRouter.initialize(cyboflowDb);
+
   setRevisionLauncher((info) =>
     runRevisionBatch(
       {
@@ -2044,6 +2212,66 @@ async function initializeServices(): Promise<boolean> {
   // is "any component changing demotes", so both must be (a) stable across calls
   // on an unchanged host — they are compared for equality, not merely stored —
   // and (b) cheap, since `status()` recomputes them on every gated request.
+  // The §5.3 drift probes, hoisted OUT of the store literal so the runbook
+  // BOOTSTRAP keys its §10 suppression on the IDENTICAL hashes the store
+  // demotes a proof on. A suppression is honored only while both still match,
+  // so a second implementation of either would produce one that never expires
+  // or one that never holds.
+  // The §5.3 project INPUT hash: the things that change what "build and serve
+  // this project" MEANS — the package scripts the runbook's commands invoke,
+  // the lockfile (a dependency bump can break a dev server), and the two ABI
+  // facts §1's root cause (c) turned on. Deliberately NOT a hash of the whole
+  // tree: every commit would then demote the runbook, which would make the
+  // proof worthless by expiring it constantly.
+  const verifyComputeInputHash = async (dirPath: string): Promise<string | null> => {
+    try {
+      const raw = await fs.promises.readFile(path.join(dirPath, 'package.json'), 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      const pkg = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+      const hash = createHash('sha256');
+      hash.update(JSON.stringify(pkg.scripts ?? null));
+      hash.update(String(pkg.packageManager ?? ''));
+      for (const lockfile of ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lockb']) {
+        try {
+          hash.update(await fs.promises.readFile(path.join(dirPath, lockfile)));
+        } catch {
+          // absent lockfile — nothing to fold in.
+        }
+      }
+      hash.update(process.versions.node.split('.')[0]);
+      hash.update(process.versions.modules);
+      return hash.digest('hex');
+    } catch {
+      // Could not observe the inputs. The store treats null as "cannot tell",
+      // which fails soft to 'absent' WITHOUT demoting — an inability to look is
+      // not evidence that something changed.
+      return null;
+    }
+  };
+
+  // The §5.3 host fingerprint. The chromium path is the driver's OWN resolution
+  // (the same probe preflight uses), so a chromium that moved or vanished
+  // demotes the proof rather than surfacing ten minutes into a deploy. The TCC
+  // grant state is deliberately excluded: probing it shells the peekaboo binary
+  // on EVERY gated request, and the per-modality capability ledger (§3.3)
+  // already owns grant regressions.
+  const verifyHostFingerprint = async (): Promise<string> => {
+    let chromium: string | null = null;
+    try {
+      chromium = await probeChromiumExecutable();
+    } catch {
+      chromium = null;
+    }
+    return JSON.stringify({
+      chromium,
+      node: process.versions.node.split('.')[0],
+      electronAbi: process.versions.modules,
+      platform: process.platform,
+      arch: process.arch,
+      appPath: app.getPath('exe'),
+    });
+  };
+
   const verifyRunbookStore = new VerifyRunbookStore(cyboflowDb, {
     // ABSENT vs UNREADABLE both answer null: the store's contract is that null
     // means "this tree does not carry the file", which is the ordinary pre-merge
@@ -2056,74 +2284,32 @@ async function initializeServices(): Promise<boolean> {
         return null;
       }
     },
-    // The §5.3 project INPUT hash: the things that change what "build and serve
-    // this project" MEANS — the package scripts the runbook's commands invoke,
-    // the lockfile (a dependency bump can break a dev server), and the two ABI
-    // facts §1's root cause (c) turned on. Deliberately NOT a hash of the whole
-    // tree: every commit would then demote the runbook, which would make the
-    // proof worthless by expiring it constantly.
-    computeInputHash: async (dirPath: string): Promise<string | null> => {
-      try {
-        const raw = await fs.promises.readFile(path.join(dirPath, 'package.json'), 'utf8');
-        const parsed: unknown = JSON.parse(raw);
-        const pkg = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
-        const hash = createHash('sha256');
-        hash.update(JSON.stringify(pkg.scripts ?? null));
-        hash.update(String(pkg.packageManager ?? ''));
-        for (const lockfile of ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lockb']) {
-          try {
-            hash.update(await fs.promises.readFile(path.join(dirPath, lockfile)));
-          } catch {
-            // absent lockfile — nothing to fold in.
-          }
-        }
-        hash.update(process.versions.node.split('.')[0]);
-        hash.update(process.versions.modules);
-        return hash.digest('hex');
-      } catch {
-        // Could not observe the inputs. The store treats null as "cannot tell",
-        // which fails soft to 'absent' WITHOUT demoting — an inability to look is
-        // not evidence that something changed.
-        return null;
-      }
-    },
-    // The §5.3 host fingerprint. The chromium path is the driver's OWN resolution
-    // (the same probe preflight uses), so a chromium that moved or vanished
-    // demotes the proof rather than surfacing ten minutes into a deploy. The TCC
-    // grant state is deliberately excluded: probing it shells the peekaboo binary
-    // on EVERY gated request, and the per-modality capability ledger (§3.3)
-    // already owns grant regressions.
-    hostFingerprint: async (): Promise<string> => {
-      let chromium: string | null = null;
-      try {
-        chromium = await probeChromiumExecutable();
-      } catch {
-        chromium = null;
-      }
-      return JSON.stringify({
-        chromium,
-        node: process.versions.node.split('.')[0],
-        electronAbi: process.versions.modules,
-        platform: process.platform,
-        arch: process.arch,
-        appPath: app.getPath('exe'),
-      });
-    },
+    computeInputHash: verifyComputeInputHash,
+    hostFingerprint: verifyHostFingerprint,
     logger: cyboflowLogger,
   });
 
   // ONE resolver, two consumers: the scheduler's §3.2 degrade gate (below) and
-  // the health panel's setup badge (via the tRPC context). Probed against the
-  // PROJECT path — both ask a project-level question ("has this project ever
-  // proven a runbook for this modality, and does that proof still hold here?"),
-  // while the enqueue-time injection (scheduler.resolveProvenRunbook) probes the
-  // requesting RUN's worktree, which is the tree whose commands would actually
-  // execute. No project path (a deleted/unresolvable project row) ⇒ 'absent',
-  // which skips with the setup CTA rather than guessing.
-  verifyRunbookStatus = async (projectId, modality) => {
-    const projectPath = databaseService.getProject(projectId)?.path;
-    if (!projectPath) return 'absent';
-    return verifyRunbookStore.status(projectId, projectPath, modality);
+  // the health panel's setup badge (via the tRPC context) — one implementation
+  // so a record's badge and its gate can never be computed two different ways.
+  //
+  // The CALLER chooses the tree. The gate passes the requesting run's worktree,
+  // because that is the tree whose commands would actually execute and the tree
+  // the enqueue-time injection (scheduler.resolveProvenRunbook) has always
+  // probed; before lane-runbook-bootstrap.md §3 this resolver forced the project
+  // root on both, so a runbook committed on a session branch was invisible to
+  // the gate until it merged. The health panel omits the path and gets the
+  // project root, which is the level its question is actually asked at.
+  //
+  // No path at all (a deleted/unresolvable project row and no caller-supplied
+  // one) ⇒ 'absent', which skips with the setup CTA rather than guessing.
+  verifyRunbookStatus = async (projectId, modality, probePath) => {
+    const probeDir = probePath ?? databaseService.getProject(projectId)?.path;
+    // No tree to probe at all: 'absent' with the honest reason. NOT
+    // 'indeterminate' — an unresolvable project row is a missing project, not an
+    // unreadable record — and the gate skips with the setup CTA either way.
+    if (!probeDir) return { status: 'absent', reason: 'no-record' };
+    return verifyRunbookStore.statusDetail(projectId, probeDir, modality);
   };
 
   const verificationAgentRunner = new VerificationAgentRunner({
@@ -2241,6 +2427,172 @@ async function initializeServices(): Promise<boolean> {
   // existence check observes exactly where the runner wrote the transcript.
   const verifyArtifactsDirResolver = (runId: string): string =>
     getCyboflowSubdirectory('artifacts', 'runs', runId);
+  // ------------------------------------------------------------------------
+  // The lane RUNBOOK BOOTSTRAP (docs/proposals/lane-runbook-bootstrap.md §12).
+  //
+  // Everything below is IO the sequence itself must not own: a git binary, a
+  // filesystem, an SDK query, the scheduler singleton. `runRunbookBootstrap` is
+  // a pure sequence over these closures, which is what lets the whole
+  // draft → validate → commit → register → prove path be unit-tested with no
+  // worktree and no subprocess.
+  //
+  // Gated twice before any of it runs — the project toggle and the kill switch
+  // (combined in `evaluateRunbookBootstrap`), then §4's runbook-situation check.
+  // Default OFF.
+  // ------------------------------------------------------------------------
+  const runbookBootstrapStamps = new RunbookBootstrapStampStore(cyboflowDb, cyboflowLogger);
+  const runbookBootstrapSuppression = new BootstrapSuppressionStore(cyboflowDb, cyboflowLogger);
+  const runbookDraftQuery = makeRunbookDraftQuery(cyboflowLogger);
+
+  const runbookBootstrapRunner = (
+    args: Parameters<typeof runRunbookBootstrap>[0],
+  ): ReturnType<typeof runRunbookBootstrap> =>
+    runRunbookBootstrap(args, {
+      stamps: runbookBootstrapStamps,
+      suppression: runbookBootstrapSuppression,
+      // The READ-ONLY drafting agent (§8). Resolved through the same effective-
+      // agent layering every other bundled agent uses, so its prompt and its
+      // model are overridable per project/workflow exactly like visual-verify's
+      // — this is a bundled agent that happens to be deployed by the controller
+      // rather than bound to a step, not a hardcoded prompt.
+      draft: async (request) => {
+        const effective = resolveRunEffectiveAgents(databaseService.getDb(), request.runId);
+        const agent = effective.find((e) => e.agentKey === 'runbook-bootstrap');
+        if (!agent) {
+          cyboflowLogger?.warn?.('[runbookBootstrap] the runbook-bootstrap agent is not resolvable for this run');
+          return null;
+        }
+        // Claude-only, deliberately: this deployment's whole output is a
+        // structured object validated against a JSON schema, and the query below
+        // is the Claude SDK boundary. A run pinned to another provider gets the
+        // Claude default rather than a deployment that cannot honor the contract.
+        const model =
+          agent.model !== null ? bareModelId(agent.model, isModelUsable) ?? DEFAULT_JUDGE_MODEL : DEFAULT_JUDGE_MODEL;
+        return runbookDraftQuery({
+          prompt: composeRunbookDraftPrompt({
+            modality: request.modality,
+            round: request.round,
+            maxRounds: MAX_BOOTSTRAP_ROUNDS,
+            adopt: request.adopt,
+            existingRunbookRaw: request.existingRunbookRaw,
+            feedback: request.feedback,
+            laneTaskRef: request.laneTaskRef,
+          }),
+          systemPrompt: agent.systemPrompt,
+          cwd: request.worktreePath,
+          model,
+        });
+      },
+      readFile: async (worktreePath, relativePath) => {
+        try {
+          return await fs.promises.readFile(path.join(worktreePath, relativePath), 'utf8');
+        } catch {
+          return null;
+        }
+      },
+      writeFile: async (worktreePath, relativePath, content) => {
+        const target = path.join(worktreePath, relativePath);
+        await fs.promises.mkdir(path.dirname(target), { recursive: true });
+        await fs.promises.writeFile(target, content, 'utf8');
+      },
+      // Pathspec commit with index-lock retry — NEVER a bare commit, which in a
+      // worktree five lanes are editing would sweep up whatever they had staged
+      // (§8 check 4).
+      commitPaths: (worktreePath, paths, message) =>
+        commitPathspec({
+          git: (gitArgs) => runGitAsync(worktreePath, gitArgs),
+          paths,
+          message,
+          ...(cyboflowLogger ? { logger: cyboflowLogger } : {}),
+        }),
+      registerDraft: (projectId, worktreePath, modality) =>
+        verifyRunbookStore.registerDraft(projectId, worktreePath, modality),
+      setOrigin: (projectId, modality, origin) => verifyRunbookStore.setOrigin(projectId, modality, origin),
+      // A passing proof and a proven record are two different facts: the engine
+      // declines to promote a proof that ran in the dirty-worktree fallback,
+      // carried no pin, or lost its CAS. Ask the record itself rather than infer
+      // it from the request's status — probing the RUN WORKTREE, the same tree
+      // the lane's own enqueue will resolve against.
+      confirmProven: async () =>
+        (await verifyRunbookStore.status(args.projectId, args.worktreePath, args.modality)) === 'proven',
+      // The proof rides the SAME enqueue seam as ordinary lane traffic, with the
+      // migration-105 kind set. `bootstrapProof` is not a wire field and this is
+      // its only writer, which makes it a strictly stronger guarantee than
+      // setup_proof's workflow-identity check (§5).
+      enqueueProof: async ({ runId, laneTaskRef, task, round, runbookHash, runbookLocalVersion }) => {
+        const worktree = rawDb
+          .prepare('SELECT worktree_path AS worktreePath FROM workflow_runs WHERE id = ?')
+          .get(runId) as { worktreePath?: unknown } | undefined;
+        const worktreePath =
+          typeof worktree?.worktreePath === 'string' && worktree.worktreePath.length > 0
+            ? worktree.worktreePath
+            : null;
+        if (worktreePath === null) return { error: 'the run has no worktree to snapshot' };
+        const result = await enqueueTaskVerification({
+          db: cyboflowDb,
+          runId,
+          task,
+          laneTaskRef,
+          // The lane's attempt is irrelevant to the proof's identity — the
+          // `:bootstrap:<round>` generation segment is what makes each round its
+          // own request, and it is appended to this number rather than replacing
+          // it. Pinned at 1 so a lane loopback cannot make round 1 look fresh.
+          attempt: 1,
+          worktreePath,
+          bootstrapProof: true,
+          bootstrapRound: round,
+          runbookHash,
+          runbookLocalVersion,
+          ...(cyboflowLogger ? { logger: cyboflowLogger } : {}),
+        });
+        return result.outcome === 'enqueued'
+          ? { requestId: result.requestId }
+          : { error: result.reason };
+      },
+      awaitProof: (requestId, timeoutMs) =>
+        VerificationScheduler.getInstance().awaitTerminal(requestId, timeoutMs),
+      computeInputHash: verifyComputeInputHash,
+      hostFingerprint: verifyHostFingerprint,
+      // §12 step 10 — the `verify-runbook` tab, through the artifact chokepoint.
+      // One artifact per (run, atype), so a second modality's bootstrap in the
+      // same run replaces this rather than minting a rival tab.
+      reportArtifact: async ({ projectId, runId, label, markdown }) => {
+        await ArtifactRouter.getInstance().apply(projectId, {
+          op: 'create',
+          runId,
+          atype: 'verify-runbook',
+          label,
+          payloadJson: JSON.stringify({ markdown }),
+          actor: 'orchestrator',
+        });
+      },
+      // §8.1 — the review-queue row naming an auto-edited config file. This is
+      // the REVIEW-BACKED half of §15A's trade: rung 1 is only as safe as the
+      // review it gets, so the finding is the guarantee rather than a courtesy.
+      // Non-blocking — it asks for eyes at the merge gate, it does not park the
+      // run.
+      reportFinding: async ({ projectId, runId, title, body, locations }) => {
+        await ReviewItemRouter.getInstance().applyReviewItem(projectId, {
+          op: 'create',
+          actor: 'orchestrator',
+          kind: 'finding',
+          title,
+          body,
+          blocking: false,
+          audience: 'human',
+          severity: 'warning',
+          source: 'runbook-bootstrap',
+          entityType: null,
+          entityId: null,
+          runId,
+          // `locations` rides on the finding PAYLOAD, not on the review item —
+          // that is where the queue's card reads file references from.
+          payload: { kind: 'finding', category: 'runbook-bootstrap', locations },
+        });
+      },
+      ...(cyboflowLogger ? { logger: cyboflowLogger } : {}),
+    });
+
   VerificationScheduler.initialize({
     db: cyboflowDb,
     backends: {
@@ -2252,6 +2604,9 @@ async function initializeServices(): Promise<boolean> {
     artifactsDirResolver: verifyArtifactsDirResolver,
     logger: cyboflowLogger,
     config: visualVerifyConfig,
+    // Re-read per call, for the settings a user expects to take effect without
+    // relaunching the app — see `liveConfig` on the scheduler's deps.
+    liveConfig: () => configManager.getVisualVerifyConfig(),
     // P8a — advisory verdict delivery through the existing router chokepoints
     // (artifact enrich on every judged outcome + a FAIL/low-confidence finding).
     onVerdict: createVerdictDelivery({
@@ -2308,6 +2663,11 @@ async function initializeServices(): Promise<boolean> {
     // SAME backend instance registered above, so the agent path and the legacy
     // capture path can never disagree about this host's screen capability.
     nativeCaptureProbe: () => peekabooBackend.healthCheck(),
+    // §12 steps 3–8: derive, commit, register and PROVE a runbook for a lane
+    // whose verification would otherwise be skipped. The scheduler owns the
+    // DECISION (it holds the toggle and the runbook status); this closure is the
+    // ACTING half, assembled above out of IO the scheduler must not hold.
+    runbookBootstrap: runbookBootstrapRunner,
   });
 
   // Passive dynamic-workflow tracker (Workflow tool / ultracode detection).
@@ -2390,6 +2750,12 @@ async function initializeServices(): Promise<boolean> {
     // (default ON). Consulted by the snapshot ONLY for variant/experiment-tagged
     // runs (untagged built-in runs ignore it), on TOP of the global toggle above.
     isVariantAutoGradeEnabled: () => configManager.getAutoGradeVariantRuns(),
+    // §11 (lane-runbook-bootstrap): drop the runbook bootstrap's own files from
+    // the graded diff. verify-setup is exempt from auto-eval for exactly this
+    // reason — a runbook's acceptance test is its own proof run, not a rubric —
+    // and the bootstrap moves that diff class into sprint/ship runs, which ARE
+    // graded and A/B-compared.
+    bootstrapWrittenPaths: (runId) => runbookBootstrapStamps.writtenPathsForRun(runId),
   });
   // Crash-safe resume: re-enqueue any eval an app quit left 'pending'/'running'
   // (the frozen diff lives in the row, so a re-grade is self-contained) — otherwise
@@ -2403,12 +2769,43 @@ async function initializeServices(): Promise<boolean> {
   // chokepoint are all closures so the worker imports no concrete service. Its
   // isEvalEnabled is COMPOSED — global code-review eval AND the auto-grade
   // sub-toggle — so turning either off captures the diffs but skips the judge.
+  //
+  // The panel mirrors EvalWorker's rubric jury: 2×Claude + 1×Codex, its LENGTH
+  // driving K. Both Claude slots share ONE ClaudePairwiseJudge instance (identical
+  // to claudeJudge above). The Codex slot gets a FRESH makeCodexEvalJudgeQuery — the
+  // factory's resolvedModel is per-closure state, so reusing the rubric juror's
+  // query fn would cross-contaminate the two panels' model provenance. No timeoutMs:
+  // the factory already defaults to CODEX_EVAL_JUDGE_TIMEOUT_MS.
+  const claudePairwiseJudge = new ClaudePairwiseJudge({
+    structuredQuery: makePairwiseJudgeQuery(cyboflowLogger),
+    logger: cyboflowLogger,
+  });
+  const codexPairwiseJudge = new CodexPairwiseJudge({
+    structuredQuery: makeCodexEvalJudgeQuery(cyboflowLogger),
+    logger: cyboflowLogger,
+  });
   PairwiseJudgeWorker.initialize(cyboflowDb, cyboflowLogger, {
     gitDiff: evalGitDiff,
-    judge: new ClaudePairwiseJudge({
-      structuredQuery: makePairwiseJudgeQuery(cyboflowLogger),
-      logger: cyboflowLogger,
-    }),
+    panel: [
+      {
+        slot: 'claude-1',
+        provider: 'claude',
+        model: claudePairwiseJudge.resolvedModel ?? null,
+        judge: claudePairwiseJudge,
+      },
+      {
+        slot: 'claude-2',
+        provider: 'claude',
+        model: claudePairwiseJudge.resolvedModel ?? null,
+        judge: claudePairwiseJudge,
+      },
+      {
+        slot: 'codex-1',
+        provider: 'codex',
+        model: codexPairwiseJudge.resolvedModel ?? null,
+        judge: codexPairwiseJudge,
+      },
+    ],
     reviewItemWriter: (projectId, change) =>
       ReviewItemRouter.getInstance().applyReviewItem(projectId, change),
     emitComparisonReady: (event) => experimentEvents.emit('comparisonReady', event),
@@ -2583,6 +2980,10 @@ async function initializeServices(): Promise<boolean> {
       // so toggling the master switch in Settings takes effect on the next tool
       // call rather than requiring a restart.
       getVisualVerifyConfig: () => configManager.getVisualVerifyConfig(),
+      // The sprint task-cap override, read LIVE for the same reason: the
+      // cyboflow_create_sprint_batch backstop must honor the CURRENT setting, not
+      // one frozen at launch.
+      getSprintMaxTasks: () => configManager.getSprintMaxTasks(),
       // Workflow/variant configuration tools (cyboflow_*_workflow / _variant):
       // forward the WorkflowRegistry as the narrow WorkflowConfigLike structural
       // surface so quick sessions can edit flows + variants over MCP without the
@@ -2598,7 +2999,7 @@ async function initializeServices(): Promise<boolean> {
         resetSpec: (id) => workflowRegistry.resetSpec(id),
         createCustom: (params) => workflowRegistry.createCustom(params),
         deleteWorkflow: (id) => workflowRegistry.deleteWorkflow(id),
-        listVariants: (id) => workflowRegistry.listVariants(id),
+        listVariants: (id, opts) => workflowRegistry.listVariants(id, opts),
         createVariantFromCurrent: (id, label) => workflowRegistry.createVariantFromCurrent(id, label),
         updateVariant: (variantId, patch) => workflowRegistry.updateVariant(variantId, patch),
         setVariantStatus: (variantId, status) => workflowRegistry.setVariantStatus(variantId, status),
@@ -2862,6 +3263,12 @@ async function initializeServices(): Promise<boolean> {
     // raw-prompt path picks up the idea its context step creates before optional
     // design steps evaluate UI_PROTOTYPE / ARCH_DESIGN.
     runOwnedIdeaIdsProvider: (runId) => listRunOwnedIdeaIds(cyboflowDb, runId),
+    // §11 (lane-runbook-bootstrap): the files this run's bootstrap committed,
+    // rendered as a do-not-touch list on address-review. That step "fixes in
+    // place", and both files are booby-trapped for a well-meant fix — the
+    // runbook's proof is content-addressed against the committed bytes, and the
+    // rung-1 config edit is what makes the environment stand up at all.
+    bootstrapProtectedPathsProvider: (runId) => runbookBootstrapStamps.writtenPathsForRun(runId),
     // Per-step agent-runtime resolver (Codex-per-step mixing): resolves the run's
     // FULL effective agent set (project overrides + workflow agentConfigs + variant
     // deltas — the same layering the agent overlay writes to disk) and looks up the
@@ -3072,6 +3479,10 @@ async function initializeServices(): Promise<boolean> {
               monitorSteeringActions
                 ? monitorSteeringActions.rewindToStep(ctx.runId, input)
                 : Promise.resolve(STEERING_NOT_WIRED),
+            rewindLaneToStep: (input) =>
+              monitorSteeringActions
+                ? monitorSteeringActions.rewindLaneToStep(ctx.runId, input)
+                : Promise.resolve(STEERING_NOT_WIRED),
             resolveReviewItem: (input) =>
               monitorSteeringActions
                 ? monitorSteeringActions.resolveReviewItem(ctx.runId, input)
@@ -3176,7 +3587,41 @@ async function initializeServices(): Promise<boolean> {
           return async () => {
             const endHead = await readHead();
             const porcelain = await runGitAsync(worktreePath, ['status', '--porcelain']);
-            return { headAdvanced: endHead !== startHead, dirty: porcelain.trim().length > 0 };
+            // §9 (lane-runbook-bootstrap): a RUNBOOK BOOTSTRAP commits into this
+            // same shared worktree, mid-lane. HEAD then moves for a reason that
+            // is not any lane's work — and since the only case that withholds
+            // 'integrated' is "HEAD did not move AND the tree is dirty", an
+            // advanced HEAD would let a lane that committed nothing integrate
+            // anyway. That is the exact failure this probe exists to catch, so
+            // the bootstrap's own commits are subtracted before the comparison.
+            //
+            // Fail-soft on purpose, in the direction that PRESERVES the probe: a
+            // rev-list that throws leaves headAdvanced as the plain sha
+            // comparison, which is what shipped.
+            let headAdvanced = endHead !== startHead;
+            if (headAdvanced) {
+              try {
+                const bootstrapShas = new Set(runbookBootstrapStamps.commitShasForRun(rid));
+                if (bootstrapShas.size > 0) {
+                  const between = (
+                    await runGitAsync(worktreePath, ['rev-list', `${startHead}..${endHead}`])
+                  )
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0);
+                  // Compared by PREFIX in both directions: the stamp records
+                  // whatever `rev-parse HEAD` returned (full) but a hand-written
+                  // or abbreviated sha must still match.
+                  headAdvanced = between.some(
+                    (sha) =>
+                      ![...bootstrapShas].some((b) => sha.startsWith(b) || b.startsWith(sha)),
+                  );
+                }
+              } catch {
+                // Keep the plain comparison.
+              }
+            }
+            return { headAdvanced, dirty: porcelain.trim().length > 0 };
           };
         },
         driveLane: ({ runId: rid, itemId, status, currentStepId, attempt, allowedStepIds }) => {
@@ -3301,6 +3746,12 @@ async function initializeServices(): Promise<boolean> {
     // §3c#1): the fallback resolveRunAgentPermissionMode uses when a run's owning
     // session has a NULL agent_permission_mode (inherit the global default).
     () => configManager.getDefaultAgentPermissionMode(),
+    // Dynamic-workflow liveness probe: the interactive rest seam consults this so
+    // a turn-end that merely yields to a background `Workflow` task does not park
+    // the run in awaiting_review while its subagents are still working. Read
+    // through tryGetInstance so boot ordering (tracker initialized above, but
+    // defensively) can never throw here.
+    (runId) => DynamicWorkflowTracker.tryGetInstance()?.hasRunningForRun(runId) === true,
   );
 
   // Raw-PTY byte path (TASK-814 / IDEA-030): subscribe the facade's 'pty-output'
@@ -3346,6 +3797,16 @@ async function initializeServices(): Promise<boolean> {
       // the chat session (and vice versa).
       if (!dbSession.chat_run_id || dbSession.chat_run_id !== evt.runId) return;
       if (dbSession.status !== 'running') return;
+      // A turn-end that lands while a dynamic workflow is still RUNNING for this
+      // run is the agent yielding to a background Workflow task, not the session
+      // finishing — the CLI re-invokes it when the workflow completes. Flipping
+      // to 'completed' here would strand the session in a terminal-looking state
+      // (and enable Merge) while its subagents are still writing the worktree.
+      // This is reachable today: the Ultracode wizard card launches quick PTY
+      // sessions with `--settings '{"ultracode":true}'`, which is exactly the
+      // setting that makes the agent fan work out as dynamic workflows.
+      // The session rests on the NEXT turn-end after the workflow goes terminal.
+      if (DynamicWorkflowTracker.tryGetInstance()?.hasRunningForRun(evt.runId) === true) return;
       // Direct DB write + manual session-updated emit — the same shape as the
       // SDK exit handler in events.ts (updateSession would re-map 'completed'
       // through mapSessionStatusToDbStatus and lose the completed_unviewed edge).
@@ -3406,6 +3867,10 @@ async function initializeServices(): Promise<boolean> {
     // variant (explicit pin or weighted random over active variants) pre-createRun
     // so every launch surface inherits rotation from one place.
     new VariantResolver(cyboflowDb),
+    // Idea-session nesting lineage (migration 114): launch() stamps
+    // sessions.origin_idea_id for a SINGULAR idea-seeded launch, then refreshes
+    // the session so the sidebar regroups it under the idea immediately.
+    sessionManager,
   );
 
   // Capture the orch socket path once for the lifecycle + CLI-manager wiring.
@@ -3500,15 +3965,14 @@ async function initializeServices(): Promise<boolean> {
   });
   createdCodexSdkManager.setApprovalRouterProvider(() => ApprovalRouter.getInstance());
   createdCodexSdkManager.setQuestionRouterProvider(() => QuestionRouter.getInstance());
-  // OMP takes the same MCP runtime config and nothing else: its approval dialogs
-  // are answered in-process by OmpApprovalBridge (the gating extension is the
-  // policy engine, so a prompt reaching the bridge was already allowed), so
-  // there is no router provider to inject here.
+  // OMP tool approvals are answered in-process after the gating extension vets
+  // them; content questions use the same durable QuestionRouter as Claude/Codex.
   createdOmpSdkManager.setCyboflowMcpRuntimeConfig({
     orchSocketPath: socketPath,
     bridgeScriptPath: bridgeScriptResolver.getScriptPath(),
     nodeExecutablePath: await nodeResolver.getNodePath(),
   });
+  createdOmpSdkManager.setQuestionRouterProvider(() => QuestionRouter.getInstance());
 
   // OrchestratorHealth — constructed with the real McpServerLifecycle so both the
   // raw-IPC cyboflow:mcp-health channel and the tRPC cyboflow.health.mcpServer
@@ -3888,6 +4352,31 @@ app.whenReady().then(async () => {
       logger: loggerLike,
       runQueues,
       omp: fleetRegistryReader,
+      // The stuck-run push channel the epic always specified but never wired.
+      // events.onStuckDetected subscribes to this emitter; without it the
+      // renderer's runStatusMap stays empty and the whole stuck UI is dead.
+      stuckEvents,
+      // Rung 1 (orphan_pty) liveness. RunExecutor is the right supplier here
+      // and defaultCliManager is NOT: the CLI managers are per-provider, so
+      // asking the Claude SDK manager whether a run is alive answers "no" for
+      // every healthy OMP, Codex and interactive-PTY run and would stamp all
+      // of them orphaned. hasActiveExecution is provider-agnostic — it is true
+      // while ANY executor-driven walk holds the run between start and
+      // teardownRun, which is precisely the window in which somebody could
+      // still collect an approval.
+      //
+      // The ID domains line up by an enforced invariant, not by luck:
+      // RunExecutor.execute sets panelId = sessionId = runId (see the comment
+      // at its assignment), so no run->panel translation is needed.
+      //
+      // Honest about the proxy: this answers "an executor still holds this
+      // run", not "the agent process is alive". Those diverge if a walk hangs
+      // on a dead process, which this will still report as alive — strictly
+      // better than the `() => true` no-op it replaces, and it never reports a
+      // live run as dead, which is the direction that would cause damage.
+      claudeManager: {
+        hasActiveRunForId: (runId: string): boolean => runExecutor.hasActiveExecution(runId),
+      },
       // Review-item write chokepoint. Used at start to drain any LEGACY
       // idle-session review items (the mint was retired for the live
       // QuickSessionsTable — see Orchestrator.start / drainLegacyIdleReviewItems).
@@ -4094,6 +4583,20 @@ app.whenReady().then(async () => {
     const outcomeBackfill = backfillTerminalOutcomes(db);
     if (outcomeBackfill.failedBackfilled > 0 || outcomeBackfill.canceledBackfilled > 0) {
       console.log(`[Main] Backfilled terminal outcomes (failed: ${outcomeBackfill.failedBackfilled}, canceled: ${outcomeBackfill.canceledBackfilled})`);
+    }
+
+    // Insights Phase-2 (migration 026) self-heal. rollupRunUsage is wired only to
+    // runExecutor's terminal lifecycle hook, but ~8 other writers can put a run
+    // into a terminal status (cancel handlers, questionRouter, the trpc close-outs,
+    // the merge path, and the orphan sweeps just above) — each leaves the run's
+    // usage living ONLY in raw_events. Insights hides this behind its raw_events
+    // fallback, so the gap is invisible until that log is pruned. Sweeping the
+    // invariant here covers every writer at once, including future ones. Must run
+    // AFTER the orphan sweeps + outcome backfill so runs force-terminated on this
+    // boot are materialized in the same pass. Fail-soft internally.
+    const usageBackfill = backfillRunUsageRollups(db);
+    if (usageBackfill.materialized > 0) {
+      console.log(`[Main] Materialized ${usageBackfill.materialized} missing run_usage rollup(s) of ${usageBackfill.candidates} candidate(s)`);
     }
 
     // Boot self-heal (migration 066): the derived 'In development' stage projects
@@ -4687,6 +5190,21 @@ app.whenReady().then(async () => {
       logger: loggerLike,
     };
 
+    // Lane-rewind deps bag (monitor rewind_lane_to_step). Deliberately tiny next to
+    // the rewind bag above: a lane rewind mutates nothing durable — it records an
+    // in-memory directive and interrupts ONE lane — so it needs no queue, no
+    // step_results purge, and no batch/lane writers. `abortLaneSpawn` is the SAME
+    // facade abort the whole-run rewind uses as `stopLiveRun`, keyed here on the
+    // PER-LANE spawn key (`${runId}:${taskId}`) the fan-out driver spawns under
+    // rather than the run id, so exactly one lane's process dies.
+    const laneRewindDepsBag: LaneRewindDeps = {
+      db,
+      requestLaneRewind: (runId, itemId, stepId) => runExecutor.requestLaneRewind(runId, itemId, stepId),
+      listLiveSpawnKeys: (runId) => substrateFacade.listLiveSpawnKeys(runId),
+      abortLaneSpawn: (spawnKey) => substrateFacade.abort(spawnKey),
+      logger: loggerLike,
+    };
+
     monitorSteeringActions = {
       addTask: (runId, input) => addTaskToRun(runId, input, taskMutationDeps).then(mapTaskResult),
       removeTask: (runId, input) => removeTaskFromRun(runId, input, taskMutationDeps).then(mapTaskResult),
@@ -4786,6 +5304,41 @@ app.whenReady().then(async () => {
           race: 'The run changed state mid-rewind — try again.',
         };
         return { ok: false, message: messages[result.reason] ?? `Rewind refused (${result.reason}).` };
+      },
+      rewindLaneToStep: async (runId, input) => {
+        const result = await laneRewindHandler(runId, input, laneRewindDepsBag);
+        if ('delivered' in result) {
+          // Distinguish the two interrupt paths in the message: a killed agent turn
+          // is visible to the user (the lane's transcript stops mid-thought), while a
+          // directive that lands at the lane's next step boundary is not.
+          const stopNote = result.abortedSpawn
+            ? " Stopped that lane's current agent first."
+            : ' It takes effect as soon as the lane finishes what it is doing.';
+          const fromNote = result.fromStepId !== null ? ` (was on '${result.fromStepId}')` : '';
+          return {
+            ok: true,
+            message: `Rewound ${result.ref}'s lane to step '${result.stepId}'${fromNote} — only that lane re-runs; the rest of the sprint keeps going.${stopNote}`,
+          };
+        }
+        const laneStatusHint =
+          result.laneStatus === 'queued'
+            ? "that lane hasn't started yet, so it will run from the top of its chain anyway"
+            : result.laneStatus === 'integrated'
+              ? 'that lane already finished and integrated — re-running it needs a whole-run rewind to the fan-out step'
+              : `that lane has already settled (${result.laneStatus ?? 'unknown'}) — re-driving a settled lane needs a whole-run rewind or a retry`;
+        const messages: Record<string, string> = {
+          not_found: 'Run not found.',
+          not_programmatic: 'Only programmatic runs have sprint lanes to rewind.',
+          run_not_running:
+            "The run isn't executing right now, so there is no live lane to rewind. Use retry or the whole-run rewind to revive it first.",
+          no_fan_out: "This run has no sprint task fan-out, so there are no lanes to rewind.",
+          unknown_task: `No task matching '${input.taskRef}' in this project.`,
+          lane_not_found: `${input.taskRef} isn't one of this run's sprint lanes.`,
+          lane_not_live: `Can't rewind ${input.taskRef}'s lane — ${laneStatusHint}.`,
+          unknown_step: `'${input.stepId}' isn't one of this run's lane steps — a lane rewind targets a task's INNER steps (e.g. 'implement', 'code-review'), not the run's phase steps. Use the whole-run rewind for those.`,
+          target_not_prior: `'${input.stepId}' is ahead of where that lane is now — a lane rewind only goes backward.`,
+        };
+        return { ok: false, message: messages[result.reason] ?? `Lane rewind refused (${result.reason}).` };
       },
       resolveReviewItem: async (runId, input) => {
         const projectId = runProjectId(runId);
@@ -4921,8 +5474,19 @@ app.whenReady().then(async () => {
       } catch {
         /* fail-soft */
       }
-      // 3. Remove the worktree (non-main-repo sessions).
-      if (dbSession?.worktree_name && dbSession.project_id && !dbSession.is_main_repo) {
+      // 3. Remove the worktree — worktree-backed, non-main-repo sessions only.
+      // An IN-PLACE session (migration 047) has NO worktree of its own: its
+      // worktree_path IS the project checkout. Attempting removeWorktree for one
+      // is at best a no-op on a nonexistent path and at worst aimed at the user's
+      // real checkout, so it is skipped outright. This became load-bearing when
+      // the idea-session door (openIdeaSessionCore) started using this same
+      // primitive to compensate a half-created IN-PLACE home session.
+      if (
+        dbSession?.worktree_name &&
+        dbSession.project_id &&
+        !dbSession.is_main_repo &&
+        !dbSession.in_place
+      ) {
         const project = databaseService.getProject(dbSession.project_id);
         if (project) {
           try {
@@ -4943,6 +5507,10 @@ app.whenReady().then(async () => {
     setExperimentsDeps({
       db: experimentsDb,
       runLauncher,
+      // Sprint seed-task cap: the same live Settings override runs.start and the
+      // batch picker read, so an experiment arm accepts exactly what a normal
+      // sprint launch would.
+      getSprintMaxTasks: () => configManager.getSprintMaxTasks(),
       // settleQuickArm write barrier: refuse to rest a quick arm whose session
       // has an agent turn mid-write (grading would snapshot a partial diff).
       // Routed through the facade so every substrate manager is consulted.
@@ -5185,6 +5753,40 @@ app.whenReady().then(async () => {
     });
     console.log('[Main] experiments deps wired');
 
+    // Open-idea-session door (idea sessions plan, Stage 1). The IPC handler in
+    // ipc/session.ts is thin by contract; every collaborator is assembled HERE
+    // because two of them only exist at this composition root: the FULL safe
+    // session-dismiss (dismissSessionFully — now in-place-aware, see its step 3)
+    // and the lazily-bound Claude panel registrar. Deliberately placed AFTER
+    // dismissSessionFully so the compensation primitive is in scope.
+    setOpenIdeaSessionDeps({
+      getDb: () => databaseService.getDb(),
+      quickSession: {
+        taskQueue: taskQueue!,
+        sessionManager,
+        workflowRegistry,
+        getDb: () => databaseService.getDb(),
+        // The idea door pins substrate/runtime itself, so createRun should never
+        // reject the combo — but the core's compensation window is the only
+        // layer holding the session id when it does.
+        dismissHalfCreatedSession: dismissSessionFully,
+      },
+      runPreflights: () => runClaudeSdkSessionPreflights(configManager),
+      panelManager,
+      getClaudePanelRegistrar: () => {
+        // Lazy require, mirroring ipc/panels.ts: the handler assigns the export
+        // at boot, long before any Open, but it is not readable at wiring time.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { claudePanelManager } = require('./ipc/claudePanel') as typeof import('./ipc/claudePanel');
+        return claudePanelManager;
+      },
+      refreshSession: (sessionId) => {
+        sessionManager.refreshSessionFromDatabase(sessionId);
+      },
+      dismissSession: dismissSessionFully,
+    });
+    console.log('[Main] open-idea-session deps wired');
+
     // Boot recovery: reconcile non-terminal A/B experiments (migration 049).
     // running→grading when both arms are settled; a half-created experiment (crash
     // mid-startSideBySide, one arm never launched) → abandoned, THEN its two arm
@@ -5315,6 +5917,176 @@ app.whenReady().then(async () => {
         error: err instanceof Error ? err.message : String(err),
       });
     });
+
+    // Design-mode-fork launch saga (QuestionRouter.launchDesignModeOnFork /
+    // designSessionLaunch.ts). A HUMAN answering the planner's approve-idea gate
+    // with "Approve → design mode" launches a Design Mode session — the SAME
+    // three-layer belt sessions:create-quick's design branch drives
+    // (ipc/session.ts ~787-1091: validateDesignIdeaLink, createQuickSessionCore
+    // with requireSdkSubstrate, the design_idea_id stamp + ui-prototype stub),
+    // replayed here since this launch has no renderer client. Compensation
+    // (dismissSessionFully) and the review-item failure report reuse the SAME
+    // primitives proposalExecutorDeps wires just above.
+    QuestionRouter.getInstance().setDesignSessionLaunchDeps({
+      validateIdeaLink: (ideaId, projectId) => {
+        const result = validateDesignIdeaLink(databaseService.getDb(), ideaId, projectId);
+        if (!result.ok) return { ok: false, error: result.error };
+        // Max-one-running-per-idea (idea sessions plan, Stage 1): the design
+        // fork is one of the doors the hard rule guards. Same rejection channel
+        // as a dead idea link — the saga reports either as "could not launch".
+        const busy = findIdeaBusyReason(databaseService.getDb(), ideaId);
+        return busy === null ? { ok: true } : { ok: false, error: busy.message };
+      },
+      createDesignSession: async ({ projectId, ideaId, nameHint }) => {
+        // Fail-closed Claude/SDK availability pre-flight — the SHARED ladder
+        // (services/claudeSdkSessionPreflight.ts) the design branch of
+        // sessions:create-quick and the open-idea-session door also run: a
+        // design session is hard-pinned to the Claude SDK substrate, so an
+        // unavailable Claude login/binary must reject BEFORE any worktree is
+        // cut, rather than let substrate resolution silently fall through. Only
+        // the wording is local — this fork's messages are terser than the IPC
+        // handler's (no "Enable Claude to start a design session." tail) and
+        // stay byte-identical to what it threw before the extraction.
+        const designPreflight = await runClaudeSdkSessionPreflights(configManager);
+        if (!designPreflight.ok) {
+          throw new Error(DESIGN_FORK_PREFLIGHT_MESSAGES[designPreflight.reason]);
+        }
+
+        const { session, runId, resolvedSubstrate } = await createQuickSessionCore(
+          {
+            taskQueue: taskQueue!,
+            sessionManager,
+            workflowRegistry,
+            getDb: () => databaseService.getDb(),
+          },
+          {
+            projectId,
+            nameHint,
+            agentProvider: 'claude',
+            agentRuntime: 'claude-sdk',
+            requestedSubstrate: 'sdk',
+            requireSdkSubstrate: true,
+          },
+        );
+        // From here down, createQuickSessionCore has ALREADY minted a real
+        // session + sentinel run + git worktree — anything that throws past
+        // this point must compensate via a full dismiss before propagating,
+        // because launchDesignSessionForFork (designSessionLaunch.ts) only
+        // records `created.sessionId` once THIS callback resolves; a throw
+        // from inside it leaves the saga's own catch block with no id to
+        // dismiss, orphaning the session/run/worktree. finishDesignSessionCreate
+        // (designSessionLaunch.ts) owns that internal compensation — see its
+        // JSDoc for why this is NOT redundant with the saga's own dismiss (the
+        // two only ever apply in mutually exclusive windows): do NOT also add
+        // a dismiss to the saga's catch for this failure mode.
+        await finishDesignSessionCreate({
+          sessionId: session.id,
+          resolvedSubstrate,
+          stampDesignIdeaId: () => {
+            const dbHandle = databaseService.getDb();
+            dbHandle.prepare(`UPDATE sessions SET design_idea_id = ? WHERE id = ?`).run(ideaId, session.id);
+            // `origin_idea_id` (migration 114): a design session IS a session
+            // launched from the idea, and the sidebar nests children by that
+            // column. Lineage, not a claim — no unique index. Kept a SEPARATE
+            // statement, mirroring the sessions:create-quick design branch.
+            dbHandle.prepare(`UPDATE sessions SET origin_idea_id = ? WHERE id = ?`).run(ideaId, session.id);
+          },
+          refreshSession: (sessionId) => {
+            sessionManager.refreshSessionFromDatabase(sessionId);
+          },
+          dismissSession: dismissSessionFully,
+          onCompensationFailure: (dismissErr) => {
+            loggerLike.warn('[Main] design-mode fork: compensating dismiss failed after mid-create error', {
+              sessionId: session.id,
+              error: dismissErr instanceof Error ? dismissErr.message : String(dismissErr),
+            });
+          },
+        });
+
+        // v0.5 re-entry stub (mirrors ipc/session.ts ~1064-1090) — fail-soft: a
+        // stub failure must never fail session creation. Deliberately called
+        // AFTER finishDesignSessionCreate rather than folded into it — this
+        // failure mode is intentionally NOT compensating.
+        try {
+          await ArtifactRouter.getInstance().apply(projectId, {
+            op: 'create',
+            runId,
+            atype: 'ui-prototype',
+            label: 'Prototype',
+            payloadJson: null,
+            sourceRef: ideaId,
+            sessionId: session.id,
+            isNew: true,
+            actor: 'orchestrator',
+          });
+        } catch (stubErr) {
+          loggerLike.warn('[Main] design-mode fork: prototype stub creation failed (non-fatal)', {
+            sessionId: session.id,
+            error: stubErr instanceof Error ? stubErr.message : String(stubErr),
+          });
+        }
+
+        return { sessionId: session.id, runId, worktreePath: session.worktreePath };
+      },
+      kickoffDesignPanel: async ({ sessionId, worktreePath }) => {
+        // Mirrors useQuickSession.ts's post-create sequence: create the Chat
+        // panel, register it with the Claude runtime, then fire the canonical
+        // design kickoff prompt as its first turn via startPanel — a FRESH
+        // panel has no running process and no claude_session_id yet, so this is
+        // the 'panels:continue' first-message branch (ipc/session.ts ~2783-2797),
+        // never continuePanel/resume.
+        const panel = await panelManager.createPanel({ sessionId, type: 'claude', title: 'Chat' });
+        const { claudePanelManager } = require('./ipc/claudePanel') as typeof import('./ipc/claudePanel');
+        if (!claudePanelManager) throw new Error('the Claude panel manager is not available yet');
+        // We just created this panel with type 'claude', so its customState IS a
+        // ClaudePanelState — but ToolPanel's `state.customState` is a union across
+        // every panel kind with no discriminant tying it to `panel.type`, so TS
+        // cannot see that. The parallel call in ipc/panels.ts:36 passes it
+        // unnarrowed only because its `require` is untyped; narrow here rather
+        // than giving up the typed import.
+        claudePanelManager.registerPanel(
+          panel.id,
+          panel.sessionId,
+          panel.type === 'claude'
+            ? (panel.state.customState as ClaudePanelState | undefined)
+            : undefined,
+        );
+
+        const kickoffPrompt = DESIGN_MODE_KICKOFF_PROMPT;
+        sessionManager.addPanelConversationMessage(panel.id, 'user', kickoffPrompt);
+        const dbSession = sessionManager.getDbSession(sessionId);
+        await claudePanelManager.startPanel(panel.id, worktreePath, kickoffPrompt, dbSession?.permission_mode);
+      },
+      dismissSession: dismissSessionFully,
+      reportLaunchFailure: ({ projectId, ideaId, runId, error }) => {
+        void ReviewItemRouter.getInstance()
+          .applyReviewItem(projectId, {
+            op: 'create',
+            actor: 'orchestrator',
+            kind: 'finding',
+            title: 'Design mode launch failed',
+            body:
+              `The approve-idea gate's design-mode fork could not launch a design session ` +
+              `for idea ${ideaId} (run ${runId}): ${error}\n\nOpen the idea's prototype from the ` +
+              `backlog and start a design session manually, or re-run the planner and pick ` +
+              `"Approve → design mode" again.`,
+            blocking: false,
+            severity: 'error',
+            entityType: 'idea',
+            entityId: ideaId,
+            runId,
+            payload: { kind: 'finding', category: 'design-mode-launch' },
+          })
+          .catch((err) => {
+            loggerLike.error('[Main] design-mode fork: failed to report launch failure', {
+              ideaId,
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+      },
+    } satisfies DesignSessionLaunchDeps);
+    console.log('[Main] design-mode-fork launch deps wired');
 
     // Boot recovery: reconcile EVERY workflow's rotation experiment against its live
     // weighted pool (migration 058). Config could have drifted while a pre-058 build
@@ -5520,6 +6292,27 @@ app.whenReady().then(async () => {
 
     setHealthProvider(orchestratorHealth);
     console.log('[Main] health.mcpServer deps wired');
+
+    // Subscription-usage meters. The store hydrates its last-known readings from
+    // user_preferences so the review queue shows something before the first poll
+    // returns; the poller then asks both providers directly, which is the only
+    // way to get a percentage out of Claude below its warning threshold.
+    const providerUsageStore = initProviderUsageStore(databaseService, console);
+    const providerUsagePoller = new ProviderUsagePoller(
+      providerUsageStore,
+      {
+        pollClaude: pollClaudeUsage,
+        pollCodex: () => pollCodexRateLimits(app.getVersion()),
+        isProviderEnabled: (provider) => configManager.isAgentProviderEnabled(provider),
+      },
+      console,
+    );
+    setProviderUsageSource({
+      getState: () => providerUsageStore.getState(),
+      events: providerUsageStore.events,
+      refresh: () => providerUsagePoller.refresh(),
+    });
+    console.log('[Main] providerUsage deps wired');
   }
 
   // Create the window only now — after ALL router deps above are wired — so a
@@ -5558,6 +6351,14 @@ app.on('will-quit', () => {
 });
 
 app.on('before-quit', async (event) => {
+  // Drain the debounced provider-usage write before anything can preventDefault
+  // or tear the DB down — a trailing 2s debounce is otherwise lost on quit.
+  try {
+    tryGetProviderUsageStore()?.flush();
+  } catch (error) {
+    console.warn('[Main] providerUsage flush on quit failed:', error);
+  }
+
   // Check if there are active archive tasks
   if (archiveProgressManager && archiveProgressManager.hasActiveTasks()) {
     event.preventDefault();
@@ -5606,6 +6407,20 @@ app.on('before-quit', async (event) => {
     trackerSyncService.stop();
   }
 
+  // Kill every live OMP fleet worker. Unlike the other managers' children these
+  // are REMOTE processes: nothing about this app exiting stops them, so without
+  // an explicit fleet_kill they outlive the quit, keep burning producer budget
+  // and keep mutating worktrees no one is watching. Best-effort and awaited —
+  // stopAll never rejects (a failed kill is logged and the panel terminated
+  // locally), so this cannot wedge the quit.
+  if (ompSessionManager) {
+    try {
+      await ompSessionManager.stopAll();
+    } catch (err) {
+      console.warn('[Main] OMP fleet teardown on quit failed (workers may survive):', err);
+    }
+  }
+
   // Stop the vitest-orphan sweep timer. Its handle is unref'd so it could never
   // hold the process open, but leaving a sweep to fire into a torn-down app is
   // pointless work.
@@ -5615,6 +6430,10 @@ app.on('before-quit', async (event) => {
   // unref'd (never holds the event loop open on its own), so this is cleanup
   // for tidiness rather than a shutdown-correctness requirement.
   mcpOrphanTripwire?.stop();
+
+  // Stop the daily database-backup tick. Its interval is already unref'd, so
+  // this is cleanup for tidiness rather than a shutdown-correctness requirement.
+  databaseBackupService?.stop();
 
   // Stop orchestrator (drains run queues)
   if (orchestrator) {

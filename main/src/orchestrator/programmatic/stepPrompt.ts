@@ -121,6 +121,23 @@ export interface ComposeStepPromptArgs {
    * empty ⇒ no section (output unchanged).
    */
   loopbackFeedback?: string;
+  /**
+   * Repo paths this run's RUNBOOK BOOTSTRAP wrote
+   * (docs/proposals/lane-runbook-bootstrap.md §11), rendered as a do-not-touch
+   * list on the address-review step.
+   *
+   * This is not tidiness. The runbook's machine-local record is content-addressed
+   * against the committed file, so ANY edit to it — including a well-meant
+   * "fix" — demotes the proof by hash drift and the next verification skips.
+   * And the rung-1 config edit is what makes the environment stand up at all, so
+   * a reviewer reverting it silently un-proves the environment while leaving the
+   * runbook claiming otherwise. address-review is the one step in the chain that
+   * "fixes in place", which is why it is the one that has to be told.
+   *
+   * Absent / empty ⇒ no section (byte-identical prompts on every run that did not
+   * bootstrap, which is nearly all of them).
+   */
+  bootstrapProtectedPaths?: readonly string[];
 }
 
 /**
@@ -281,6 +298,21 @@ export function composeStepPrompt(args: ComposeStepPromptArgs): string {
     step.agent === 'address-review' || step.id === 'address-review'
       ? `\n\n## Findings contract (address-review) — how this step gets its input and closes it out\n\nThis step acts on the findings THIS run already filed; it does not produce new ones.\n\n1. Call \`cyboflow_list_run_findings\` (read-only, no arguments) FIRST. It returns every still-open finding this run filed — each task lane's \`code-review\` \`## Findings\` AND \`sprint-review\`'s — with the \`id\` each one needs to be resolved. Do NOT reconstruct this list from your own context: \`cyboflow_report_finding\` never returns the minted id, and most of these were filed by lanes you never saw. An empty list means there is nothing to do — say so and stop.\n2. Delegate to \`cyboflow-address-review\`, passing the findings verbatim (id, title, body, category, severity, locations, suggested fix).\n3. **Settle the code BEFORE you resolve anything.** If the subagent changed any files, re-run the project's FULL test suite yourself. This step runs AFTER the sprint's full-suite verification, so that verification is now stale with respect to your edits — and the subagent only ran the targeted tests covering the files it touched, which cannot see a cross-module regression. If the full suite fails, re-delegate \`cyboflow-address-review\` ONCE to repair or revert its own fixes and re-run the suite. If it STILL fails, file a BLOCKING finding via \`cyboflow_report_finding\` (\`blocking: true\`, category \`address-review-regression\`) carrying the failing tests and what was changed, and say so in your summary. That finding is the durable signal — your summary prose is not machine-read, so a blocking review item is the only thing that actually parks the run before the human's merge gate instead of letting a red tree slide into it. This is the ONE exception to "do not file new findings from this step", and it qualifies precisely because no further retry or loopback in this chain will fix it. The next step is the human's merge gate, and it must not open over a tree whose suite has not passed since the last edit. Then commit per step 2 above with a message naming the findings addressed. If the subagent changed NO files, skip straight to step 4.\n4. **Only now** act on its \`## Disposition\`, one entry per finding id, using the disposition as it stands AFTER step 3 — the verdicts are NOT interchangeable:\n   - **FIXED, and the fix survived step 3** → \`cyboflow_resolve_finding\` with \`resolution_kind: 'fixed'\` and a \`note\` naming what changed.\n   - **FIXED, but the fix was reverted or dropped in step 3** → leave it OPEN, exactly like a DEFERRED one. The code no longer carries the fix, so the finding is not fixed.\n   - **INVALID** → \`cyboflow_resolve_finding\` with \`resolution_kind: 'triaged'\` and a \`note\` carrying the refutation.\n   - **DEFERRED** → do NOTHING. Leave it open. It is a real issue deliberately left for the human gate, and resolving it would erase the one record of it. The same applies to any id the subagent omitted or gave a verdict outside those three — never guess a disposition.\n\nNever resolve a finding before its fix is verified and committed: resolving is IRREVERSIBLE (there is no un-resolve tool), so a finding closed as \`fixed\` whose fix is then reverted — or lost to a crash before the commit — leaves a real defect in the branch with its only record already closed. Resolution is the cheapest, most repeatable action in this chain; it goes last precisely because everything before it can fail.\n\nDo NOT file new findings from this step, and do NOT widen the change beyond the filed findings.`
       : '';
+  // The bootstrap's own files, appended to the address-review contract above.
+  // Deliberately a SEPARATE const rather than interpolated into that one: the
+  // address-review note is a fixed contract, and this is per-run data that is
+  // absent on almost every run — keeping them apart is what makes the common
+  // prompt byte-identical to what it was.
+  const bootstrapDenylistNote =
+    (step.agent === 'address-review' || step.id === 'address-review') &&
+    args.bootstrapProtectedPaths !== undefined &&
+    args.bootstrapProtectedPaths.length > 0
+      ? `\n\n## Files this run's verification bootstrap wrote — do NOT touch them\n\nThis run derived and proved its own verification runbook, and committed these files:\n\n${args.bootstrapProtectedPaths
+          .map((p) => `- \`${p}\``)
+          .join(
+            '\n',
+          )}\n\nLeave them exactly as they are, even if a finding appears to be about one of them, and even if one looks wrong to you. The runbook's proof is content-addressed against the committed file, so ANY edit to it — including a correct one — invalidates the proof and the next verification silently skips. The configuration change is what makes this project stand up for verification at all; reverting it un-proves the environment while the runbook still claims otherwise. If you believe one of these files is genuinely wrong, file a finding saying so and leave the file alone.\n\nRelay this list to \`cyboflow-address-review\` verbatim when you delegate — it cannot see this prompt.`
+      : '';
   const conditionalExecutionNote = conditionalExecution(step, workflowName, runOwnedIdeaIds.length > 0);
   const ideaFlagContractNote = ideaFlagContract(step);
   // Compound review-queue discipline — applies to EVERY compound step, not just
@@ -327,5 +359,5 @@ Do ONLY this step:
 2. **Commit file changes atomically.** If this step changes repository files, make ONE git commit (\`<type>: <what changed>\`), staging only the files this step touched. For DB-only, analysis, review, or artifact-reporting work, do not make a git commit. Never create an empty commit.
 3. **Stop.** Do NOT start any other step — the host orchestrator sequences the workflow and will invoke the next step itself. Report a one-line summary of what this step produced, then end your turn.
 
-The cyboflow database is the single source of truth: never read on-disk or worktree state files (e.g. a plugin state directory) to decide the task set or a task's status — any such file is NOT cyboflow's source of truth and may be stale or absent.${conditionalExecutionNote}${ideaFlagContractNote}${compoundGuard}${artifactNote}${taskVerifyRelayNote}${addressReviewNote}${userGuidance}${contractError}${loopbackFeedback}${retryNote}`;
+The cyboflow database is the single source of truth: never read on-disk or worktree state files (e.g. a plugin state directory) to decide the task set or a task's status — any such file is NOT cyboflow's source of truth and may be stale or absent.${conditionalExecutionNote}${ideaFlagContractNote}${compoundGuard}${artifactNote}${taskVerifyRelayNote}${addressReviewNote}${bootstrapDenylistNote}${userGuidance}${contractError}${loopbackFeedback}${retryNote}`;
 }

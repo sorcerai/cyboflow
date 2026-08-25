@@ -348,6 +348,32 @@ const GLOBAL_AGENT_TOOLS = [
     },
   },
   {
+    name: 'cyboflow_history',
+    description:
+      "READ-ONLY search over YOUR OWN past conversation transcripts with this user — your long-term memory. Your live context resets daily, but every past turn is durably kept; this tool reaches all of it. Without query: pages back through past turns newest-first (before_id continues a listing). With query (case-insensitive PLAIN-TEXT substring, not a regex): returns past turns whose text contains it, newest first, each as an excerpt around the first occurrence. role filters to 'user' or 'assistant' turns; days_back restricts to the last N days. Results are capped (limit clamps to 50, default 20, ~100KB payload) — truncated:true plus a numeric nextBeforeId mean there is more; pass nextBeforeId as before_id to continue. Use it when the user references a past conversation ('as we discussed', 'that thing from last week'), asks what was talked about before, or when earlier context would clearly help — never claim you don't remember without searching first.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Optional case-insensitive plain-text substring (not a regex). Omit to browse past turns newest-first.',
+        },
+        role: {
+          type: 'string',
+          enum: ['user', 'assistant'],
+          description: "Optional — return only your turns ('assistant') or only the user's ('user').",
+        },
+        days_back: { type: 'number', description: 'Optional — restrict to turns from the last N days.' },
+        before_id: {
+          type: 'number',
+          description: 'Optional paging cursor — pass a previous call\'s nextBeforeId to continue that listing.',
+        },
+        limit: { type: 'number', description: 'Optional turn count; clamped to <= 50 (default 20).' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'cyboflow_propose_action',
     description:
       "THE ONLY write-shaped tool available to the global agent. Records a proposal — a candidate action for a human to review — and returns { proposalId }. Calling this tool NEVER executes anything: no run is launched, no task is reprioritized, no workflow is edited, nothing navigates. A human must explicitly confirm the resulting proposal card before any side effect happens, and confirmation runs through the SAME chokepoints every other write in this app uses (TaskChangeRouter / WorkflowRegistry / RunLauncher), stamped actor:'user'. After calling this tool, STOP and describe the proposal in your reply — do NOT claim the action happened, and do NOT poll or retry waiting for it to happen. `payload_json` is a JSON-encoded object (field names camelCase, matching shared/types/agentThread.ts AgentProposalPayload exactly) whose `kind` selects its shape: launch-run {kind,projectId,workflowName,substrate?,taskIds?,ideaIds?,findingIds?,note?}; reprioritize-backlog {kind,projectId,items:[{taskId,priority?,stageId?}]}; edit-workflow {kind,workflowId,definitionJson,summary?} (preconditions — the current spec hash — are captured server-side from a fresh read, never trusted from the caller, even if you include one); open-session {kind,navigation:{target:'run',runId}|{target:'quick-session',sessionId,runId?}}. An unrecognized kind or a payload missing a kind's required fields is rejected with 'invalid_payload'.",
@@ -462,8 +488,8 @@ const DESIGN_TOOLS = [
         },
         priority: {
           type: 'string',
-          enum: ['P0', 'P1', 'P2'],
-          description: "Optional priority; defaults to 'P2'.",
+          enum: ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'],
+          description: "Optional priority (P0-P6); defaults to 'P2'.",
         },
       },
       required: ['title'],
@@ -574,7 +600,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             task_type: { type: 'string', enum: ['idea', 'epic', 'task'], description: "Optional task type; defaults to 'idea'" },
             summary: { type: 'string', description: 'Optional SHORT one-line descriptor shown on the board card (keep it to a sentence). For the rich spec / acceptance criteria, use body.' },
             body: { type: 'string', description: 'Optional full markdown body — the canonical rich detail (the idea spec, the task description + acceptance criteria, file/dependency hints). This is what the entity artifact renders, so prefer it for anything multi-line; leave summary as the short caption.' },
-            priority: { type: 'string', enum: ['P0', 'P1', 'P2'], description: "Optional priority; defaults to 'P2'" },
+            priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'], description: "Optional priority (P0-P6); defaults to 'P2'" },
             category: { type: 'string', enum: ['feature', 'bug', 'chore'], description: "Optional entity CLASSIFICATION (feature|bug|chore); defaults to 'feature'. Unrelated to cyboflow_report_finding's free-text grouping `category`." },
             repo: { type: 'string', description: 'Optional repo identifier' },
             parent_epic_id: { type: 'string', description: 'Optional parent epic id' },
@@ -601,7 +627,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             title: { type: 'string', description: 'Optional new title' },
             summary: { type: 'string', description: 'Optional new SHORT one-line descriptor shown on the board card. For the rich spec / acceptance criteria, use body.' },
             body: { type: 'string', description: 'Optional new full markdown body — the canonical rich detail rendered in the entity artifact (idea spec, task description + acceptance criteria). Prefer it over summary for anything multi-line.' },
-            priority: { type: 'string', enum: ['P0', 'P1', 'P2'], description: 'Optional new priority' },
+            priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6'], description: 'Optional new priority (P0-P6)' },
             category: { type: 'string', enum: ['feature', 'bug', 'chore'], description: "Optional new entity CLASSIFICATION (feature|bug|chore). Unrelated to cyboflow_report_finding's free-text grouping `category`." },
             repo: { type: 'string', description: 'Optional new repo identifier' },
             parent_epic_id: { type: 'string', description: 'Optional parent epic id (re-parent)' },
@@ -640,6 +666,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'cyboflow_set_idea_component',
+        description:
+          "Set one idea's component ledger state (migration 101's idea component ledger — idea-spec/prototype/architecture/epics/stories, each complete|incomplete|skipped). Routes through the single IdeaComponentRouter write chokepoint with source:'flow'; sourceRunId and the idea's builtAgainstVersion are resolved by the tool itself from THIS run, never accepted as input. idea_id may be the opaque idea id OR its display ref (e.g. 'IDEA-009') — resolved the same way as cyboflow_get_task. Setting a state ALWAYS clears any prior staleness on that component (an explicit stamp is a reviewed judgment, even 'still incomplete'). Stamp AFTER the body write that completes a component, never before — see cyboflow_get_task's description for why order matters.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            idea_id: { type: 'string', description: "Opaque idea id OR display ref (e.g. 'IDEA-009') (required)" },
+            component: {
+              type: 'string',
+              enum: ['idea-spec', 'prototype', 'architecture', 'epics', 'stories'],
+              description: 'Which of the five tracked idea components to set (required)',
+            },
+            state: {
+              type: 'string',
+              enum: ['complete', 'incomplete', 'skipped'],
+              description: "The component's new state (required). 'skipped' must only be set deliberately — it is never inferred.",
+            },
+          },
+          required: ['idea_id', 'component', 'state'],
+        },
+      },
+      {
         name: 'cyboflow_list_tasks',
         description:
           "List the backlog (ideas/epics/tasks) for THIS run's project. Read-only and run-bound (no project argument — the project is derived from CYBOFLOW_RUN_ID). Returns COMPACT items WITHOUT their markdown body — use cyboflow_get_task to fetch one item's full body by the id or ref this tool returns. By default archived items and done/retired items are hidden; opt in with include_archived / include_done. Use this before cyboflow_create_task to check whether an idea/task already exists and avoid creating a duplicate.",
@@ -656,7 +704,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'cyboflow_get_task',
         description:
-          "Fetch ONE backlog entity with its FULL markdown body, by opaque id OR display ref (e.g. IDEA-009, EPIC-002, TASK-014) — pass a ref straight from cyboflow_list_tasks, it is resolved automatically. Read-only, scoped to THIS run's project: an id/ref that belongs to another project is reported as not_found. For an IDEA, the response also includes an 'attachments' array — [{ id, label, mimeType, path }], `path` a RESOLVED ABSOLUTE on-disk path (never base64/dataURLs) — read the image bytes yourself via the Read tool; an idea with none returns attachments: []. Epics/tasks carry no 'attachments' key. For an idea with an approved design (Design Mode), the response also includes 'approved_design': { approved_at, draft_revision, prototype_revision, snapshot_path }, `snapshot_path` a RESOLVED ABSOLUTE on-disk path to the approved prototype snapshot HTML — read it directly via the Read tool, no export step needed. An idea with no approved design omits the key.",
+          "Fetch ONE backlog entity with its FULL markdown body, by opaque id OR display ref (e.g. IDEA-009, EPIC-002, TASK-014) — pass a ref straight from cyboflow_list_tasks, it is resolved automatically. Read-only, scoped to THIS run's project: an id/ref that belongs to another project is reported as not_found. For an IDEA, the response also includes an 'attachments' array — [{ id, label, mimeType, path }], `path` a RESOLVED ABSOLUTE on-disk path (never base64/dataURLs) — read the image bytes yourself via the Read tool; an idea with none returns attachments: []. Epics/tasks carry no 'attachments' key. For an idea with an approved design (Design Mode), the response also includes 'approved_design': { approved_at, draft_revision, prototype_revision, snapshot_path }, `snapshot_path` a RESOLVED ABSOLUTE on-disk path to the approved prototype snapshot HTML — read it directly via the Read tool, no export step needed. An idea with no approved design omits the key. For an IDEA, the response ALSO includes 'components' — the idea component ledger, always all FIVE entries (idea-spec, prototype, architecture, epics, stories; see cyboflow_set_idea_component to write one), each `{ component, state, source, sourceRunId, sourceSessionId, builtAgainstVersion, staleAt, staleReason, updatedAt }`. `state` is one of complete|incomplete|skipped. CRITICAL: an `incomplete` component with `staleAt` non-null is NOT the same as one never started — it means prior work exists (from before the idea's body changed underneath it) and needs RE-VERIFICATION, not a redo from scratch; `staleAt === null` on an `incomplete` component means truly not started. Epics/tasks carry no 'components' key.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -1053,7 +1101,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'cyboflow_list_variants',
         description:
-          "List a workflow's A/B variants (newest-first). Read-only. Returns COMPACT rows (id, label, model, execution_model, weight, status draft|active|paused|retired, has_agent_overrides). NOTE: `has_agent_overrides` reflects only the `agent_overrides_json` blob (Claude prompt/model tweaks); a variant can still carry per-agent model pins or Codex routing via its `definition_json` `agentConfigs` and show `has_agent_overrides: false` — fetch the variant's definition to see those. Use before creating/editing variants to see what already exists.",
+          "List a workflow's A/B variants (newest-first). Read-only. Returns COMPACT rows (id, label, model, execution_model, weight, status draft|active|paused|retired, has_agent_overrides). NOTE: `has_agent_overrides` reflects only the `agent_overrides_json` blob (Claude prompt/model tweaks); a variant can still carry per-agent model pins or Codex routing via its `definition_json` `agentConfigs` and show `has_agent_overrides: false` — fetch the variant's definition to see those. ARCHIVED variants (migration 116) are OMITTED — an archived variant still exists, still holds its status and run history, and is still pinnable by id; it is just hidden from this listing, so an empty result is not proof the workflow has no variants. Use before creating/editing variants to see what already exists.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -1398,6 +1446,39 @@ async function handleGlobalAgentCallTool(request: {
       return executeMcpQuery('mcp-fs-grep', queryParams);
     }
 
+    case 'cyboflow_history': {
+      const args = (request.params.arguments ?? {}) as {
+        query?: unknown;
+        role?: unknown;
+        days_back?: unknown;
+        before_id?: unknown;
+        limit?: unknown;
+      };
+      const { query, role, days_back, before_id, limit } = args;
+      if (query !== undefined && typeof query !== 'string') {
+        return invalidArgs('query: string (optional case-insensitive plain-text substring)');
+      }
+      if (role !== undefined && role !== 'user' && role !== 'assistant') {
+        return invalidArgs("role: 'user' | 'assistant' (optional)");
+      }
+      if (days_back !== undefined && typeof days_back !== 'number') {
+        return invalidArgs('days_back: number (optional)');
+      }
+      if (before_id !== undefined && typeof before_id !== 'number') {
+        return invalidArgs('before_id: number (optional)');
+      }
+      if (limit !== undefined && typeof limit !== 'number') {
+        return invalidArgs('limit: number (optional)');
+      }
+      const queryParams: Record<string, unknown> = {};
+      if (query !== undefined) queryParams['query'] = query;
+      if (role !== undefined) queryParams['role'] = role;
+      if (days_back !== undefined) queryParams['daysBack'] = days_back;
+      if (before_id !== undefined) queryParams['beforeId'] = before_id;
+      if (limit !== undefined) queryParams['limit'] = limit;
+      return executeMcpQuery('mcp-history', queryParams);
+    }
+
     case 'cyboflow_propose_action': {
       const args = (request.params.arguments ?? {}) as { payload_json?: unknown };
       const { payload_json } = args;
@@ -1500,8 +1581,17 @@ async function handleDesignScopeCallTool(request: {
       if (body !== undefined && typeof body !== 'string') {
         return invalidArgs('body: string (optional)');
       }
-      if (priority !== undefined && priority !== 'P0' && priority !== 'P1' && priority !== 'P2') {
-        return invalidArgs("priority: 'P0' | 'P1' | 'P2' (optional)");
+      if (
+        priority !== undefined &&
+        priority !== 'P0' &&
+        priority !== 'P1' &&
+        priority !== 'P2' &&
+        priority !== 'P3' &&
+        priority !== 'P4' &&
+        priority !== 'P5' &&
+        priority !== 'P6'
+      ) {
+        return invalidArgs("priority: 'P0'..'P6' (optional)");
       }
       // Design scope mints follow-up TASKS only — taskType/category are pinned
       // server-side here, never taken from the caller.
@@ -1720,12 +1810,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
-      if (priority !== undefined && priority !== 'P0' && priority !== 'P1' && priority !== 'P2') {
+      if (
+        priority !== undefined &&
+        priority !== 'P0' &&
+        priority !== 'P1' &&
+        priority !== 'P2' &&
+        priority !== 'P3' &&
+        priority !== 'P4' &&
+        priority !== 'P5' &&
+        priority !== 'P6'
+      ) {
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ error: 'invalid_arguments', expected: "priority: 'P0' | 'P1' | 'P2' (optional)" }),
+              text: JSON.stringify({ error: 'invalid_arguments', expected: "priority: 'P0'..'P6' (optional)" }),
             },
           ],
         };
@@ -1869,12 +1968,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
-      if (priority !== undefined && priority !== 'P0' && priority !== 'P1' && priority !== 'P2') {
+      if (
+        priority !== undefined &&
+        priority !== 'P0' &&
+        priority !== 'P1' &&
+        priority !== 'P2' &&
+        priority !== 'P3' &&
+        priority !== 'P4' &&
+        priority !== 'P5' &&
+        priority !== 'P6'
+      ) {
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ error: 'invalid_arguments', expected: "priority: 'P0' | 'P1' | 'P2' (optional)" }),
+              text: JSON.stringify({ error: 'invalid_arguments', expected: "priority: 'P0'..'P6' (optional)" }),
             },
           ],
         };
@@ -2021,6 +2129,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const queryParams: Record<string, unknown> = { taskId: task_id, dependsOnTaskId: depends_on_task_id };
       if (kind !== undefined) queryParams['dependencyKind'] = kind;
       return executeMcpQuery('mcp-add-task-dependency', queryParams);
+    }
+
+    case 'cyboflow_set_idea_component': {
+      const args = (request.params.arguments ?? {}) as {
+        idea_id?: unknown;
+        component?: unknown;
+        state?: unknown;
+      };
+      const { idea_id, component, state } = args;
+      if (typeof idea_id !== 'string' || idea_id.length === 0) {
+        return {
+          content: [
+            { type: 'text', text: JSON.stringify({ error: 'invalid_arguments', expected: 'idea_id: string' }) },
+          ],
+        };
+      }
+      if (
+        component !== 'idea-spec' &&
+        component !== 'prototype' &&
+        component !== 'architecture' &&
+        component !== 'epics' &&
+        component !== 'stories'
+      ) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'invalid_arguments',
+                expected: "component: 'idea-spec' | 'prototype' | 'architecture' | 'epics' | 'stories'",
+              }),
+            },
+          ],
+        };
+      }
+      if (state !== 'complete' && state !== 'incomplete' && state !== 'skipped') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'invalid_arguments',
+                expected: "state: 'complete' | 'incomplete' | 'skipped'",
+              }),
+            },
+          ],
+        };
+      }
+      return executeMcpQuery('mcp-set-idea-component', { ideaId: idea_id, component, state });
     }
 
     case 'cyboflow_list_tasks': {

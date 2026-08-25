@@ -70,7 +70,7 @@ const COACH: Record<number, CoachSpec> = {
     pointer: true,
     body: (
       <>
-        Choose the provider and how it runs. Claude and Codex both support structured SDK sessions; interactive PTY
+        Choose the provider and how it runs. Claude and Codex both support structured SDK sessions; interactive CLI
         mode is available for quick sessions. Runtime comes first because it determines which models are available.
       </>
     ),
@@ -127,6 +127,39 @@ interface Rect {
   height: number;
 }
 
+/**
+ * The nearest ancestor of `el` that actually scrolls vertically.
+ *
+ * The scrim rects below are `pointer-events-auto` (that is what makes the tour
+ * modal — only the hole is clickable), so a wheel event over one of them targets
+ * the SCRIM. The browser then walks the scrim's DOM ancestor chain looking for a
+ * scroll container — which is the portal host (`fixed inset-0`) and then `body`,
+ * neither scrollable — and never the surface underneath. Nothing moves.
+ *
+ * That dead-ends the tour on a short (non-fullscreen) window: steps 6-8 anchor
+ * into the wizard's Configure column, whose "Start quick session" CTA — the very
+ * control step 8's copy tells you to press next — sits below the fold, reachable
+ * only by scrolling the wizard's own `overflow-y-auto` root. So we resolve that
+ * container from the ANCHOR (not from the scrim) and drive it ourselves.
+ */
+function scrollableAncestor(el: Element | null): HTMLElement | null {
+  let node = el instanceof HTMLElement ? el.parentElement : null;
+  while (node) {
+    const { overflowY } = getComputedStyle(node);
+    const scrolls = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+    if (scrolls && node.scrollHeight > node.clientHeight) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+/** One wheel event in pixels, normalizing the line/page delta modes. */
+function wheelPixels(e: React.WheelEvent): number {
+  if (e.deltaMode === 1) return e.deltaY * 16; // DOM_DELTA_LINE
+  if (e.deltaMode === 2) return e.deltaY * window.innerHeight; // DOM_DELTA_PAGE
+  return e.deltaY; // DOM_DELTA_PIXEL
+}
+
 function rectsEqual(a: Rect | null, b: Rect | null): boolean {
   if (a === null || b === null) return a === b;
   return a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height;
@@ -160,10 +193,21 @@ export function Coachmark({
   useEffect(() => {
     if (!spec) return;
     let raf = 0;
+    // The hole is clamped to the viewport, so an anchor below the fold would be
+    // highlighted at the screen edge and stay unreachable. Bring it into view
+    // once, the first frame it resolves for this step (never on later frames —
+    // that would fight the user's own scrolling).
+    let revealed = false;
     const tick = (): void => {
       const el = document.querySelector(`[${ONBOARDING_ANCHOR_ATTR}="${spec.anchorId}"]`);
       let next: Rect | null = null;
       if (el) {
+        if (!revealed) {
+          revealed = true;
+          if (typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          }
+        }
         const r = el.getBoundingClientRect();
         next = { top: r.top, left: r.left, width: r.width, height: r.height };
         missingFramesRef.current = 0;
@@ -312,15 +356,24 @@ export function Coachmark({
     bottom: Math.min(rect.top + rect.height + HOLE_PAD, vh),
   };
   const scrim = 'absolute bg-modal-overlay pointer-events-auto';
+  // Wheel over any scrim rect scrolls the surface the anchor lives on, so the
+  // tour never traps content below the fold (see scrollableAncestor). Clicks
+  // stay blocked — only scrolling is forwarded.
+  const onScrimWheel = (e: React.WheelEvent): void => {
+    const anchor = document.querySelector(`[${ONBOARDING_ANCHOR_ATTR}="${spec.anchorId}"]`);
+    const scroller = scrollableAncestor(anchor);
+    if (scroller) scroller.scrollTop += wheelPixels(e);
+  };
+  const scrimProps = { className: scrim, onWheel: onScrimWheel, 'data-testid': 'coach-scrim' };
 
   return (
     <>
       {/* 4-rect scrim leaving the target hole open. */}
-      <div className={scrim} style={{ top: 0, left: 0, width: vw, height: hole.top }} />
-      <div className={scrim} style={{ top: hole.bottom, left: 0, width: vw, height: vh - hole.bottom }} />
-      <div className={scrim} style={{ top: hole.top, left: 0, width: hole.left, height: hole.bottom - hole.top }} />
+      <div {...scrimProps} style={{ top: 0, left: 0, width: vw, height: hole.top }} />
+      <div {...scrimProps} style={{ top: hole.bottom, left: 0, width: vw, height: vh - hole.bottom }} />
+      <div {...scrimProps} style={{ top: hole.top, left: 0, width: hole.left, height: hole.bottom - hole.top }} />
       <div
-        className={scrim}
+        {...scrimProps}
         style={{ top: hole.top, left: hole.right, width: vw - hole.right, height: hole.bottom - hole.top }}
       />
 

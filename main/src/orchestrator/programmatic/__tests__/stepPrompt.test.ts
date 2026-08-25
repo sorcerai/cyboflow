@@ -170,6 +170,55 @@ describe('composeStepPrompt', () => {
     expect(byAgent).toContain('## Findings contract (address-review)');
   });
 
+  it('renders the runbook-bootstrap denylist on address-review, when the run bootstrapped', () => {
+    // address-review is the ONE step in the chain that "fixes in place", and both
+    // of these files are booby-trapped for a well-meant fix: the runbook's proof
+    // is content-addressed against the committed bytes (so any edit demotes it
+    // and the next verification silently skips), and reverting the config change
+    // un-proves the environment while the runbook goes on claiming otherwise.
+    const out = composeStepPrompt({
+      step: step({ id: 'address-review', agent: 'address-review' }),
+      workflowName: 'sprint',
+      attempt: 1,
+      bootstrapProtectedPaths: ['.cyboflow/verify-runbook.json', 'package.json'],
+    });
+    expect(out).toContain('.cyboflow/verify-runbook.json');
+    expect(out).toContain('package.json');
+    expect(out).toContain('content-addressed');
+    // The subagent cannot see this prompt, so the step agent has to forward it.
+    expect(out).toContain('Relay this list');
+  });
+
+  it('renders NOTHING about the bootstrap on a run that did not bootstrap', () => {
+    // Which is nearly every run. The common prompt must stay byte-identical to
+    // what it was, or every existing prompt assertion becomes noise.
+    const withEmpty = composeStepPrompt({
+      step: step({ id: 'address-review', agent: 'address-review' }),
+      workflowName: 'sprint',
+      attempt: 1,
+      bootstrapProtectedPaths: [],
+    });
+    const without = composeStepPrompt({
+      step: step({ id: 'address-review', agent: 'address-review' }),
+      workflowName: 'sprint',
+      attempt: 1,
+    });
+    expect(withEmpty).toBe(without);
+    expect(without).not.toContain('verification bootstrap wrote');
+  });
+
+  it('does not render the denylist on a step that is not address-review', () => {
+    // The paths are only hazardous to a step that edits files it was not asked
+    // to edit; telling implement about them would be noise in every lane.
+    const out = composeStepPrompt({
+      step: step({ id: 'implement', agent: 'implement' }),
+      workflowName: 'sprint',
+      attempt: 1,
+      bootstrapProtectedPaths: ['.cyboflow/verify-runbook.json'],
+    });
+    expect(out).not.toContain('verification bootstrap wrote');
+  });
+
   it('requires a full-suite re-run when address-review changed files (programmatic parity)', () => {
     // The controller walks the definition in order: sprint-verify runs BEFORE
     // address-review, so any fix this step applies is unverified by the time the

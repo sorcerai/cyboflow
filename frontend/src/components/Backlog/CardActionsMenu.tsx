@@ -18,9 +18,11 @@
  * THE TRACKER RULING. Archive and Delete are the app's user-initiated removal
  * chokepoint (every board surface funnels its ⋯ menu through here), so this is
  * also where the tracker-sync local-removal prompt lives: the click first asks
- * `tracker.linkForEntity`, and a LINKED entity gets {@link TrackerUnlinkDialog}
- * — keep the issue as it is, or cancel it in the tracker — before the ordinary
- * confirm dialog opens. An unlinked entity (the overwhelmingly common case) is
+ * `tracker.linksForEntity` (EVERY live link, not just one — an entity can be
+ * synced to more than one tracker), and a LINKED entity gets
+ * {@link TrackerUnlinkDialog} naming all of them — keep the issues as they are,
+ * or cancel them in their trackers — before the ordinary confirm dialog opens.
+ * An unlinked entity (the overwhelmingly common case, an empty link array) is
  * unchanged apart from that one query.
  *
  * The ruling dialog only RECORDS the answer; it is applied by the delete/archive
@@ -43,6 +45,12 @@
  * alternative to drag-reorder (WCAG 2.5.7), driving the SAME reorder core as
  * DnD. Without it (ListView, epic children) the Move items are hidden and the
  * menu renders exactly as before.
+ *
+ * When `onShowComponents` is wired (ideas with a resolved component ledger
+ * only — TaskCard.tsx), the menu also exposes "Show components", a
+ * discoverable keyboard-reachable alternative to the card's own small
+ * `ledger-expand` chevron. It only OPENS the ledger expand (never toggles it
+ * closed) — clicking it twice does nothing surprising.
  */
 import { useRef, useState } from 'react';
 import {
@@ -54,6 +62,7 @@ import {
   ArrowUp,
   ArrowDown,
   ArrowUpToLine,
+  ListChecks,
 } from 'lucide-react';
 import { Dropdown, type DropdownItem } from '../ui/Dropdown';
 import { useBacklogStore } from '../../stores/backlogStore';
@@ -86,6 +95,12 @@ interface CardActionsMenuProps {
   canMoveUp?: boolean;
   /** False on the column's last card — disables Move down. */
   canMoveDown?: boolean;
+  /**
+   * Open the card's ledger-expand section. Omitted (the common case: non-idea
+   * cards, or an idea whose components haven't resolved yet) hides the
+   * "Show components" item entirely — mirrors `onReorder`'s convention.
+   */
+  onShowComponents?: () => void;
 }
 
 export function CardActionsMenu({
@@ -93,6 +108,7 @@ export function CardActionsMenu({
   onReorder,
   canMoveUp = false,
   canMoveDown = false,
+  onShowComponents,
 }: CardActionsMenuProps): React.JSX.Element | null {
   const boards = useBacklogStore((s) => s.boards);
   const [stageOpen, setStageOpen] = useState(false);
@@ -103,11 +119,13 @@ export function CardActionsMenu({
   const [unarchiving, setUnarchiving] = useState(false);
   /**
    * The tracker ruling in front of the confirm dialog: which destructive intent
-   * is parked, and the link it is parked on. Both are null in the ordinary case
-   * — an entity that is not synced to any tracker never sees this step.
+   * is parked, and the links it is parked on (EVERY live link — an entity can be
+   * synced to more than one tracker). `parkedIntent` is null and `trackerLinks`
+   * is empty in the ordinary case — an entity that is not synced to any tracker
+   * never sees this step.
    */
   const [parkedIntent, setParkedIntent] = useState<DestructiveIntent | null>(null);
-  const [trackerLink, setTrackerLink] = useState<TrackerEntityLinkRef | null>(null);
+  const [trackerLinks, setTrackerLinks] = useState<TrackerEntityLinkRef[]>([]);
   /** Does the delete cascade take synced children with it? Ideas/epics only. */
   const [trackerChildren, setTrackerChildren] = useState(false);
   /**
@@ -172,16 +190,16 @@ export function CardActionsMenu({
    */
   const beginDestructive = async (intent: DestructiveIntent): Promise<void> => {
     setActionError(null);
-    let link: TrackerEntityLinkRef | null = null;
+    let links: TrackerEntityLinkRef[] = [];
     try {
-      link = await trpc.cyboflow.tracker.linkForEntity.query({
+      links = await trpc.cyboflow.tracker.linksForEntity.query({
         entityType: task.type,
         entityId: task.id,
       });
     } catch {
-      link = null;
+      links = [];
     }
-    if (link === null) {
+    if (links.length === 0) {
       openConfirm(intent);
       return;
     }
@@ -200,7 +218,7 @@ export function CardActionsMenu({
         children = false;
       }
     }
-    setTrackerLink(link);
+    setTrackerLinks(links);
     setTrackerChildren(children);
     setParkedIntent(intent);
   };
@@ -209,7 +227,7 @@ export function CardActionsMenu({
   const handleUnlinkResolved = (): void => {
     const intent = parkedIntent;
     setParkedIntent(null);
-    setTrackerLink(null);
+    setTrackerLinks([]);
     setTrackerChildren(false);
     rulingStaged.current = true;
     if (intent !== null) openConfirm(intent);
@@ -259,6 +277,16 @@ export function CardActionsMenu({
         onClick: () => onReorder(task, 'top'),
       },
     );
+  }
+  if (onShowComponents !== undefined) {
+    // Informational only — never gated on hasActiveRun, unlike the
+    // destructive/stage-changing items below.
+    items.push({
+      id: 'show-components',
+      label: 'Show components',
+      icon: ListChecks,
+      onClick: onShowComponents,
+    });
   }
   items.push(
     {
@@ -355,22 +383,22 @@ export function CardActionsMenu({
           discardStagedRuling();
         }}
       />
-      {trackerLink !== null && parkedIntent !== null && (
+      {trackerLinks.length > 0 && parkedIntent !== null && (
         <TrackerUnlinkDialog
           entityType={task.type}
           entityId={task.id}
           entityRef={task.ref}
           action={parkedIntent}
-          link={trackerLink}
+          links={trackerLinks}
           hasLinkedDescendants={trackerChildren}
           isOpen
           onClose={() => {
             // Dismissed without a ruling: the destructive action is abandoned
-            // too, so nothing is deleted and the link stays live. The dialog
+            // too, so nothing is deleted and every link stays live. The dialog
             // fires its own clearUnlinkRuling on the way out (nothing was staged
             // in THIS round, but an earlier abandoned one may still be live).
             setParkedIntent(null);
-            setTrackerLink(null);
+            setTrackerLinks([]);
             setTrackerChildren(false);
           }}
           onResolved={handleUnlinkResolved}

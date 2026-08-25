@@ -34,6 +34,9 @@ function makeApproval(over: Partial<Approval> = {}): Approval {
     rationale: null,
     createdAt: '2026-01-01T00:00:00.000Z',
     status: 'pending',
+    awaited: true,
+    sessionName: null,
+    agentProvider: null,
     ...over,
   };
 }

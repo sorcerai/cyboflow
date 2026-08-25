@@ -543,7 +543,7 @@ describe('WorkflowPicker — agent runtime selector (IDEA-013 / TASK-812)', () =
     ]);
   });
 
-  it('renders an agent runtime selector before model and gates Codex PTY for workflows', async () => {
+  it('renders an agent runtime selector before model and gates the Codex CLI runtime for workflows', async () => {
     render(<WorkflowPicker projectId={1} />);
 
     const runtimeSelect = (await screen.findByLabelText('Select agent runtime')) as HTMLSelectElement;
@@ -553,7 +553,7 @@ describe('WorkflowPicker — agent runtime selector (IDEA-013 / TASK-812)', () =
     // Default reflects ConfigManager.defaultSubstrate floor ('sdk').
     expect(runtimeSelect.value).toBe('claude-sdk');
     expect(screen.getByRole('option', { name: /^Codex SDK$/i })).not.toBeDisabled();
-    expect(screen.getByRole('option', { name: /Codex PTY/i })).not.toBeDisabled();
+    expect(screen.getByRole('option', { name: /Codex \(CLI\)/i })).not.toBeDisabled();
     expect(
       screen.getByText(/A structured runtime can run workflows or quick sessions/i),
     ).toBeInTheDocument();

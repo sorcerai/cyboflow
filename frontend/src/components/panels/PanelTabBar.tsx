@@ -40,7 +40,7 @@ function addChatSubstrateItems(
     },
     {
       id: 'interactive',
-      label: 'PTY (interactive)',
+      label: 'CLI (interactive)',
       description: `Run this chat with the interactive ${providerLabel} terminal`,
       substrate: 'interactive',
     },

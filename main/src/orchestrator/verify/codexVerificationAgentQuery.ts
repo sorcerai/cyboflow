@@ -61,6 +61,7 @@ import {
   type TurnSessionEvent,
 } from '../../services/panels/codex/appServer/turnSession';
 import { toStrictOutputSchema } from '../../services/panels/codex/appServer/strictOutputSchema';
+import { observeCodexNotification } from '../../services/providerUsage/codexUsageObserver';
 
 /** The one-shot app-server client this query drives (mirrors CodexEvalAppServerClient). */
 export interface CodexVerifyAppServerClient extends TurnSessionClient {
@@ -393,7 +394,13 @@ export function makeCodexVerificationAgentQuery(
       // VERIFY_ARTIFACTS_DIR / VERIFY_DRIVER / VERIFY_DRIVER_PORT / VERIFY_PORT /
       // VERIFY_DRIVER_ATTACH_ONLY — spread them last, after the codex PATH prepend.
       env: { ...prependCodexPathToEnvironment(process.env, executable.pathDir), ...args.env },
-      onNotification: (notification) => turnSession?.handleNotification(notification),
+      onNotification: (notification) => {
+        turnSession?.handleNotification(notification);
+        // Never allowed to throw: an exception escaping this handler reaches
+        // CodexAppServerClient.fail(), which SIGTERMs the app-server's whole
+        // process group mid-turn.
+        observeCodexNotification(notification.method, notification.params);
+      },
       onStderr: (chunk) => logger?.warn('[codexVerificationAgentQuery] app-server stderr', {
         stderr: chunk.trimEnd(),
       }),

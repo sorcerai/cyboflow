@@ -267,7 +267,7 @@ describe('McpQueryHandler.handleCreateSprintBatch', () => {
     expect(batchIdOf(db, 'run-1')).toBeNull();
   });
 
-  it('over-cap under the sdk default → ship_batch_too_large (16 > SPRINT_BATCH_MAX_TASKS.sdk = 15)', async () => {
+  it('over-cap under the sdk default → ship_batch_too_large (16 > SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk = 15)', async () => {
     seedRun(db, { runId: 'run-1', substrate: null }); // null substrate → 'sdk' default
     for (let i = 0; i < 16; i++) seedCreatedTaskEventOnly(db, 'run-1', `t${i}`);
 
@@ -279,6 +279,52 @@ describe('McpQueryHandler.handleCreateSprintBatch', () => {
     expect(res.error).toBe('ship_batch_too_large');
     expect(batchCount(db)).toBe(0);
     expect(batchIdOf(db, 'run-1')).toBeNull();
+  });
+
+  it("honors the user's Settings cap override: 16 tasks pass once sdk is raised to 20", async () => {
+    // Same 16-task run that trips the built-in 15 above — but this handler reads a
+    // deps bag whose getSprintMaxTasks reports the raised Settings value, so the cap
+    // guard passes and the run falls through to the NEXT rejection (these
+    // event-only ids have no eligible tasks rows). Proving a DIFFERENT error is
+    // what shows the cap did not fire.
+    const raised = new McpQueryHandler(dbAdapter(db), undefined, {
+      getSprintMaxTasks: () => ({ sdk: 20 }),
+    });
+    seedRun(db, { runId: 'run-raised', substrate: 'sdk' });
+    for (let i = 0; i < 16; i++) seedCreatedTaskEventOnly(db, 'run-raised', `r${i}`);
+
+    const { socket, writes } = makeSocketDouble();
+    await raised.handleMessage(
+      { type: 'mcp-create-sprint-batch', requestId: 'b-raised', runId: 'run-raised' },
+      socket,
+    );
+
+    const res = parseLastWrite(writes);
+    expect(res.ok).toBe(false);
+    expect(res.error).not.toBe('ship_batch_too_large');
+    expect(res.error).toBe('ship_no_tasks_to_materialize');
+  });
+
+  it('a LOWERED override still rejects: sdk pinned to 2 trips at 3 created tasks', async () => {
+    const lowered = new McpQueryHandler(dbAdapter(db), undefined, {
+      getSprintMaxTasks: () => ({ sdk: 2 }),
+    });
+    seedRun(db, { runId: 'run-low', substrate: 'sdk' });
+    seedCreatedTask(db, 'run-low', 'tsk_a', 'TASK-001', true);
+    seedCreatedTask(db, 'run-low', 'tsk_b', 'TASK-002', true);
+    seedCreatedTask(db, 'run-low', 'tsk_c', 'TASK-003', true);
+
+    const { socket, writes } = makeSocketDouble();
+    await lowered.handleMessage(
+      { type: 'mcp-create-sprint-batch', requestId: 'b-low', runId: 'run-low' },
+      socket,
+    );
+
+    const res = parseLastWrite(writes);
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('ship_batch_too_large');
+    expect(batchCount(db)).toBe(0);
+    expect(batchIdOf(db, 'run-low')).toBeNull();
   });
 
   it('cap is substrate-keyed: 11 created tasks trip the interactive cap (10) but NOT the sdk cap (15)', async () => {

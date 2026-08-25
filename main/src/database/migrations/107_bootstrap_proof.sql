@@ -1,0 +1,75 @@
+-- Migration 107: the LANE-DRIVEN runbook bootstrap's request kind + runbook
+-- provenance (docs/proposals/lane-runbook-bootstrap.md §5 + §10).
+--
+-- WHAT THIS IS FOR. Migration 096 landed the runbook, and with it the §3.2
+-- degrade gate: a request that must BUILD or SERVE the deliverable is skipped
+-- unless the project has a PROVEN runbook. The only thing that can produce one
+-- is the Verify Setup flow, which a human has to launch — so on a project nobody
+-- hand-configured, the gate's answer is permanent and visual verification never
+-- runs at all. The bootstrap makes that skip self-healing: a sprint/ship lane
+-- derives a runbook, the CONTROLLER commits and registers it, and one
+-- attestation-only proof either promotes it (engine-enforced, exactly as a setup
+-- proof is) or leaves an honest unproven draft behind.
+--
+-- (1) verification_requests.bootstrap_proof — 0/1, NOT NULL DEFAULT 0.
+--
+--     A THIRD request kind, deliberately NOT a widening of 095's `setup_proof`.
+--     `setup_proof` bundles three privileges (degrade-gate exemption, LIFETIME
+--     BUDGET exemption, lower-priority draining) and is authorized against the
+--     run's frozen workflow identity precisely because a lane must never be able
+--     to claim them (mcpQueryHandler: "a compound lane reaching for
+--     setup_proof:true because it read the verify-setup workflow prompt once").
+--     A bootstrap proof needs exactly ONE of those three:
+--
+--       degrade gate      — EXEMPT (proving the runbook is how a project stops
+--                           being unproven; gating it deadlocks the bootstrap,
+--                           the same reasoning §3.6 applies to setup_proof).
+--       lifetime budget   — COUNTED AND CHARGED, unlike setup_proof. A budget
+--                           exemption is safe for a flow a human launches once
+--                           per project; it is not safe for something a lane
+--                           reaches on every sprint.
+--       drain priority    — ORDINARY. A bootstrap blocks a live lane, so it has
+--                           no business draining behind one.
+--
+--     It is also NOT a wire field: nothing in mcpQueryHandler reads it, so no
+--     agent in any flow can request it. The only writer is the in-process
+--     controller seam (enqueueTaskVerification), which makes this a strictly
+--     stronger guarantee than setup_proof's workflow-identity check rather than
+--     a second copy of it.
+--
+--     THE OTHER HALF OF THIS COLUMN'S JOB is exclusion. A bootstrap proof must
+--     never drive a sprint lane: it carries the runbook's build/serve, NOT the
+--     lane's acceptance criteria, so letting it reach the merge gate would charge
+--     a lane's implement budget for a runbook defect (or integrate a lane on a
+--     verdict that never looked at its behaviors). Both lane-driving policy sites
+--     — verdictDelivery's applyMergeGateVerdict call and the programmatic
+--     SchedulerVisualVerifyGate — exclude on THIS COLUMN rather than on an absent
+--     task_ref, because resolveLaneForVerdict falls back to the sole lane of a
+--     single-lane run and would otherwise attribute a ref-less proof to it.
+--
+--     Every pre-107 row and every ordinary lane request defaults to 0.
+--
+-- (2) verify_runbook_local.origin — TEXT, nullable: 'setup-flow' | 'lane-bootstrap'.
+--
+--     PROVENANCE, and it is not cosmetic. A human deciding whether to trust a
+--     proven runbook should be able to see whether it was reviewed at a human
+--     gate (the setup flow, which shows the proposal and every repo change it
+--     wants before touching anything) or derived autonomously by a lane mid-sprint
+--     and proven without anyone looking. Both are proven by the same
+--     engine-enforced run; they did NOT earn the same amount of trust, and
+--     collapsing them would erase the only durable record of which happened.
+--     Surfaces in the verify health panel and the verify-runbook artifact.
+--
+--     NULL for every pre-107 row (registered before the distinction existed —
+--     honestly unknown, and readers must not guess 'setup-flow' for it).
+--
+-- NOTE: No `IF NOT EXISTS` on the ALTERs — SQLite does not support it there, and
+-- one ADD COLUMN per statement is required. Re-running raises 'duplicate column
+-- name: ...', the idempotency signal runFileBasedMigrations() keys off of (the
+-- same mechanism 055/078/095/096 rely on).
+--
+-- NOTE: No explicit BEGIN/COMMIT — runFileBasedMigrations() wraps every file in
+-- a this.transaction(...) call.
+
+ALTER TABLE verification_requests ADD COLUMN bootstrap_proof INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE verify_runbook_local ADD COLUMN origin TEXT;

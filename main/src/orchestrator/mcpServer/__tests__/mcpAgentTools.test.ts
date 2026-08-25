@@ -21,7 +21,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { McpQueryHandler, resolveGlobalAgentContext, type McpQueryResponse } from '../mcpQueryHandler';
+import {
+  McpQueryHandler,
+  resolveGlobalAgentContext,
+  type McpQueryMessage,
+  type McpQueryResponse,
+} from '../mcpQueryHandler';
 import type * as net from 'net';
 import { dbAdapter } from '../../__test_fixtures__/dbAdapter';
 import { TaskChangeRouter, taskChangeEvents } from '../../taskChangeRouter';
@@ -187,6 +192,69 @@ function seedQuestionRow(db: Database.Database, id: string, runId: string, statu
   );
 }
 
+/**
+ * Append one raw `agent_thread_events` row. Raw INSERT rather than
+ * AgentThreadDbStore.appendEvent so a fixture can pin `created_at` — the
+ * daysBack window is a SQL predicate on that column, and CURRENT_TIMESTAMP
+ * cannot express "two decades ago".
+ */
+function seedThreadEvent(
+  db: Database.Database,
+  threadId: string,
+  eventType: string,
+  payload: unknown,
+  createdAt?: string,
+): number {
+  const payloadJson = JSON.stringify(payload);
+  const result =
+    createdAt !== undefined
+      ? db
+          .prepare(
+            `INSERT INTO agent_thread_events (thread_id, event_type, payload_json, created_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(threadId, eventType, payloadJson, createdAt)
+      : db
+          .prepare(
+            `INSERT INTO agent_thread_events (thread_id, event_type, payload_json) VALUES (?, ?, ?)`,
+          )
+          .run(threadId, eventType, payloadJson);
+  return Number(result.lastInsertRowid);
+}
+
+/** The human's typed turn — the synthetic single-text-block shape buildUserTextEvent writes. */
+function seedUserTurn(db: Database.Database, threadId: string, text: string, createdAt?: string): number {
+  return seedThreadEvent(
+    db,
+    threadId,
+    'user',
+    { type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null },
+    createdAt,
+  );
+}
+
+/** An assistant reply carrying one text block. */
+function seedAssistantTurn(db: Database.Database, threadId: string, text: string, createdAt?: string): number {
+  return seedThreadEvent(
+    db,
+    threadId,
+    'assistant',
+    {
+      type: 'assistant',
+      message: { id: `msg_${text.slice(0, 8)}`, model: 'claude', role: 'assistant', content: [{ type: 'text', text }] },
+    },
+    createdAt,
+  );
+}
+
+/** SDK tool_result plumbing — persisted as event_type 'user' but NOT a conversation turn. */
+function seedToolPlumbing(db: Database.Database, threadId: string): number {
+  return seedThreadEvent(db, threadId, 'user', {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'rows: 12' }] },
+  });
+}
+
 function seedWorkflowRow(
   db: Database.Database,
   id: string,
@@ -200,6 +268,14 @@ function seedWorkflowRow(
     name,
     JSON.stringify(definition),
   );
+}
+
+/** The shape mcp-history replies with (camelCase, mirroring mcp-queue's data). */
+interface HistoryData {
+  turns: Array<{ eventId: number; at: string; role: string; text: string; matched?: boolean }>;
+  truncated: boolean;
+  nextBeforeId: number | null;
+  scanned: number;
 }
 
 const CUSTOM_DEFINITION: WorkflowDefinition = {
@@ -914,6 +990,266 @@ describe('McpQueryHandler global-agent tool family', () => {
         socket,
       );
       expect(parseLastWrite(writes)).toMatchObject({ ok: false, error: 'agent_thread_store_unavailable' });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // cyboflow_history (mcp-history) — the assistant's long-term memory over its
+  // own agent_thread_events rows. The two contracts worth guarding hardest are
+  // THREAD SCOPING (another thread's turns must be unreachable) and the
+  // skip-plumbing rule (SDK tool_result 'user' events are not conversation).
+  // -------------------------------------------------------------------------
+
+  describe('mcp-history', () => {
+    /** Ask for history as thread-1 unless a different runId is given. */
+    async function history(
+      params: Partial<Omit<Extract<McpQueryMessage, { type: 'mcp-history' }>, 'type' | 'requestId'>> = {},
+    ): Promise<McpQueryResponse> {
+      const { socket, writes } = makeSocketDouble();
+      await handler.handleMessage(
+        { type: 'mcp-history', requestId: 'h1', runId: 'agent:thread-1', ...params },
+        socket,
+      );
+      return parseLastWrite(writes);
+    }
+
+    function historyData(res: McpQueryResponse): HistoryData {
+      expect(res.ok).toBe(true);
+      return res.data as HistoryData;
+    }
+
+    beforeEach(() => {
+      store.createThread({ id: 'thread-2' });
+    });
+
+    it('rejects a non-agent runId before any DB read', async () => {
+      expect(await history({ runId: 'run-abc' })).toMatchObject({ ok: false, error: 'not_a_global_agent_run' });
+    });
+
+    it('browse mode returns user + assistant turns newest-first, skipping tool plumbing', async () => {
+      seedUserTurn(db, 'thread-1', 'what shipped last week?');
+      seedAssistantTurn(db, 'thread-1', 'we shipped 0.2.5');
+      seedToolPlumbing(db, 'thread-1');
+      seedUserTurn(db, 'thread-1', 'and the week before?');
+
+      const data = historyData(await history());
+      expect(data.turns.map((t) => t.text)).toEqual([
+        'and the week before?',
+        'we shipped 0.2.5',
+        'what shipped last week?',
+      ]);
+      expect(data.turns.map((t) => t.role)).toEqual(['user', 'assistant', 'user']);
+      // Browse mode is not a search — no turn is flagged as a match.
+      expect(data.turns.every((t) => t.matched === undefined)).toBe(true);
+      // The tool_result row was examined (it counts toward scanned) but decoded
+      // to nothing, so it never reaches the caller.
+      expect(data.scanned).toBe(4);
+      expect(data.truncated).toBe(false);
+      expect(data.nextBeforeId).toBeNull();
+      expect(data.turns[0].at.length).toBeGreaterThan(0);
+    });
+
+    it('decodes the provider-neutral agent_user / agent_assistant rows too', async () => {
+      seedThreadEvent(db, 'thread-1', 'agent_user', {
+        type: 'agent_message',
+        role: 'user',
+        content: [{ type: 'text', text: 'from another provider' }],
+      });
+      seedThreadEvent(db, 'thread-1', 'agent_assistant', {
+        type: 'agent_message',
+        role: 'assistant',
+        id: 'am1',
+        model: 'gpt',
+        content: [{ type: 'text', text: 'answered by another provider' }],
+      });
+
+      const data = historyData(await history());
+      expect(data.turns.map((t) => [t.role, t.text])).toEqual([
+        ['assistant', 'answered by another provider'],
+        ['user', 'from another provider'],
+      ]);
+    });
+
+    it('search mode matches an assistant turn case-insensitively and excerpts around the first occurrence', async () => {
+      seedUserTurn(db, 'thread-1', 'nothing relevant here');
+      const long = `${'a'.repeat(2000)}NOTARIZATION broke again${'b'.repeat(2000)}`;
+      seedAssistantTurn(db, 'thread-1', long);
+
+      const data = historyData(await history({ query: 'notarization broke' }));
+      expect(data.turns).toHaveLength(1);
+      const [turn] = data.turns;
+      expect(turn.role).toBe('assistant');
+      expect(turn.matched).toBe(true);
+      expect(turn.text).toContain('NOTARIZATION broke again');
+      // Both ends were clipped, so both carry the ellipsis marker, and the
+      // excerpt is a window — not the whole 4KB turn.
+      expect(turn.text.startsWith('…')).toBe(true);
+      expect(turn.text.endsWith('…')).toBe(true);
+      expect(turn.text.length).toBeLessThan(long.length);
+    });
+
+    it('search mode returns an empty turns array (ok:true) when nothing matches', async () => {
+      seedUserTurn(db, 'thread-1', 'hello there');
+      const data = historyData(await history({ query: 'no-such-phrase' }));
+      expect(data.turns).toEqual([]);
+      expect(data.truncated).toBe(false);
+      expect(data.nextBeforeId).toBeNull();
+      expect(data.scanned).toBe(1);
+    });
+
+    it('role narrows the result to one side of the conversation', async () => {
+      seedUserTurn(db, 'thread-1', 'user says one');
+      seedAssistantTurn(db, 'thread-1', 'assistant says one');
+      seedUserTurn(db, 'thread-1', 'user says two');
+
+      const users = historyData(await history({ role: 'user' }));
+      expect(users.turns.map((t) => t.text)).toEqual(['user says two', 'user says one']);
+
+      const assistants = historyData(await history({ role: 'assistant' }));
+      expect(assistants.turns.map((t) => t.text)).toEqual(['assistant says one']);
+    });
+
+    it('pages with beforeId: nextBeforeId round-trips without re-emitting or skipping a turn', async () => {
+      for (let i = 1; i <= 5; i++) seedUserTurn(db, 'thread-1', `turn ${i}`);
+
+      const page1 = historyData(await history({ limit: 2 }));
+      expect(page1.turns.map((t) => t.text)).toEqual(['turn 5', 'turn 4']);
+      expect(page1.truncated).toBe(true);
+      expect(page1.nextBeforeId).toBe(page1.turns[page1.turns.length - 1].eventId);
+
+      const page2 = historyData(await history({ limit: 2, beforeId: page1.nextBeforeId! }));
+      expect(page2.turns.map((t) => t.text)).toEqual(['turn 3', 'turn 2']);
+      expect(page2.truncated).toBe(true);
+
+      const page3 = historyData(await history({ limit: 2, beforeId: page2.nextBeforeId! }));
+      expect(page3.turns.map((t) => t.text)).toEqual(['turn 1']);
+      expect(page3.truncated).toBe(false);
+      expect(page3.nextBeforeId).toBeNull();
+    });
+
+    it('a page that lands EXACTLY on the last turn is complete, not truncated', async () => {
+      // 4 turns, limit 2: page 2 consumes the remainder exactly. The walk
+      // peeks past the filled page before answering, so an even division never
+      // costs the caller a wasted empty follow-up call.
+      for (let i = 1; i <= 4; i++) seedUserTurn(db, 'thread-1', `turn ${i}`);
+
+      const page1 = historyData(await history({ limit: 2 }));
+      expect(page1.turns.map((t) => t.text)).toEqual(['turn 4', 'turn 3']);
+      expect(page1.truncated).toBe(true);
+
+      const page2 = historyData(await history({ limit: 2, beforeId: page1.nextBeforeId! }));
+      expect(page2.turns.map((t) => t.text)).toEqual(['turn 2', 'turn 1']);
+      expect(page2.truncated).toBe(false);
+      expect(page2.nextBeforeId).toBeNull();
+
+      // Same holds when the whole transcript fits one page exactly.
+      const exact = historyData(await history({ limit: 4 }));
+      expect(exact.turns).toHaveLength(4);
+      expect(exact.truncated).toBe(false);
+      expect(exact.nextBeforeId).toBeNull();
+    });
+
+    it('clamps limit to 50 and defaults to 20', async () => {
+      for (let i = 1; i <= 60; i++) seedUserTurn(db, 'thread-1', `turn ${i}`);
+
+      expect(historyData(await history({ limit: 999 })).turns).toHaveLength(50);
+      expect(historyData(await history()).turns).toHaveLength(20);
+      expect(historyData(await history({ limit: 3 })).turns).toHaveLength(3);
+    });
+
+    it('daysBack drops turns older than the window', async () => {
+      seedUserTurn(db, 'thread-1', 'ancient history', '2000-01-01 00:00:00');
+      seedUserTurn(db, 'thread-1', 'recent history');
+
+      const windowed = historyData(await history({ daysBack: 7 }));
+      expect(windowed.turns.map((t) => t.text)).toEqual(['recent history']);
+
+      const unwindowed = historyData(await history());
+      expect(unwindowed.turns).toHaveLength(2);
+    });
+
+    it('clamps a huge daysBack to the whole table instead of silently returning nothing', async () => {
+      // Unclamped, datetime('now', '-1000000000 days') is NULL in SQLite and
+      // `created_at >= NULL` filters out EVERY row — the assistant would read
+      // that as "no memory of it". Clamped (~100 years) it means "everything".
+      seedUserTurn(db, 'thread-1', 'ancient history', '2000-01-01 00:00:00');
+      seedUserTurn(db, 'thread-1', 'recent history');
+
+      const data = historyData(await history({ daysBack: 1_000_000_000 }));
+      expect(data.turns.map((t) => t.text)).toEqual(['recent history', 'ancient history']);
+    });
+
+    it('NEVER returns another thread\'s turns', async () => {
+      seedUserTurn(db, 'thread-2', 'a secret from another thread');
+      seedAssistantTurn(db, 'thread-2', 'another thread reply');
+      seedUserTurn(db, 'thread-1', 'my own turn');
+
+      const browse = historyData(await history());
+      expect(browse.turns.map((t) => t.text)).toEqual(['my own turn']);
+
+      const searched = historyData(await history({ query: 'thread' }));
+      expect(searched.turns).toEqual([]);
+      // Only thread-1's single row was ever examined.
+      expect(searched.scanned).toBe(1);
+    });
+
+    it('treats the query as a LITERAL substring, never a regex (ReDoS-proof by construction)', async () => {
+      // '[unclosed' would throw as a regex and '^(a+)+b$' would be a
+      // catastrophic-backtracking bomb; as literals both are just text.
+      seedUserTurn(db, 'thread-1', 'the [unclosed bracket case');
+      seedUserTurn(db, 'thread-1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX');
+
+      const literal = historyData(await history({ query: '[unclosed' }));
+      expect(literal.turns.map((t) => t.text)).toEqual(['the [unclosed bracket case']);
+      expect(literal.turns[0].matched).toBe(true);
+
+      // The classic ReDoS pattern returns instantly with no match — it is
+      // compared as characters, not compiled.
+      const bomb = historyData(await history({ query: '^(a+)+b$' }));
+      expect(bomb.turns).toEqual([]);
+    });
+
+    it('rejects a malformed role / non-positive numeric argument', async () => {
+      const badRole = await history({ role: 'nobody' as unknown as 'user' });
+      expect(badRole.ok).toBe(false);
+      expect(badRole.error).toMatch(/^invalid_arguments: role/);
+
+      for (const bad of [{ limit: 0 }, { limit: -5 }, { daysBack: 0 }, { beforeId: Number.NaN }]) {
+        const res = await history(bad);
+        expect(res.ok).toBe(false);
+        expect(res.error).toMatch(/^invalid_arguments: (limit|daysBack|beforeId)/);
+      }
+    });
+
+    it('treats an empty query as browse mode rather than a match-everything regex', async () => {
+      seedUserTurn(db, 'thread-1', 'plain turn');
+      const data = historyData(await history({ query: '' }));
+      expect(data.turns.map((t) => t.text)).toEqual(['plain turn']);
+      expect(data.turns[0].matched).toBeUndefined();
+    });
+
+    it('stops on the ~100KB payload ceiling before the limit, and resumes without skipping a turn', async () => {
+      // Per-turn text is clipped to ~700 CHARS, so the byte ceiling only binds
+      // on wide characters: 700 CJK chars are ~2.1KB of UTF-8 each, and 50 of
+      // those overshoot 100KB — the guard must stop short of the limit.
+      const wide = '漢'.repeat(900);
+      for (let i = 1; i <= 60; i++) seedUserTurn(db, 'thread-1', `${i} ${wide}`);
+
+      const data = historyData(await history({ limit: 50 }));
+      expect(data.truncated).toBe(true);
+      expect(data.turns.length).toBeGreaterThan(0);
+      expect(data.turns.length).toBeLessThan(50);
+      // The ceiling bounds the SUM OF TURNS; the array's own commas/brackets
+      // add a byte per turn on top, hence the small slack here.
+      expect(Buffer.byteLength(JSON.stringify(data.turns), 'utf8')).toBeLessThan(101_000);
+      expect(data.nextBeforeId).not.toBeNull();
+
+      // The rejected row is re-offered by the continuation cursor: no turn is
+      // lost between the pages, and none is emitted twice.
+      const resumed = historyData(await history({ limit: 50, beforeId: data.nextBeforeId! }));
+      const seen = [...data.turns, ...resumed.turns].map((t) => t.eventId);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(Math.min(...seen)).toBe(Math.max(...seen) - seen.length + 1); // contiguous ids
     });
   });
 });

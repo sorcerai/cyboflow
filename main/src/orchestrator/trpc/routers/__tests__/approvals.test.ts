@@ -34,7 +34,7 @@ afterEach(() => {
 
 describe('cyboflow.approvals.listPending', () => {
   it('listPending returns [] when the approvals table is empty', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     const caller = appRouter.createCaller(createContext({ db: adapter }));
 
@@ -43,7 +43,7 @@ describe('cyboflow.approvals.listPending', () => {
   });
 
   it('listPending returns shaped Approval[] rows oldest-first (created_at ASC)', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     seedRun(db, { id: 'run-list-1' });
@@ -76,7 +76,7 @@ describe('cyboflow.approvals.listPending', () => {
   });
 
   it('listPending truncates payloadPreview to 512 chars', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     seedRun(db, { id: 'run-trunc' });
@@ -92,7 +92,7 @@ describe('cyboflow.approvals.listPending', () => {
 
 describe('cyboflow.approvals.approve', () => {
   it('approve(approvalId) resolves the in-flight decisionPromise with {behavior:"allow"}', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     ApprovalRouter.initialize(adapter);
     const router = ApprovalRouter.getInstance();
@@ -142,7 +142,7 @@ describe('cyboflow.approvals.approve', () => {
   });
 
   it('approve(unknownId) throws TRPCError code=NOT_FOUND', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     ApprovalRouter.initialize(adapter);
 
@@ -156,7 +156,7 @@ describe('cyboflow.approvals.approve', () => {
 
 describe('cyboflow.approvals.reject', () => {
   it('reject(approvalId, message) resolves the decisionPromise with {behavior:"deny", message}', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     ApprovalRouter.initialize(adapter);
     const approvalRouter = ApprovalRouter.getInstance();
@@ -202,7 +202,7 @@ describe('cyboflow.approvals.reject', () => {
   });
 
   it('reject(unknownId) throws TRPCError code=NOT_FOUND', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
     ApprovalRouter.initialize(adapter);
 
@@ -216,7 +216,7 @@ describe('cyboflow.approvals.reject', () => {
 
 describe('cyboflow.approvals.approveRestOfRun', () => {
   it('approveRestOfRun returns { decided: N } and leaves other run untouched', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     // Seed two runs with direct DB inserts (no ApprovalRouter needed here).
@@ -255,7 +255,7 @@ describe('cyboflow.approvals.approveRestOfRun', () => {
 
 describe('cyboflow.approvals.rejectRestOfRun', () => {
   it('rejectRestOfRun returns { decided: N } and leaves other run untouched', async () => {
-    const db = createTestDb();
+    const db = createTestDb({ includeStuckDetectedAt: true });
     const adapter = dbAdapter(db);
 
     seedRun(db, { id: 'run-rrr-a' });

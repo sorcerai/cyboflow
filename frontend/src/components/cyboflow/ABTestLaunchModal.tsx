@@ -33,7 +33,8 @@ import { trpc } from '../../trpc/client';
 import { useWorkflowVariants } from '../../stores/variantsStore';
 import { pickableVariants } from './variantSelectorLogic';
 import { BASELINE_VARIANT_SENTINEL, QUICK_ARM_SENTINEL } from '../../../../shared/types/experiments';
-import { SPRINT_BATCH_MAX_TASKS } from '../../../../shared/types/sprintBatch';
+import { resolveSprintMaxTasks } from '../../../../shared/types/sprintBatch';
+import { useConfigStore } from '../../stores/configStore';
 import type { BacklogTaskItem, Board } from '../../../../shared/types/tasks';
 import type { PermissionMode } from '../../../../shared/types/workflows';
 import { effortLevelsForProvider, type ReasoningEffort } from '../../../../shared/types/reasoningEffort';
@@ -241,13 +242,6 @@ export interface ABTestLaunchModalProps {
   onClose: () => void;
 }
 
-/**
- * The A/B seed-task cap. The experiment defaults to the 'sdk' substrate (the
- * modal has no substrate picker), and startExperiment enforces the same cap
- * server-side; the picker disables checkboxes past it (defense in depth).
- */
-const SEED_TASK_CAP = SPRINT_BATCH_MAX_TASKS.sdk;
-
 export function ABTestLaunchModal({
   isOpen,
   projectId,
@@ -257,6 +251,15 @@ export function ABTestLaunchModal({
   onClose,
 }: ABTestLaunchModalProps): React.JSX.Element {
   const isSprint = workflowName === 'sprint';
+  /**
+   * The A/B seed-task cap. The experiment defaults to the 'sdk' substrate (the
+   * modal has no substrate picker), so the cap is the sdk rung of the user's
+   * Settings override layered over the built-in default — the SAME value
+   * startExperiment enforces server-side; the picker disables checkboxes past it
+   * (defense in depth).
+   */
+  const sprintMaxTasks = useConfigStore((state) => state.config?.sprintMaxTasks);
+  const seedTaskCap = resolveSprintMaxTasks(sprintMaxTasks, 'sdk');
   // The project whose backlog seeds this experiment. Defaults to the caller's
   // `projectId` (for a GLOBAL flow, a guess); a >1-project picker lets the user
   // correct it. The modal unmounts on close, so this re-initialises per open.
@@ -373,19 +376,19 @@ export function ABTestLaunchModal({
 
   // Eligible (selectable) seed tasks: not already in-flight in another run.
   const selectableTasks = useMemo(() => seedTasks.filter((t) => t.inFlow.length === 0), [seedTasks]);
-  const atTaskCap = selectedTaskIds.size >= SEED_TASK_CAP;
+  const atTaskCap = selectedTaskIds.size >= seedTaskCap;
 
   const toggleTask = (taskId: string): void => {
     setSelectedTaskIds((prev) => {
       const next = new Set(prev);
       if (next.has(taskId)) next.delete(taskId);
-      else if (next.size < SEED_TASK_CAP) next.add(taskId);
+      else if (next.size < seedTaskCap) next.add(taskId);
       return next;
     });
   };
 
   const selectAllTasks = (): void => {
-    setSelectedTaskIds(new Set(selectableTasks.slice(0, SEED_TASK_CAP).map((t) => t.id)));
+    setSelectedTaskIds(new Set(selectableTasks.slice(0, seedTaskCap).map((t) => t.id)));
   };
 
   // Select/deselect a whole epic group's tasks, honoring the seed-task cap.
@@ -397,7 +400,7 @@ export function ABTestLaunchModal({
         return next;
       }
       for (const id of taskIds) {
-        if (next.size >= SEED_TASK_CAP) break;
+        if (next.size >= seedTaskCap) break;
         next.add(id);
       }
       return next;
@@ -664,7 +667,7 @@ export function ABTestLaunchModal({
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium text-text-secondary">
                       Seed tasks (required) · selected{' '}
-                      <span className="font-semibold text-text-primary">{selectedTaskIds.size}</span>/{SEED_TASK_CAP}
+                      <span className="font-semibold text-text-primary">{selectedTaskIds.size}</span>/{seedTaskCap}
                     </span>
                     <button
                       type="button"

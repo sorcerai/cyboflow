@@ -636,6 +636,49 @@ function readDesignSessionPrompt(): string {
   return cachedDesignSessionPrompt;
 }
 
+/** Cache for the idea-session first-turn prompt (read once per process). */
+let cachedIdeaSessionPrompt: string | null = null;
+
+/**
+ * The idea-session first-turn prompt (idea-session.md), loaded the SAME way as
+ * {@link readDesignSessionPrompt} — a `join(__dirname, …)` against the compiled
+ * workflow-prompt bundle `copy-workflow-assets.js` ships alongside the built-in
+ * flow prompts, so the relative resolve works in both dev (source tree) and
+ * packaged builds. Like design.md, idea-session.md carries NO frontmatter (a
+ * pure prompt body), so it is read + trimmed verbatim. Cached module-wide — the
+ * file never changes at runtime; a read failure is surfaced rather than
+ * silently stripping the idea-session's operating contract.
+ */
+function readIdeaSessionPrompt(): string {
+  if (cachedIdeaSessionPrompt !== null) return cachedIdeaSessionPrompt;
+  const promptPath = path.join(__dirname, '..', '..', '..', 'orchestrator', 'workflows', 'idea-session.md');
+  cachedIdeaSessionPrompt = fs.readFileSync(promptPath, 'utf-8').trim();
+  return cachedIdeaSessionPrompt;
+}
+
+/**
+ * Resolve the `Linked idea: <REF> (<id>) — <title>` line appended to an idea
+ * session's first-turn prompt (see `readIdeaSessionPrompt`'s caller). Reads
+ * fresh from `ideas` per spawn — restart-safe and reflects a rename that
+ * happened between turns — using the same direct-table-by-id pattern
+ * `mcpQueryHandler`'s design-scope idea lookup uses (ideas carry `ref`/`title`
+ * directly; no join needed). On any lookup miss (the idea was deleted,
+ * decomposed, or the row is otherwise gone) falls back to the raw id so the
+ * agent still knows which idea it's linked to even when the friendly ref/title
+ * can't be resolved.
+ */
+function resolveLinkedIdeaLine(db: Database.Database, ideaId: string): string {
+  const row = db.prepare('SELECT ref, title FROM ideas WHERE id = ?').get(ideaId) as
+    | { ref?: unknown; title?: unknown }
+    | undefined;
+  const ref = typeof row?.ref === 'string' ? row.ref : null;
+  const title = typeof row?.title === 'string' ? row.title : null;
+  if (ref !== null && title !== null) {
+    return `\n\nLinked idea: ${ref} (${ideaId}) — ${title}`;
+  }
+  return `\n\nLinked idea: ${ideaId}`;
+}
+
 /**
  * The minimal contract an injected per-spawn events sink must satisfy (S0.2(c)).
  *
@@ -1501,7 +1544,19 @@ export class ClaudeCodeManager extends AbstractCliManager {
       // lifetime), decremented once at process-death by removeBundleForSession — a
       // warm turn re-writes the bundle (driveWarmTurn) but does NOT re-bump.
       if (!dbSession?.in_place) {
-        installWorkflowBundle(this.db, this.bundleWriter, runId, options.worktreePath, makeLoggerLike(this.logger));
+        // 'prose' EXPLICITLY: this install seam is substrate-shared, but the SDK
+        // path composes its prompt through workflowPromptReaderAdapter (which
+        // never emits the workflow-dispatch chain), so stage scripts written
+        // here would be inert files in an SDK worktree. Pinned rather than
+        // defaulted so the intent survives a change to the default.
+        installWorkflowBundle(
+          this.db,
+          this.bundleWriter,
+          runId,
+          options.worktreePath,
+          makeLoggerLike(this.logger),
+          'prose',
+        );
         this.bundleWorktrees.set(sessionId, options.worktreePath);
         this.bundleRefcountBySession.set(sessionId, (this.bundleRefcountBySession.get(sessionId) ?? 0) + 1);
       }
@@ -1539,7 +1594,13 @@ export class ClaudeCodeManager extends AbstractCliManager {
       const priorRefcount = this.trackerRefcountByRunId.get(runId) ?? 0;
       this.trackerRefcountByRunId.set(runId, priorRefcount + 1);
       if (priorRefcount === 0) {
-        DynamicWorkflowTracker.tryGetInstance()?.attachToRouter(router, { runId, sessionId });
+        // worktreePath explicitly (see the interactive sibling): a flow run has no
+        // `sessions` row, so the tracker's sessions-keyed fallback resolves nothing.
+        DynamicWorkflowTracker.tryGetInstance()?.attachToRouter(router, {
+          runId,
+          sessionId,
+          worktreePath: options.worktreePath,
+        });
       }
 
       // Abort controller for cancellation.
@@ -3630,7 +3691,9 @@ export class ClaudeCodeManager extends AbstractCliManager {
    * tool `input` unchanged:
    *   - AskUserQuestion → QuestionRouter (see below), NEVER ApprovalRouter;
    *   - allowlist short-circuit (defense-in-depth: honor user/project grants even on
-   *     the auto path) → { behavior: 'allow', updatedInput: input };
+   *     the auto path) → { behavior: 'allow', updatedInput: input } — SKIPPED when
+   *     `opts.matchedAskRule` is set, i.e. a user `permissions.ask` rule forced this
+   *     prompt, which the SDK contract says a host-side auto-approver must respect;
    *   - allow → { behavior: 'allow', updatedInput: decision.updatedInput ?? input };
    *   - deny  → { behavior: 'deny', message } (message is MANDATORY on deny);
    *   - RunNotRunningError → { behavior: 'deny', message: 'Run not active' };
@@ -3715,7 +3778,16 @@ export class ClaudeCodeManager extends AbstractCliManager {
       // `updatedInput: input` echoes the original tool input unchanged — MANDATORY
       // on the allow branch (the CLI's can_use_tool response schema requires a
       // record; a bare `{ behavior: 'allow' }` ZodErrors → see makeCanUseTool doc).
-      if (isToolAllowed(toolName, input, allowRules)) {
+      //
+      // `matchedAskRule` (agent-sdk 0.3.224+) VETOES that shortcut. The CLI sets it
+      // when a user-configured `permissions.ask` rule forced this prompt, and the
+      // SDK contract is explicit that a host running its own auto-approval must
+      // treat such an ask as rule-forced — the user's stated intent IS a human
+      // prompt. Our own `ask` handling in isToolAllowed covers the rules this
+      // module can parse; this covers the rest (path globs and any future
+      // specifier kind the CLI understands and we do not), so an ask the CLI
+      // recognized can never be swallowed by a broader local allow rule.
+      if (opts.matchedAskRule === undefined && isToolAllowed(toolName, input, allowRules)) {
         return { behavior: 'allow', updatedInput: pinDispatchInput(input) };
       }
       try {
@@ -4350,6 +4422,18 @@ export class ClaudeCodeManager extends AbstractCliManager {
     // warm reuse is unaffected.
     const designIdeaId = this.sessionManager.getDbSession(sessionId)?.design_idea_id;
     const isDesignSession = typeof designIdeaId === 'string' && designIdeaId.length > 0;
+    // Idea session (idea-session.md): a quick session linked to an idea via
+    // sessions.home_idea_id (migration 113) is that idea's persistent home —
+    // Read/Grep/Glob only (no code-writing tools; this is a thinking space, not
+    // an implementation session) plus the idea-session first-turn prompt and a
+    // per-spawn "Linked idea" line. Design branch checked FIRST and left
+    // byte-identical: a session can't be both. Deliberately carries NO mcpScope
+    // — the full run-scoped cyboflow MCP family (cyboflow_get_task,
+    // cyboflow_update_task, cyboflow_set_idea_component, …) is intentional here,
+    // unlike design's minimal scoped toolset.
+    const rawHomeIdeaId = this.sessionManager.getDbSession(sessionId)?.home_idea_id;
+    const homeIdeaId =
+      !isDesignSession && typeof rawHomeIdeaId === 'string' && rawHomeIdeaId.length > 0 ? rawHomeIdeaId : null;
     const options: ClaudeSpawnOptions = {
       panelId,
       sessionId,
@@ -4362,7 +4446,12 @@ export class ClaudeCodeManager extends AbstractCliManager {
       reasoningEffort,
       ...(isDesignSession
         ? { mcpScope: 'design' as const, systemPromptAppend: readDesignSessionPrompt() }
-        : {}),
+        : homeIdeaId !== null
+          ? {
+              tools: ['Read', 'Grep', 'Glob'],
+              systemPromptAppend: readIdeaSessionPrompt() + resolveLinkedIdeaLine(this.db, homeIdeaId),
+            }
+          : {}),
       // Quick/legacy SDK sessions resolve their 4-mode agent permission from the
       // per-session override (sessions.agent_permission_mode, migration 021) when
       // set, else the GLOBAL default — so both the Settings control AND the

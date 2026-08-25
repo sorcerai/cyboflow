@@ -82,15 +82,22 @@ export function useUnifiedPanelMessages(
   const [messages, setMessages] = useState<UnifiedMessage[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  // Guard against concurrent loads (the live event can fire mid-load).
+  // Guard against concurrent loads (the live event can fire mid-load). A
+  // blocked load is remembered below: dropping it can strand the optimistic
+  // pending-send row forever when the in-flight request returns a snapshot from
+  // before the user turn was persisted.
   const isLoadingRef = useRef(false);
+  const reloadRequestedRef = useRef(false);
   // Stash the latest loader so the live-event effect can call it without
   // re-registering the listener on every loader identity change.
   const loadRef = useRef<(() => Promise<void>) | null>(null);
 
   const loadMessages = useCallback(async (): Promise<void> => {
     if (!enabled || !panelId) return;
-    if (isLoadingRef.current) return;
+    if (isLoadingRef.current) {
+      reloadRequestedRef.current = true;
+      return;
+    }
     isLoadingRef.current = true;
     try {
       setLoadError(null);
@@ -129,6 +136,14 @@ export function useUnifiedPanelMessages(
     } finally {
       setIsLoading(false);
       isLoadingRef.current = false;
+      // Coalesce any number of output notifications received during this fetch
+      // into one trailing refresh. Use loadRef so a panel switch that happened
+      // while the old request was in flight reloads the current panel instead
+      // of replaying this callback's stale panelId closure.
+      if (reloadRequestedRef.current) {
+        reloadRequestedRef.current = false;
+        void loadRef.current?.();
+      }
     }
   }, [enabled, panelId, transformer]);
 
@@ -139,6 +154,7 @@ export function useUnifiedPanelMessages(
   // Initial load on panelId change.
   useEffect(() => {
     if (!enabled || !panelId) {
+      reloadRequestedRef.current = false;
       setMessages([]);
       setLoadError(null);
       setIsLoading(false);

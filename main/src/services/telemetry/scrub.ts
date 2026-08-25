@@ -1,4 +1,4 @@
-import type { Event, Breadcrumb } from '@sentry/electron/main';
+import type { Event, Breadcrumb, StackFrame } from '@sentry/electron/main';
 
 /**
  * Privacy scrubbing for Sentry payloads.
@@ -8,7 +8,8 @@ import type { Event, Breadcrumb } from '@sentry/electron/main';
  * Sentry's `beforeSend` / `beforeBreadcrumb` hooks to strip:
  *   - server/host names
  *   - the `extra` and `user` bags (may carry prompts / PII)
- *   - directory components of stack-frame paths (basename only)
+ *   - directory components of stack-frame paths, JS (filename/abs_path) and
+ *     native (package) alike (basename only)
  *   - absolute home paths inside messages / exception values (-> '~/')
  *   - console breadcrumbs entirely (they contain code/prompts)
  *
@@ -63,6 +64,66 @@ export function isBenignStreamWriteEpipe<T extends Event>(event: T): boolean {
   }
   return false;
 }
+
+/**
+ * Electron process types that the SDK could not identify. The startup minidump
+ * sweep stamps `'event.process'` from crashpad's `process_type` annotation,
+ * falling back to the literal `'unknown'` when the annotation is absent
+ * (@sentry/electron `sentry-minidump/index.js`, the `sendNativeCrashes` call in
+ * `setup()`).
+ */
+const UNIDENTIFIED_PROCESS = 'unknown';
+
+/**
+ * Stamp `crash_source` on a NATIVE crash event: `'app'` for one of cyboflow's
+ * own Electron processes, `'external-process'` for anything else.
+ *
+ * WHY THIS EXISTS. `Sentry.init` starts Electron's crashReporter, which installs
+ * a Crashpad handler by setting the task exception port — and on macOS that port
+ * is INHERITED across fork/exec. Every process spawned beneath the app therefore
+ * reports its crashes into cyboflow's project under `_productName: cyboflow`: the
+ * bundled `peekaboo` / `codex` binaries we drive on purpose, and also whatever a
+ * session agent shells out to (a `vitest` worker OOMing mid `pnpm test:unit` is
+ * the observed case). Untagged, all of it reads as "cyboflow crashed" —
+ * CYBOFLOW-APP-J spent six weeks merging two unrelated failure modes because
+ * `__pthread_kill` was the only symbolicated frame in either.
+ *
+ * WHY THE TAG AND NOT A DROP. The split we actually want — our own binaries
+ * (a peekaboo crash means native-screen verification is broken, which IS our
+ * bug) vs. an agent's stray descendant — needs thread names and the module list.
+ * Those live in the minidump, which rides along as an opaque ATTACHMENT and is
+ * symbolicated server-side; `beforeSend` sees crashpad annotations only. So the
+ * finer split belongs in Sentry's fingerprinting rules, and dropping here would
+ * be all-or-nothing across a boundary we cannot see. Tag, never discard.
+ *
+ * DIRECTION OF FAILURE. Only an explicitly unidentified process is called
+ * external. A named renderer (`getRendererName`) or a process type Electron adds
+ * later stays `'app'` — misfiling one of OUR crashes as external noise is the
+ * expensive mistake, so the ambiguous case fails toward us.
+ *
+ * Non-native events are left alone: JS errors already carry a trustworthy
+ * `'event.process'` from the SDK's context integration and were never ambiguous.
+ */
+export function tagCrashSource<T extends Event>(event: T): T {
+  if (event.platform !== 'native') return event;
+
+  const process = event.tags?.['event.process'];
+  const unidentified = typeof process !== 'string' || process === UNIDENTIFIED_PROCESS;
+
+  event.tags = { ...event.tags, crash_source: unidentified ? 'external-process' : 'app' };
+  return event;
+}
+
+/**
+ * A stack frame as it actually arrives from a NATIVE minidump.
+ *
+ * The SDK's `StackFrame` models JS frames and omits `package`, but the Sentry
+ * event protocol defines it for native frames — it is the path to the owning
+ * binary or dylib, and on a minidump it is the ONLY path field set
+ * (filename/abs_path stay undefined). Observed live on CYBOFLOW-APP-J:
+ * `/Users/<name>/.nvm/versions/node/<ver>/bin/node`.
+ */
+type FrameWithPackage = StackFrame & { package?: string };
 
 /** Return the final path segment, splitting on both POSIX and Windows separators. */
 function basename(p: string): string {
@@ -131,6 +192,17 @@ export function scrubSentryEvent<T extends Event>(event: T): T | null {
           }
           if (typeof frame.abs_path === 'string') {
             frame.abs_path = basename(frame.abs_path);
+          }
+          // NATIVE frames carry their path on `package` (the owning binary or
+          // dylib) and leave filename/abs_path unset, so the two rules above
+          // never reach them — minidump frames were shipping absolute paths
+          // like '/Users/<name>/.nvm/.../bin/node' intact. Basename keeps the
+          // whole diagnostic value (the module name is what identifies the
+          // crashing binary, and what server-side grouping rules match on)
+          // while dropping the home directory and toolchain layout.
+          const nativeFrame = frame as FrameWithPackage;
+          if (typeof nativeFrame.package === 'string') {
+            nativeFrame.package = basename(nativeFrame.package);
           }
         }
       }

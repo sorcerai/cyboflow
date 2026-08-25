@@ -188,10 +188,18 @@ describe('mappingTargetToStageId', () => {
 
   it('never targets the orchestrator-derived In-development stage', () => {
     const stageIds = resolveStageIds(raw, 1);
-    const targeted = (['dont', 'idea', 'ready', 'done', 'wontdo'] as const).map((t) =>
+    // 'indev' is in this list deliberately: it NAMES that stage but must still
+    // never resolve to it inbound, because a tracker actor writing a derived
+    // stage is rejected as 'forbidden_stage'.
+    const targeted = (['dont', 'idea', 'ready', 'done', 'wontdo', 'indev'] as const).map((t) =>
       mappingTargetToStageId(t, stageIds),
     );
     expect(targeted).not.toContain(STAGE.inDevelopment);
+  });
+
+  it('resolves the outbound-only target to no inbound stage at all', () => {
+    const stageIds = resolveStageIds(raw, 1);
+    expect(mappingTargetToStageId('indev', stageIds)).toBeNull();
   });
 });
 
@@ -222,5 +230,35 @@ describe('pickWriteBackState', () => {
     const noStarted = STATES.filter((s) => s.group !== 'started');
     expect(pickWriteBackState(noStarted, 'started')).toBeNull();
     expect(pickWriteBackState([], 'completed')).toBeNull();
+  });
+
+  it("an 'indev' pin overrides the group guess for the started write-back", () => {
+    // 'In Review' is the SECOND started state, so first-in-order would never
+    // choose it. Pinning is the user overriding that choice.
+    const mapping = { 'st-review': 'indev' } as const;
+    expect(pickWriteBackState(STATES, 'started', mapping)?.id).toBe('st-review');
+  });
+
+  it("an 'indev' pin wins even when the pinned state's own group disagrees", () => {
+    // The whole point on a provider whose groups are INFERRED from names: the
+    // pin must beat a misclassification, not lose to it.
+    const mapping = { 'st-todo': 'indev' } as const;
+    expect(pickWriteBackState(STATES, 'started', mapping)?.id).toBe('st-todo');
+  });
+
+  it("rescues a workspace where NOTHING infers as 'started'", () => {
+    const noStarted = STATES.filter((s) => s.group !== 'started');
+    expect(pickWriteBackState(noStarted, 'started')).toBeNull();
+    expect(pickWriteBackState(noStarted, 'started', { 'st-todo': 'indev' })?.id).toBe('st-todo');
+  });
+
+  it('leaves the other groups alone — the pin is started-only', () => {
+    const mapping = { 'st-todo': 'indev' } as const;
+    expect(pickWriteBackState(STATES, 'completed', mapping)?.id).toBe('st-done');
+    expect(pickWriteBackState(STATES, 'cancelled', mapping)?.id).toBe('st-canceled');
+  });
+
+  it('falls back to first-in-order when nothing is pinned', () => {
+    expect(pickWriteBackState(STATES, 'started', { 'st-todo': 'ready' })?.id).toBe('st-progress');
   });
 });

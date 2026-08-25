@@ -32,6 +32,31 @@ export const TERMINAL_RUN_STATUSES_SQL_IN = `('${TERMINAL_RUN_STATUSES.join(
   "','",
 )}')`;
 
+/**
+ * `workflow_runs.outcome` values that mean THE SESSION'S WORK WAS DELIVERED —
+ * it reached the project's main line (or is on its way there via a pushed
+ * branch) rather than being thrown away.
+ *
+ *   'merged'    — squash/rebase merged into main through our own merge path.
+ *   'integrated'— the per-task close-out: merged into a sprint integration branch.
+ *   'completed' — the work landed by a path we did not observe (the agent merged
+ *                 it in chat, the user merged outside the app). Stamped ONLY by
+ *                 the explicit "Mark complete" human action.
+ *   'pr_open'   — the branch was pushed and a PR opened; delivery is in flight.
+ *
+ * This is the ONE predicate behind three behaviours that must never disagree:
+ * the archive sweeps preserve a delivered session's FINDINGS (they describe code
+ * that is now in the tree, so they still apply), and the Insights compounding
+ * surface only offers findings whose work actually landed. A run outcome absent
+ * from this list ('dismissed' / 'failed' / 'canceled' / 'interrupted') means the
+ * work never landed, so its findings are a no-op and are swept.
+ */
+export const DELIVERED_RUN_OUTCOMES = ['merged', 'integrated', 'completed', 'pr_open'] as const;
+export type DeliveredRunOutcome = (typeof DELIVERED_RUN_OUTCOMES)[number];
+export const DELIVERED_RUN_OUTCOMES_SQL_IN = `('${DELIVERED_RUN_OUTCOMES.join(
+  "','",
+)}')`;
+
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'timed_out';
 
 /**

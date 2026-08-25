@@ -11,7 +11,8 @@
  * persist → reuse → re-derive on drift" that touch persistence:
  * {@link VerifyRunbookStore.registerDraft} (persist a derived revision),
  * {@link VerifyRunbookStore.markProven} (the engine's proof flip),
- * {@link VerifyRunbookStore.status} (reuse + drift detection), and
+ * {@link VerifyRunbookStore.status} (reuse + drift detection — and its
+ * situation-preserving sibling {@link VerifyRunbookStore.statusDetail}), and
  * {@link VerifyRunbookStore.getByHash} (the runner's pin resolution).
  *
  * THE ONE INVARIANT WORTH RE-READING: `'proven'` is not a flag someone sets, it
@@ -70,6 +71,65 @@ import { runbookPortableHash } from './runbookHash';
  * degradation; `'unproven-draft'` is deliberately NOT a pass.
  */
 export type VerifyRunbookStatus = 'proven' | 'unproven-draft' | 'absent';
+
+/**
+ * WHY the same answer is not always the same situation.
+ *
+ * `status()` is deliberately three-valued because that is all its one consumer
+ * — the §3.2 degrade gate — can act on: proven, or not. But `'unproven-draft'`
+ * is a collapse of genuinely different facts, and a caller that intends to
+ * *write* rather than merely gate has to tell them apart. The motivating case
+ * (lane-runbook-bootstrap.md §4): `registerDraft` UPSERTs a SINGLETON
+ * `(project_id, modality)` row, so a caller that reacts to `'unproven-draft'`
+ * by deriving a fresh runbook would, on a branch that merely predates the
+ * runbook merge, overwrite the proven record every OTHER branch depends on —
+ * breaking verification precisely for the projects that set it up properly.
+ *
+ * The discriminant, by situation:
+ *
+ *  - `'proven'` — the full conjunction holds. The only reason paired with a
+ *    `'proven'` status.
+ *  - `'no-record'` — nothing persisted and no usable portable file. Nothing was
+ *    ever derived for this (project, modality); there is no proof to endanger.
+ *  - `'file-only'` — no record, but THIS tree carries a portable file that
+ *    parses and declares the modality (a teammate's committed runbook, freshly
+ *    cloned). Distinct from `'no-record'` because the right response is to
+ *    ADOPT and prove what is already there, not to author a competing one.
+ *  - `'draft'` — a record exists and is marked `'unproven-draft'`. There is no
+ *    proof to endanger, so re-deriving over it is safe.
+ *  - `'proven-file-absent-here'` — a record is PROVEN and this tree simply
+ *    lacks the portable file. The documented pre-merge case (see the class
+ *    doc's deliberate exception): the honest answer for this probe path is
+ *    `'unproven-draft'`, but the record is live and someone else's. **Never
+ *    write over this one** — the resolution is to merge the branch carrying
+ *    the file, not to derive a new runbook.
+ *  - `'drifted'` — a proven record was just DEMOTED by this very read (hash,
+ *    project-input, or host-fingerprint mismatch). The proof is already gone;
+ *    the record now reads `'unproven-draft'` for everyone.
+ *  - `'indeterminate'` — the store could not observe enough to answer (a
+ *    pre-096 DB, a SQL error, an input hash that would not compute). Fails soft
+ *    to `'absent'` like everything else here, but is NOT evidence that nothing
+ *    exists, and a writing caller must treat it as "do not touch".
+ *
+ * Note this is a superset of the four discriminants the proposal named: two
+ * situations `status()` already distinguishes internally (`'file-only'`, and
+ * the two fail-soft `'absent'` paths) collapse to the wrong answer if folded
+ * into the others, and the whole point of this type is not to collapse things.
+ */
+export type VerifyRunbookStatusReason =
+  | 'proven'
+  | 'no-record'
+  | 'file-only'
+  | 'draft'
+  | 'proven-file-absent-here'
+  | 'drifted'
+  | 'indeterminate';
+
+/** The three-valued gate answer plus the situation that produced it. */
+export interface VerifyRunbookStatusDetail {
+  status: VerifyRunbookStatus;
+  reason: VerifyRunbookStatusReason;
+}
 
 /**
  * Environment-specific IO the store needs but must not import (see the class
@@ -175,6 +235,25 @@ export class VerifyRunbookStore {
     probePath: string,
     modality: VerificationModality,
   ): Promise<VerifyRunbookStatus> {
+    return (await this.statusDetail(projectId, probePath, modality)).status;
+  }
+
+  /**
+   * {@link VerifyRunbookStore.status}, plus WHICH of the situations behind the
+   * answer produced it — see {@link VerifyRunbookStatusReason} for the full
+   * enumeration and why the collapse is unsafe for a caller that writes.
+   *
+   * This is the real implementation; `status()` is a projection of it, so the
+   * gate's answer and a writing caller's answer can never be computed by two
+   * code paths that drift. It has the same side effect the three-valued version
+   * always had — a drift check that fails DEMOTES the record write-through — so
+   * asking for the detail is not a cheaper or more passive read.
+   */
+  async statusDetail(
+    projectId: number,
+    probePath: string,
+    modality: VerificationModality,
+  ): Promise<VerifyRunbookStatusDetail> {
     try {
       const row = this.readRow(projectId, modality);
 
@@ -184,22 +263,26 @@ export class VerifyRunbookStore {
       if (!row) {
         // Nothing persisted. A parseable file that declares this modality is a
         // derived-but-never-proven runbook; anything else is genuinely absent.
-        if (parsedFile && this.declaresModality(parsedFile, modality)) return 'unproven-draft';
-        return 'absent';
+        if (parsedFile && this.declaresModality(parsedFile, modality)) {
+          return { status: 'unproven-draft', reason: 'file-only' };
+        }
+        return { status: 'absent', reason: 'no-record' };
       }
 
-      if (row.status !== 'proven') return 'unproven-draft';
+      if (row.status !== 'proven') return { status: 'unproven-draft', reason: 'draft' };
 
       // The pre-merge case: this tree simply does not carry the file. Report
       // honestly for THIS probe path without touching the record.
-      if (rawFile === null) return 'unproven-draft';
+      if (rawFile === null) {
+        return { status: 'unproven-draft', reason: 'proven-file-absent-here' };
+      }
 
       if (!parsedFile) {
-        return this.demote(projectId, modality, 'portable file no longer parses');
+        return this.demoted(projectId, modality, 'portable file no longer parses');
       }
       const freshHash = runbookPortableHash(parsedFile);
       if (freshHash !== row.portable_hash) {
-        return this.demote(projectId, modality, 'portable runbook hash drift');
+        return this.demoted(projectId, modality, 'portable runbook hash drift');
       }
 
       const freshInputHash = await this.deps.computeInputHash(probePath);
@@ -210,18 +293,18 @@ export class VerifyRunbookStore {
           modality,
           probePath,
         });
-        return 'absent';
+        return { status: 'absent', reason: 'indeterminate' };
       }
       if (freshInputHash !== row.input_hash) {
-        return this.demote(projectId, modality, 'project input hash drift');
+        return this.demoted(projectId, modality, 'project input hash drift');
       }
 
       const freshFingerprint = await this.deps.hostFingerprint();
       if (freshFingerprint !== row.host_fingerprint_json) {
-        return this.demote(projectId, modality, 'host fingerprint drift');
+        return this.demoted(projectId, modality, 'host fingerprint drift');
       }
 
-      return 'proven';
+      return { status: 'proven', reason: 'proven' };
     } catch (err) {
       this.deps.logger?.warn('[VerifyRunbookStore] status failed (fail-soft)', {
         projectId,
@@ -229,7 +312,7 @@ export class VerifyRunbookStore {
         probePath,
         error: err instanceof Error ? err.message : String(err),
       });
-      return 'absent';
+      return { status: 'absent', reason: 'indeterminate' };
     }
   }
 
@@ -393,6 +476,42 @@ export class VerifyRunbookStore {
   }
 
   /**
+   * Stamp migration 105's `origin` on a record — WHO derived it.
+   *
+   * WHY THIS IS NOT COSMETIC. Two things can produce a proven runbook: the
+   * Verify Setup flow, where a human sees the proposal and every repo change it
+   * wants before anything is touched, and the lane bootstrap
+   * (docs/proposals/lane-runbook-bootstrap.md), where an agent derives one
+   * mid-sprint and the engine proves it with nobody watching. Both are proven by
+   * the same engine-enforced run and they did NOT earn the same amount of trust.
+   * Collapsing them would erase the only durable record of which happened, and a
+   * human deciding whether to keep a machine-authored runbook has no other way to
+   * find out.
+   *
+   * Deliberately NOT a parameter of {@link VerifyRunbookStore.registerDraft}:
+   * that method's UPSERT is the CAS'd content write and adding a column to it
+   * would mean a pre-105 DB losing the REGISTRATION rather than just the
+   * provenance. Here, a pre-105 DB fails soft and loses only the badge.
+   *
+   * Never throws — a provenance stamp that failed must not undo a registration
+   * that succeeded.
+   */
+  setOrigin(projectId: number, modality: VerificationModality, origin: string): void {
+    try {
+      this.db
+        .prepare('UPDATE verify_runbook_local SET origin = ? WHERE project_id = ? AND modality = ?')
+        .run(origin, projectId, modality);
+    } catch (err) {
+      this.deps.logger?.debug('[VerifyRunbookStore] origin stamp failed (fail-soft)', {
+        projectId,
+        modality,
+        origin,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
    * Content-addressed fetch for the runner's §5.2 seam-3 pin validation: given
    * the `runbook_hash` + `runbook_local_version` stamped on the request row at
    * enqueue, resolve the EXACT revision to execute.
@@ -550,15 +669,15 @@ export class VerifyRunbookStore {
    * proof WAS taken against, which is what makes a subsequent re-proof
    * diagnosable.
    *
-   * Fail-soft: a failed demotion still returns `'unproven-draft'` to the
-   * caller. The read answer is correct either way; only the persisted
+   * Fail-soft: a failed demotion still returns `'unproven-draft'`/`'drifted'`
+   * to the caller. The read answer is correct either way; only the persisted
    * correction is lost, and the next read re-detects the same drift.
    */
-  private demote(
+  private demoted(
     projectId: number,
     modality: VerificationModality,
     reason: string,
-  ): 'unproven-draft' {
+  ): VerifyRunbookStatusDetail {
     try {
       this.db
         .prepare(
@@ -580,6 +699,6 @@ export class VerifyRunbookStore {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-    return 'unproven-draft';
+    return { status: 'unproven-draft', reason: 'drifted' };
   }
 }

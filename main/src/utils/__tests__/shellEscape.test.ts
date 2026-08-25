@@ -6,12 +6,11 @@
  * 2. escapeShellArg wraps double quotes, backticks, and command substitution patterns safely.
  * 3. escapeShellArg handles adversarial injection strings (semicolons, operators, newlines).
  * 4. escapeShellArgs joins multiple escaped tokens with spaces.
- * 5. buildSafeCommand prepends the command and delegates to escapeShellArgs.
  *
  * All assertions are on the produced string only — no actual shell is invoked.
  */
 import { describe, it, expect } from 'vitest';
-import { escapeShellArg, escapeShellArgs, buildSafeCommand } from '../shellEscape';
+import { escapeShellArg, escapeShellArgs } from '../shellEscape';
 
 // ---------------------------------------------------------------------------
 // escapeShellArg
@@ -122,31 +121,6 @@ describe('escapeShellArgs', () => {
     // "'; evil; #" has a leading single quote → after escaping: ''\''; evil; #'
     const result = escapeShellArgs(['log', '--oneline', "'; evil; #"]);
     expect(result).toBe("'log' '--oneline' ''\\''; evil; #'");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// buildSafeCommand
-// ---------------------------------------------------------------------------
-
-describe('buildSafeCommand', () => {
-  it('returns the bare command when no args are provided', () => {
-    expect(buildSafeCommand('git')).toBe('git');
-  });
-
-  it('builds a safe command with a single arg', () => {
-    expect(buildSafeCommand('git', 'status')).toBe("git 'status'");
-  });
-
-  it('builds a safe command with multiple args', () => {
-    const result = buildSafeCommand('git', 'commit', '-m', 'hello world');
-    expect(result).toBe("git 'commit' '-m' 'hello world'");
-  });
-
-  it('safely quotes args containing injection attempts', () => {
-    // "'; rm -rf /; #" has a leading single quote → after escaping: ''\''; rm -rf /; #'
-    const result = buildSafeCommand('git', 'commit', '-m', "'; rm -rf /; #");
-    expect(result).toBe("git 'commit' '-m' ''\\''; rm -rf /; #'");
   });
 });
 

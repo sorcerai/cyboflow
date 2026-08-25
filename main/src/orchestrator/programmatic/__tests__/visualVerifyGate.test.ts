@@ -521,4 +521,102 @@ describe('SchedulerVisualVerifyGate', () => {
       expect(outcome).toEqual({ kind: 'loopback', attempt: 2 }); // no feedback key
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Migration 107 — bootstrap proofs are never a lane's verdict
+  // (docs/proposals/lane-runbook-bootstrap.md §6)
+  // ---------------------------------------------------------------------------
+  describe('bootstrap-proof exclusion', () => {
+    /** Apply 095/096/105 on top of the base chain so `bootstrap_proof` exists. */
+    function upgradeTo105(): void {
+      const migDir = join(__dirname, '..', '..', '..', 'database', 'migrations');
+      for (const f of [
+        '095_verify_failure_classes.sql',
+        '096_verify_runbook_local.sql',
+        '107_bootstrap_proof.sql',
+      ]) {
+        db.exec(readFileSync(join(migDir, f), 'utf-8'));
+      }
+    }
+
+    function seedBootstrapRequest(id: string, runId: string, status: RequestStatus, taskRef: string): void {
+      seedRequest(db, { id, runId, status, taskRef });
+      db.prepare('UPDATE verification_requests SET bootstrap_proof = 1 WHERE id = ?').run(id);
+    }
+
+    it('does not bind a parked lane to a bootstrap proof, even in a single-lane run', async () => {
+      // The single-lane run is the DANGEROUS case, not the safe one: the proof
+      // shares the run, the controller stamps the lane's ref on it for its own
+      // bookkeeping, and it is the run's only request — so it satisfies BOTH the
+      // taskRef match and the sole-request fallback. Without the exclusion the
+      // lane would resolve its gate on a verdict about the RUNBOOK.
+      upgradeTo105();
+      singleLaneParked('run-1');
+      seedBootstrapRequest('vr_boot', 'run-1', 'failed', 'TASK-001');
+
+      // 'advance' because nothing attributable is pending — NOT 'loopback',
+      // which is what a FAIL would have produced had it been attributed.
+      await expect(gate(db).awaitVerdict({ runId: 'run-1', itemId: 'tsk_a' })).resolves.toEqual({
+        kind: 'advance',
+      });
+    });
+
+    it('does not treat a bootstrap proof as a live request for the adoption probe', () => {
+      upgradeTo105();
+      singleLaneParked('run-1');
+      seedBootstrapRequest('vr_boot', 'run-1', 'running', 'TASK-001');
+      expect(gate(db).hasLiveRequestForLane('run-1', 'tsk_a')).toBe(false);
+    });
+
+    it('still binds the lane to its OWN ordinary request alongside a bootstrap proof', () => {
+      // The exclusion must remove exactly one row from consideration, not poison
+      // the query for the lane's real request.
+      upgradeTo105();
+      singleLaneParked('run-1');
+      seedBootstrapRequest('vr_boot', 'run-1', 'passed', 'TASK-001');
+      seedRequest(db, { id: 'vr_lane', runId: 'run-1', status: 'running', taskRef: 'TASK-001' });
+      expect(gate(db).hasLiveRequestForLane('run-1', 'tsk_a')).toBe(true);
+    });
+
+    it('a bootstrap terminal EVENT does not match the lane', async () => {
+      upgradeTo105();
+      singleLaneParked('run-1');
+      seedBootstrapRequest('vr_boot', 'run-1', 'running', 'TASK-001');
+      seedRequest(db, { id: 'vr_lane', runId: 'run-1', status: 'running', taskRef: 'TASK-001' });
+
+      const pending = gate(db).awaitVerdict({ runId: 'run-1', itemId: 'tsk_a' });
+      // The bootstrap's terminal fires first and must be ignored…
+      db.prepare("UPDATE verification_requests SET status = 'failed' WHERE id = 'vr_boot'").run();
+      const bootEvent: VerificationTerminalEvent = {
+        requestId: 'vr_boot',
+        runId: 'run-1',
+        projectId: 1,
+        type: 'static-render-snapshot',
+        status: 'failed',
+        taskRef: 'TASK-001',
+      };
+      verificationEvents.emit(verificationChannel('run-1'), bootEvent);
+      // …and the lane resolves only on its OWN request's terminal.
+      db.prepare("UPDATE verification_requests SET status = 'passed' WHERE id = 'vr_lane'").run();
+      verificationEvents.emit(verificationChannel('run-1'), {
+        requestId: 'vr_lane',
+        runId: 'run-1',
+        projectId: 1,
+        type: 'static-render-snapshot',
+        status: 'passed',
+        taskRef: 'TASK-001',
+      } satisfies VerificationTerminalEvent);
+
+      await expect(pending).resolves.toEqual({ kind: 'advance' });
+    });
+
+    it('a pre-105 DB (no bootstrap_proof column) attributes requests exactly as before', () => {
+      // The narrowed query must never be able to WIDEN behavior: if the added
+      // predicate made `prepare` throw, the catch would answer "no request" and
+      // every parked lane would advance unverified.
+      singleLaneParked('run-1');
+      seedRequest(db, { id: 'vr1', runId: 'run-1', status: 'running', taskRef: 'TASK-001' });
+      expect(gate(db).hasLiveRequestForLane('run-1', 'tsk_a')).toBe(true);
+    });
+  });
 });

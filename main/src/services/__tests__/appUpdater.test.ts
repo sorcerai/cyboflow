@@ -29,7 +29,7 @@ vi.mock('electron-updater', () => ({
   autoUpdater: mockAutoUpdater,
 }));
 
-import { AppUpdater } from '../appUpdater';
+import { AppUpdater, isNewerVersion } from '../appUpdater';
 
 const NETWORK_GONE = {
   type: 'Utility',
@@ -39,10 +39,10 @@ const NETWORK_GONE = {
   name: 'Network Service',
 };
 
-function makeHarness() {
+function makeHarness(currentVersion = '0.1.28') {
   const app = new EventEmitter() as EventEmitter & { isPackaged: boolean; getVersion: () => string };
   app.isPackaged = true;
-  app.getVersion = () => '0.1.28';
+  app.getVersion = () => currentVersion;
 
   const send = vi.fn();
   const win = {
@@ -127,5 +127,62 @@ describe('AppUpdater network-stack-lost handling', () => {
     await updater.check();
 
     expect(lastEvent()).toEqual({ kind: 'error', message: 'net::ERR_FAILED' });
+  });
+});
+
+/**
+ * The update feed can legitimately sit BEHIND the installed build — a dev build
+ * ahead of the published dev feed, or a stable feed rolled back. electron-updater
+ * refuses to stage a downgrade, so advertising one arms a Download button that
+ * can only fail with "Please check update first". Regression guard for a
+ * `latest !== current` check that treated any difference as an update.
+ */
+describe('AppUpdater version comparison', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+  });
+
+  it('does not offer an update when the feed is behind the installed build', async () => {
+    const { updater } = makeHarness('0.2.5');
+    mockAutoUpdater.checkForUpdates.mockResolvedValueOnce({ updateInfo: { version: '0.2.4' } });
+
+    expect(await updater.check()).toEqual({
+      supported: true,
+      currentVersion: '0.2.5',
+      updateAvailable: false,
+      latestVersion: '0.2.4',
+    });
+  });
+
+  it('offers an update when the feed is ahead', async () => {
+    const { updater } = makeHarness('0.2.5');
+    mockAutoUpdater.checkForUpdates.mockResolvedValueOnce({ updateInfo: { version: '0.2.6' } });
+
+    expect(await updater.check()).toMatchObject({ updateAvailable: true, latestVersion: '0.2.6' });
+  });
+
+  it('reports up-to-date when the feed matches', async () => {
+    const { updater } = makeHarness('0.2.5');
+    mockAutoUpdater.checkForUpdates.mockResolvedValueOnce({ updateInfo: { version: '0.2.5' } });
+
+    expect(await updater.check()).toMatchObject({ updateAvailable: false });
+  });
+
+  it('compares numerically, not lexically', () => {
+    // The bug this guards is not only ordering: '0.2.10' vs '0.2.9' sorts wrong
+    // as strings, so a lexical fix would regress a real double-digit patch bump.
+    expect(isNewerVersion('0.2.10', '0.2.9')).toBe(true);
+    expect(isNewerVersion('0.2.9', '0.2.10')).toBe(false);
+    expect(isNewerVersion('0.10.0', '0.9.9')).toBe(true);
+    expect(isNewerVersion('1.0.0', '0.99.99')).toBe(true);
+  });
+
+  it('falls back to inequality for versions it cannot parse', () => {
+    // Unfamiliar formats stay offerable rather than becoming silently
+    // unreachable; cyboflow ships plain MAJOR.MINOR.PATCH today.
+    expect(isNewerVersion('nightly', '0.2.5')).toBe(true);
+    expect(isNewerVersion('0.2.5', '0.2.5')).toBe(false);
+    expect(isNewerVersion('0.2.5-rc.1', '0.2.5')).toBe(true);
   });
 });

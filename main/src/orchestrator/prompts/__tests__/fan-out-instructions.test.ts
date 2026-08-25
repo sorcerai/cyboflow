@@ -21,7 +21,12 @@
  */
 import { describe, it, expect } from 'vitest';
 import { buildFanOutAppend } from '../fan-out-instructions';
+import { fanOutBatchWorkflowName } from '../fanOutStageScript';
 import { WORKFLOW_DEFINITIONS, type WorkflowDefinition } from '../../../../../shared/types/workflows';
+import {
+  DEFAULT_FAN_OUT_DISPATCH,
+  INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT,
+} from '../../../../../shared/types/fanOutDispatch';
 
 /**
  * Build a single-phase def whose one step declares the canonical sprint fan-out
@@ -217,5 +222,91 @@ describe('buildFanOutAppend — fail-soft', () => {
     const block = buildFanOutAppend(WORKFLOW_DEFINITIONS.sprint);
     expect(block).toContain('## Fan-out execution — `execute-tasks`');
     expect(block).toContain('at most **5**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stage-major workflow dispatch (opts.dispatch === 'workflow')
+// ---------------------------------------------------------------------------
+
+describe('buildFanOutAppend — dispatch mode', () => {
+  const def = canonicalFanOutDef();
+
+  // LOAD-BEARING, not incidental. `workflowPromptReaderAdapter` (the SDK prompt
+  // composer) calls buildFanOutAppend(def) with NO opts, while claudeCodeManager
+  // installs the workflow bundle with 'prose' EXPLICITLY. So if the no-opts
+  // default ever became 'workflow', the SDK orchestrator would be instructed to
+  // dispatch to `.claude/workflows/cyboflow-*.js` scripts that were never written
+  // to its worktree — a prompt/disk mismatch no typecheck can see.
+  //
+  // The shipped-ON default for INTERACTIVE runs lives in
+  // INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT (read by ConfigManager.getFanOutDispatch)
+  // precisely so it cannot reach this call site. Do not "fix" this test by
+  // retargeting it at 'workflow'.
+  it('defaults to prose — byte-identical to an explicit prose request', () => {
+    expect(buildFanOutAppend(def)).toBe(buildFanOutAppend(def, { dispatch: 'prose' }));
+  });
+
+  it('pins the two defaults apart: neutral floor prose, interactive workflow', () => {
+    expect(DEFAULT_FAN_OUT_DISPATCH).toBe('prose');
+    expect(INTERACTIVE_FAN_OUT_DISPATCH_DEFAULT).toBe('workflow');
+  });
+
+  it('the prose arm never mentions the Workflow tool', () => {
+    expect(buildFanOutAppend(def)).not.toContain('Workflow({');
+  });
+
+  describe('workflow arm', () => {
+    const block = buildFanOutAppend(def, { dispatch: 'workflow', workflowName: 'sprint' });
+
+    it('dispatches the whole non-gated sub-chain as ONE batch', () => {
+      const batchName = fanOutBatchWorkflowName('sprint', 'execute-tasks', 'implement');
+      expect(batchName).not.toBeNull();
+      expect(block).toContain(`Workflow({ name: '${batchName as string}'`);
+      // ONE dispatch, not one per stage.
+      expect(block.match(/Workflow\(\{ name:/g)).toHaveLength(1);
+      expect(block).toContain('dispatched as ONE batch, no orchestrator gate between them');
+    });
+
+    it('names the Workflow tool explicitly so the agent does not try Skill first', () => {
+      expect(block).toContain('use the **Workflow tool** (not Skill, not Bash)');
+    });
+
+    it('keeps the firm visual gate on the prose path', () => {
+      const gateName = fanOutBatchWorkflowName('sprint', 'execute-tasks', 'visual-verify');
+      expect(block).not.toContain(`name: '${gateName as string}'`);
+      expect(block).toContain('cyboflow_request_verification');
+      expect(block).toContain('there is NO subagent to delegate');
+    });
+
+    it('states the lane-granularity trade explicitly', () => {
+      expect(block).toContain('does not');
+      expect(block).toContain('tick per stage');
+      expect(block).toContain('backfill');
+    });
+
+    it('reconciles domain outcomes rather than assuming success', () => {
+      expect(block).toContain('outcome: "ok"');
+      expect(block).toContain('outcome: "failed"');
+      expect(block).toContain('failedStage');
+    });
+
+    it('keeps every cyboflow write with the orchestrator', () => {
+      expect(block).toContain('SOLE writer of cyboflow');
+      expect(block).toContain('The script writes NO cyboflow state by design');
+      expect(block).toContain('cyboflow_report_finding');
+    });
+
+    it('retains the shared dispatch + loopback protocol', () => {
+      expect(block).toContain('at most **5** concurrently');
+      expect(block).toContain('Loopback + attempt protocol');
+      expect(block).toContain('ONE git commit for that task');
+    });
+
+    it('falls back to prose for a batch whose name cannot be slugged', () => {
+      const weird = buildFanOutAppend(def, { dispatch: 'workflow', workflowName: '***' });
+      expect(weird).not.toContain('Workflow({');
+      expect(weird).toContain('cyboflow-implement');
+    });
   });
 });

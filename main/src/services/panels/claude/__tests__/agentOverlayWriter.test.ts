@@ -338,6 +338,7 @@ describe('agentOverlayWriter — variant agent deltas (A/B testing, migration 04
         id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, label TEXT NOT NULL,
         spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
         weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+        archived_at TEXT,  -- migration 116
         created_at TEXT, updated_at TEXT
       );
     `);
@@ -541,6 +542,7 @@ describe('agentOverlayWriter — workflow agent configs (workflow-scoped)', () =
         id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, label TEXT NOT NULL,
         spec_json TEXT NOT NULL DEFAULT '{}', agent_overrides_json TEXT, model TEXT, execution_model TEXT,
         weight INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft',
+        archived_at TEXT,  -- migration 116
         created_at TEXT, updated_at TEXT
       );
     `);

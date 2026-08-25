@@ -111,9 +111,32 @@ function buildDb(): Database.Database {
   // match production. Applied AFTER the revision ALTER above — 091's recreate
   // copies `revision`, so the column must exist first.
   db.exec(readFileSync(join(migDir, '091_eval_report_atype.sql'), 'utf-8'));
+  // 099 widens the atype CHECK again to include 'idea-summary' (the per-idea
+  // ledger-status hub) and makes it per-entity, alongside idea-spec/arch-design.
+  // Applied AFTER 091 for the same "recreate carries only what it names" reason
+  // 091 documents about running after 089.
+  db.exec(readFileSync(join(migDir, '102_idea_summary_atype.sql'), 'utf-8'));
   // Migration 059: category (feature|bug|chore) — an unconditional column in
   // insertEntity/readEntity now (mirrors priority), so every create needs it.
   db.exec(readFileSync(join(migDir, '059_entity_category.sql'), 'utf-8'));
+  // 098 (idea_components ledger, standalone/no-FK) — resolveIdeaComponents'
+  // ledger-row SELECT hits this table unconditionally (not fail-soft, unlike
+  // its run-linkage arms), so idea-summary's content gate needs it to exist.
+  db.exec(readFileSync(join(migDir, '101_idea_component_ledger.sql'), 'utf-8'));
+  // approved_designs (082's read model) feeds the 'prototype' component's
+  // derivation, also queried unconditionally. Migration 082 itself ALTERs the
+  // legacy Crystal `sessions` table (ADD COLUMN design_idea_id) which this
+  // entity-only test DB never creates, so — mirroring the session_id/revision
+  // inline-ALTER precedent just above — this stubs ONLY the columns
+  // resolveIdeaComponentsBatch actually SELECTs, instead of running the full
+  // migration file.
+  db.exec(`
+    CREATE TABLE approved_designs (
+      idea_id TEXT NOT NULL,
+      project_id INTEGER NOT NULL,
+      superseded_at DATETIME
+    );
+  `);
   return db;
 }
 
@@ -945,8 +968,10 @@ describe('autoMintArtifacts.handleRunStart (sprint/ship baseline)', () => {
     await handleRunStart(adapter, 'run-sprint-idem');
     await handleRunStart(adapter, 'run-sprint-idem');
 
-    // One idea-spec + one decomposed-stories = 2 rows total, no duplicates.
-    expect(artifactCount(db, 'run-sprint-idem')).toBe(2);
+    // One idea-spec + one decomposed-stories + one idea-summary (the idea's
+    // epics/stories components are derived-complete, clearing the content
+    // gate) = 3 rows total, no duplicates.
+    expect(artifactCount(db, 'run-sprint-idem')).toBe(3);
     const specId = readArtifactId(db, 'run-sprint-idem', 'idea-spec');
     const specEvents = readArtifactEvents(db, specId!);
     expect(specEvents.length).toBe(1);
@@ -1394,8 +1419,10 @@ describe('autoMintArtifacts.handleEntityWrite', () => {
     });
     await handleEntityWrite(adapter, 'run-ew-refresh', 'task');
 
-    // Still ONE row (UPSERT), but the label now reflects the live count.
-    expect(artifactCount(db, 'run-ew-refresh')).toBe(1);
+    // Still ONE decomposed-stories row (UPSERT), but the label now reflects the
+    // live count. A second row exists — idea-summary, whose 'epics'/'stories'
+    // components are now derived-complete — so the run total is 2, not 1.
+    expect(artifactCount(db, 'run-ew-refresh')).toBe(2);
     expect(readArtifact(db, 'run-ew-refresh', 'decomposed-stories')!.label).toBe('1 epic, 2 tasks');
   });
 
@@ -2292,5 +2319,415 @@ describe('autoMintArtifacts — per-idea arch-design + joint batch gates', () =>
 
     expect(readArtifact(db, 'run-sp', 'approve-ideas')).toBeUndefined();
     expect(readArtifact(db, 'run-sp', 'approve-designs')).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// idea-summary — the per-idea ledger-status hub (migration 102)
+// ---------------------------------------------------------------------------
+
+describe('autoMintArtifacts idea-summary', () => {
+  afterEach(() => {
+    ArtifactRouter._resetForTesting();
+    artifactChangeEvents.removeAllListeners();
+    TaskChangeRouter._resetForTesting();
+    taskChangeEvents.removeAllListeners();
+  });
+
+  /** Seed one explicit idea_components ledger row (migration 101). */
+  function seedLedgerRow(
+    db: Database.Database,
+    ideaId: string,
+    projectId: number,
+    component: string,
+    state: 'complete' | 'incomplete' | 'skipped',
+    staleAt: string | null = null,
+  ): void {
+    db.prepare(
+      `INSERT INTO idea_components
+         (idea_id, project_id, component, state, source, stale_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'manual', ?, datetime('now'), datetime('now'))`,
+    ).run(ideaId, projectId, component, state, staleAt);
+  }
+
+  it('does NOT mint idea-summary for a bare stub idea (all-incomplete ledger, content gate)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-bare');
+    const { taskId: ideaId } = await TaskChangeRouter.getInstance().applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      title: 'Bare stub',
+      runId: 'run-sum-bare',
+    });
+    setSeedIdea(db, 'run-sum-bare', ideaId);
+
+    await handleRunStart(adapter, 'run-sum-bare');
+
+    expect(readArtifact(db, 'run-sum-bare', 'idea-summary')).toBeUndefined();
+  });
+
+  it('mints idea-summary once the idea-spec component is derived-complete (non-empty summary/body)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-spec');
+    const { taskId: ideaId } = await TaskChangeRouter.getInstance().applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Has a spec',
+      body: '## Idea spec\n\nSome real content.',
+      runId: 'run-sum-spec',
+    });
+
+    await handleEntityWrite(adapter, 'run-sum-spec', 'idea');
+
+    const art = readArtifact(db, 'run-sum-spec', 'idea-summary');
+    expect(art).toBeDefined();
+    expect(art!.label).toBe('Idea summary');
+    expect(art!.source_ref).toBe(ideaId);
+    expect(art!.step_origin).toBe('Plan · idea summary');
+    // Templated: content re-derived on read → mode 'template', payload null.
+    expect(art!.mode).toBe('template');
+    expect(art!.payload_json).toBeNull();
+    expect(art!.is_new).toBe(1);
+  });
+
+  it('mints idea-summary from an explicit ledger row alone (a manual "skipped" component is meaningful)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-skip');
+    const { taskId: ideaId } = await TaskChangeRouter.getInstance().applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      title: 'Skipped prototype',
+      runId: 'run-sum-skip',
+    });
+    setSeedIdea(db, 'run-sum-skip', ideaId);
+    // Nothing derivable yet, but a human explicitly skipped 'prototype'.
+    seedLedgerRow(db, ideaId, 1, 'prototype', 'skipped');
+
+    await handleRunStart(adapter, 'run-sum-skip');
+
+    expect(readArtifact(db, 'run-sum-skip', 'idea-summary')).toBeDefined();
+  });
+
+  it('mints idea-summary from a "needs review" (stale) component alone', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-stale');
+    const { taskId: ideaId } = await TaskChangeRouter.getInstance().applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      title: 'Needs review',
+      runId: 'run-sum-stale',
+    });
+    setSeedIdea(db, 'run-sum-stale', ideaId);
+    seedLedgerRow(db, ideaId, 1, 'architecture', 'incomplete', '2026-08-01T00:00:00.000Z');
+
+    await handleRunStart(adapter, 'run-sum-stale');
+
+    expect(readArtifact(db, 'run-sum-stale', 'idea-summary')).toBeDefined();
+  });
+
+  it('mints idea-summary at RUN START for a SPRINT run (its only mint opportunity)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    // A pre-decomposed idea (owned by a PRIOR planner run) whose tasks are
+    // linked into this sprint's batch — mirrors seedDecomposedIdea's shape
+    // (that helper is scoped to the handleRunStart describe block above).
+    seedPlannerRun(db, 'run-sum-plan');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaId } = await router.applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      title: 'Pre-decomposed idea',
+      summary: 'already planned',
+      runId: 'run-sum-plan',
+    });
+    const { taskId: epicId } = await router.applyChange(1, {
+      actor: 'orchestrator',
+      entityType: 'epic',
+      title: 'Epic',
+      originatingIdeaId: ideaId,
+      runId: 'run-sum-plan',
+    });
+    const { taskId: taskId } = await router.applyChange(1, {
+      actor: 'orchestrator',
+      entityType: 'task',
+      title: 'Task',
+      parentEpicId: epicId,
+      runId: 'run-sum-plan',
+    });
+    seedSprintRun(db, 'run-sum-sprint', 'batch-sum');
+    linkBatchTask(db, 'batch-sum', taskId);
+
+    await handleRunStart(adapter, 'run-sum-sprint');
+
+    const art = readArtifact(db, 'run-sum-sprint', 'idea-summary');
+    expect(art).toBeDefined();
+    expect(art!.source_ref).toBe(ideaId);
+    expect(art!.step_origin).toBe('Sprint · run start');
+  });
+
+  it('does NOT refresh idea-summary via handleEntityWrite for a SPRINT run (content-driven only for planner/ship)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    // A standalone sprint owns no ideas via seed_idea_id, so handleEntityWrite's
+    // own CONTENT_DRIVEN_WORKFLOWS gate already excludes it — this pins that
+    // idea-summary specifically never appears via THIS seam for sprint.
+    seedSprintRun(db, 'run-sum-sprint-ew', 'batch-y');
+    await handleEntityWrite(adapter, 'run-sum-sprint-ew', 'idea');
+
+    expect(readArtifact(db, 'run-sum-sprint-ew', 'idea-summary')).toBeUndefined();
+  });
+
+  it('mints idea-summary on an epic/task write too (epics/stories components changed)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-ew-task');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaId } = await router.applyChange(1, {
+      actor: 'user',
+      entityType: 'idea',
+      title: 'Idea',
+      runId: 'run-sum-ew-task',
+    });
+    const { taskId: epicId } = await router.applyChange(1, {
+      actor: 'orchestrator',
+      entityType: 'epic',
+      title: 'Epic',
+      originatingIdeaId: ideaId,
+      runId: 'run-sum-ew-task',
+    });
+    await router.applyChange(1, {
+      actor: 'orchestrator',
+      entityType: 'task',
+      title: 'T1',
+      parentEpicId: epicId,
+      runId: 'run-sum-ew-task',
+    });
+
+    await handleEntityWrite(adapter, 'run-sum-ew-task', 'task');
+
+    const art = readArtifact(db, 'run-sum-ew-task', 'idea-summary');
+    expect(art).toBeDefined();
+    expect(art!.source_ref).toBe(ideaId);
+    expect(art!.step_origin).toBe('Plan · idea summary');
+  });
+
+  it('is idempotent: two entity-write fires yield ONE idea-summary row and one created event', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-idem');
+    await TaskChangeRouter.getInstance().applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Idempotent summary',
+      // The ledger's 'idea-spec' component derives from the BODY's '## Idea
+      // spec' heading (extractIdeaSpecSection) — NOT the summary field (that's
+      // the idea-spec ARTIFACT's own, separate, content gate).
+      body: '## Idea spec\n\nhas content',
+      runId: 'run-sum-idem',
+    });
+
+    await handleEntityWrite(adapter, 'run-sum-idem', 'idea');
+    await handleEntityWrite(adapter, 'run-sum-idem', 'idea');
+
+    const rows = db
+      .prepare("SELECT COUNT(*) AS n FROM artifacts WHERE run_id = 'run-sum-idem' AND atype = 'idea-summary'")
+      .get() as { n: number };
+    expect(rows.n).toBe(1);
+    const artId = readArtifactId(db, 'run-sum-idem', 'idea-summary')!;
+    const events = readArtifactEvents(db, artId).map((e) => e.kind);
+    expect(events).toEqual(['created']);
+  });
+
+  it('mints ONE COMBINED idea-summary for a multi-idea planner batch, not one tab per idea', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-batch');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaA } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Idea Alpha',
+      // See the idempotency test above: the ledger's 'idea-spec' component
+      // derives from the body's '## Idea spec' heading, not a bare summary.
+      body: '## Idea spec\n\nspec A',
+      runId: 'run-sum-batch',
+    });
+    // Idea Beta is a bare stub — no body/summary, no ledger row. It still gets a
+    // ROW on the combined matrix (five "not started" cells is real information
+    // about the batch), so it COUNTS toward the label even though it would never
+    // have earned a hub tab of its own.
+    const { taskId: ideaB } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Idea Beta',
+      runId: 'run-sum-batch',
+    });
+    setSeedIdeaIds(db, 'run-sum-batch', [ideaA, ideaB]);
+
+    await handleEntityWrite(adapter, 'run-sum-batch', 'idea');
+
+    const summaries = db
+      .prepare(
+        `SELECT source_ref, label, payload_json FROM artifacts
+          WHERE run_id = 'run-sum-batch' AND atype = 'idea-summary'`,
+      )
+      .all() as Array<{ source_ref: string; label: string; payload_json: string | null }>;
+    expect(summaries).toHaveLength(1);
+    // sourceRef anchors on the FIRST owned idea so a row minted while the batch
+    // was still size 1 is ADOPTED in place by the (run_id, atype, source_ref)
+    // UPSERT (see the adoption test below).
+    expect(summaries[0].source_ref).toBe(ideaA);
+    expect(summaries[0].label).toBe('Idea summaries · 2 ideas');
+    expect(JSON.parse(summaries[0].payload_json!)).toEqual({ combined: true });
+    expect(summaries[0].source_ref).not.toBe(ideaB);
+  });
+
+  it('ADOPTS the single-idea hub row in place when the batch grows to two ideas', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-adopt');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaA } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Idea Alpha',
+      body: '## Idea spec\n\nspec A',
+      runId: 'run-sum-adopt',
+    });
+    setSeedIdeaIds(db, 'run-sum-adopt', [ideaA]);
+    await handleEntityWrite(adapter, 'run-sum-adopt', 'idea');
+
+    const before = readArtifact(db, 'run-sum-adopt', 'idea-summary');
+    const beforeId = readArtifactId(db, 'run-sum-adopt', 'idea-summary');
+    expect(before!.label).toBe('Idea summary');
+    expect(before!.payload_json).toBeNull();
+    expect(beforeId).toBeDefined();
+
+    // The planner mints its second idea; the batch is now size 2.
+    const { taskId: ideaB } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Idea Beta',
+      body: '## Idea spec\n\nspec B',
+      runId: 'run-sum-adopt',
+    });
+    setSeedIdeaIds(db, 'run-sum-adopt', [ideaA, ideaB]);
+    await handleEntityWrite(adapter, 'run-sum-adopt', 'idea');
+
+    const rows = db
+      .prepare(
+        `SELECT id, label, payload_json FROM artifacts
+          WHERE run_id = 'run-sum-adopt' AND atype = 'idea-summary'`,
+      )
+      .all() as Array<{ id: string; label: string; payload_json: string | null }>;
+    // ONE row, the SAME row — converted, never orphaned beside a new one.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(beforeId);
+    expect(rows[0].label).toBe('Idea summaries · 2 ideas');
+    expect(JSON.parse(rows[0].payload_json!)).toEqual({ combined: true });
+  });
+
+  it('does NOT mint the combined tab while NO idea in the batch has a meaningful ledger', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-batch-bare');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaA } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Bare Alpha',
+      runId: 'run-sum-batch-bare',
+    });
+    const { taskId: ideaB } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Bare Beta',
+      runId: 'run-sum-batch-bare',
+    });
+    setSeedIdeaIds(db, 'run-sum-batch-bare', [ideaA, ideaB]);
+
+    await handleEntityWrite(adapter, 'run-sum-batch-bare', 'idea');
+
+    expect(readArtifact(db, 'run-sum-batch-bare', 'idea-summary')).toBeUndefined();
+  });
+
+  it('counts only NON-ARCHIVED ideas in the combined label', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    TaskChangeRouter.initialize(adapter);
+    ArtifactRouter.initialize(adapter);
+
+    seedPlannerRun(db, 'run-sum-batch-arch');
+    const router = TaskChangeRouter.getInstance();
+    const { taskId: ideaA } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Kept Alpha',
+      body: '## Idea spec\n\nspec A',
+      runId: 'run-sum-batch-arch',
+    });
+    const { taskId: ideaB } = await router.applyChange(1, {
+      actor: 'agent:cyboflow-context',
+      entityType: 'idea',
+      title: 'Archived Beta',
+      body: '## Idea spec\n\nspec B',
+      runId: 'run-sum-batch-arch',
+    });
+    setSeedIdeaIds(db, 'run-sum-batch-arch', [ideaA, ideaB]);
+    // The renderer drops archived ideas, so the label must agree with the rows.
+    db.prepare("UPDATE ideas SET archived_at = datetime('now') WHERE id = ?").run(ideaB);
+
+    await handleEntityWrite(adapter, 'run-sum-batch-arch', 'idea');
+
+    const art = readArtifact(db, 'run-sum-batch-arch', 'idea-summary');
+    expect(art!.label).toBe('Idea summaries · 1 idea');
+    expect(JSON.parse(art!.payload_json!)).toEqual({ combined: true });
+  });
+
+  it('is fail-soft for an unknown run id (no throw, no mint)', async () => {
+    const db = buildDb();
+    const adapter = dbAdapter(db);
+    ArtifactRouter.initialize(adapter);
+
+    await expect(handleRunStart(adapter, 'no-such-run')).resolves.toBeUndefined();
+    await expect(handleEntityWrite(adapter, 'no-such-run', 'idea')).resolves.toBeUndefined();
+    expect((db.prepare('SELECT COUNT(*) AS n FROM artifacts').get() as { n: number }).n).toBe(0);
   });
 });

@@ -30,6 +30,7 @@ import {
   type EventLoopUtilization,
   type IntervalHistogram,
 } from 'node:perf_hooks';
+import { drainTimerCensus, formatTimerCensus, installTimerCensus } from './timerCensus';
 
 /** Minimal logger surface — kept local so this module imports nothing heavy. */
 interface PerfLogger {
@@ -138,6 +139,15 @@ export class PerfTracer {
       `[perf] elu=${eluPct}% cpu=${cpuPct}% eld(mean/p99/max)=${eldMean}/${eldP99}/${eldMax}ms ` +
         `rss=${rssMb}mb heap=${heapMb}mb | ${seamStr}`,
     );
+
+    // Timer wakeups are the dominant main-process idle cost (see timerCensus's
+    // header), so they get their own line rather than competing with the seam
+    // counters for space.
+    const census = drainTimerCensus();
+    const wakeups = census.reduce((sum, row) => sum + row.fires, 0);
+    this.logger.info(
+      `[perf-timers] ${(wakeups / (wallMs / 1000)).toFixed(1)}/s | ${formatTimerCensus(census)}`,
+    );
   }
 }
 
@@ -148,6 +158,7 @@ export class PerfTracer {
  */
 export function startPerfTracer(logger: PerfLogger): PerfTracer | null {
   if (!TRACE_ENABLED) return null;
+  installTimerCensus();
   const tracer = new PerfTracer(logger);
   tracer.start();
   return tracer;

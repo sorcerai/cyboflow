@@ -1,7 +1,7 @@
 /**
  * Foundation contract tests for the agent foundation modules (agent-overrides
  * epic). Locks:
- *  1. The catalogue parses EXACTLY the 19 canonical builtins from the bundled
+ *  1. The catalogue parses EXACTLY the 20 canonical builtins from the bundled
  *     `.md` files, each with name === `cyboflow-<basename>`, a CLI-tool subset,
  *     and a non-empty description.
  *  2. The sorted catalogue keys deep-equal the sorted CANONICAL_AGENT_KEYS.
@@ -30,9 +30,9 @@ import { CLI_TOOLS, type CliTool } from '../../../../../shared/types/cliTools';
 const cliToolSet = new Set<string>(CLI_TOOLS);
 
 describe('loadBuiltInAgents', () => {
-  it('parses exactly the 19 canonical builtins', () => {
+  it('parses exactly the 20 canonical builtins', () => {
     const catalogue = loadBuiltInAgents();
-    expect(catalogue.size).toBe(19);
+    expect(catalogue.size).toBe(20);
     expect(catalogueMatchesCanonical(catalogue)).toBe(true);
   });
 

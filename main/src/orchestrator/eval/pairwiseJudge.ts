@@ -1,15 +1,21 @@
 /**
  * pairwiseJudge — the pluggable pairwise A/B judge (slice C), cloned from
  * evalJury.ts. `PairwiseJudgeClient` is the seam the PairwiseJudgeWorker grades
- * through; `ClaudePairwiseJudge` is the ONE v1 implementation. It holds NO SDK
- * import — it takes an injected `PairwiseStructuredQueryFn` (real impl in
- * pairwiseJudgeQuery.ts, a fake in tests) so the prompt-build + defensive-parse
- * logic here is unit-testable with a canned structured object.
+ * through; `ClaudePairwiseJudge` (below) is one implementation and
+ * `CodexPairwiseJudge` (codexPairwiseJudge.ts) is the other — both reuse the
+ * prompt/schema/parser in this file verbatim. Neither holds an SDK import: each
+ * takes an injected `PairwiseStructuredQueryFn` (real impls in
+ * pairwiseJudgeQuery.ts / codexEvalJudgeQuery.ts, a fake in tests) so the
+ * prompt-build + defensive-parse logic here is unit-testable with a canned
+ * structured object.
  *
- * The worker runs K of these per comparison, each with a randomized
- * `positionAFirst` so position bias cancels in aggregate; the labels the judge
- * sees are neutral ("Solution 1" / "Solution 2") and the worker maps the raw
- * '1'/'2'/'tie' output back to arm identity using the persisted `positionAFirst`.
+ * The worker grades ONE sample per ORDERED PANEL SLOT (2×Claude + 1×Codex in
+ * production, the panel's length driving K — see pairwiseJudgeWorker.ts), so the
+ * clients in a panel are DISTINCT, not K copies of one. Each sample gets a
+ * randomized `positionAFirst` so position bias cancels in aggregate; the labels
+ * the judge sees are neutral ("Solution 1" / "Solution 2") and the worker maps the
+ * raw '1'/'2'/'tie' output back to arm identity using the persisted
+ * `positionAFirst`.
  *
  * Standalone-typecheck note: imports only the diff-truncation helper (pure), the
  * model-alias helper (pure), the spec-hash helper (node:crypto), and the query-fn
@@ -54,7 +60,13 @@ export interface PairwiseJudgeClient {
   readonly name: string;
   /** The concrete resolved model id (persisted as judge_model), when known. */
   readonly resolvedModel?: string;
-  /** Grade one sample. Throws on a malformed/unusable result (worker retries once). */
+  /**
+   * Grade one sample. Throws on a malformed/unusable result. The worker retries a
+   * slot ONCE only for a NON-deterministic throw: a `CodexJurorUnavailableError`
+   * (slot dropped as unavailable) and a deterministic `EvalJudgeTimeoutError` /
+   * `EvalJudgeMaxTurnsError` (see isDeterministicJudgeFailure in judgeErrors.ts)
+   * each fail the slot on the FIRST occurrence, with no second attempt.
+   */
   grade(input: PairwiseGradeInput): Promise<PairwiseRawResult>;
 }
 

@@ -24,7 +24,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const TEN_MIN_AGO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+// Past the production STALE_THRESHOLD_MS (45 min), stated relatively so a
+// threshold change cannot quietly turn these fixtures young.
+const STALE_THRESHOLD_MS = 45 * 60 * 1000;
+const STALE_AGO = new Date(Date.now() - (STALE_THRESHOLD_MS + 60 * 1000)).toISOString();
 
 function makeClaudeManager(active: Set<string> = new Set()): ClaudeManagerLike {
   return { hasActiveRunForId: (runId) => active.has(runId) };
@@ -34,14 +37,14 @@ describe('StuckDetector — human-gate blind spot', () => {
   it('does NOT transition a run parked at a stale human-gate decision item (no approvals row)', async () => {
     const db = buildReviewInboxDb();
     seedInboxRun(db, 'run-h', 'awaiting_review');
-    // Only a blocking human-gate decision review_item, created 10 min ago (past
-    // the 5-min stale threshold). NO approvals row exists for this run.
+    // Only a blocking human-gate decision review_item, created past the stale
+    // threshold. NO approvals row exists for this run.
     seedBlockingReviewItem(db, {
       id: 'rvw_gate',
       runId: 'run-h',
       kind: 'decision',
       source: 'gate:human-step:plan-review',
-      createdAt: TEN_MIN_AGO,
+      createdAt: STALE_AGO,
     });
 
     const emitter = new EventEmitter();
@@ -77,7 +80,7 @@ describe('StuckDetector — human-gate blind spot', () => {
     db.prepare(
       `INSERT INTO approvals (id, run_id, tool_name, tool_input_json, tool_use_id, status, created_at)
        VALUES ('appr-1', 'run-h', 'Bash', '{}', 'appr-1', 'pending', ?)`,
-    ).run(TEN_MIN_AGO);
+    ).run(STALE_AGO);
 
     const emitter = new EventEmitter();
     const events: StuckDetectedEvent[] = [];

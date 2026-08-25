@@ -33,12 +33,23 @@ import { AbstractCliManager } from '../cli/AbstractCliManager';
 import { resolveOmpGateExtensionPath } from './gate/ompGatePath';
 import type { OmpGateConfig, OmpGateSentinel } from './gate/ompGateTypes';
 import { OmpApprovalBridge } from './ompApprovalBridge';
+import {
+  OmpQuestionBridge,
+  type OmpQuestionRouterPort,
+} from './ompQuestionBridge';
 import { detectOmpAvailability } from './ompAvailability';
 import { buildOmpGateConfig } from './ompGateConfigBuilder';
+import {
+  composePiConfigFiles,
+  ensureHandlerTimeoutOverlay,
+  OMP_HANDLER_TIMEOUT_MS,
+  OMP_RAISED_DECISION_BUDGET_MS,
+} from './ompHandlerTimeoutOverlay';
 import { writeOmpMcpConfig } from './ompMcpConfigWriter';
 import { getSharedOmpModelCatalogProbe, type OmpModelCatalogProbe } from './ompModelCatalog';
 import { assertOmpRequiredSpawnFlags, ompApprovalModeForMode } from './ompPtyManager';
 import { OmpRawEventSink } from './ompRawEventSink';
+import { supportsConfigurableHandlerTimeout } from './ompVersions';
 import {
   lastAssistantTextIn,
   OMP_RPC_UI_MODE_ARGS,
@@ -110,6 +121,22 @@ export const OMP_TURN_TIMEOUT_MS = 30 * 60_000;
  * with the provider's own record rather than only ours.
  */
 const OMP_TURN_ABORT_GRACE_MS = 10_000;
+
+/**
+ * What the model and the transcript are told when the turn ceiling stopped the
+ * turn. Shared by the aborted-`agent_end` rewrite and the outright failure, so
+ * the two paths cannot drift into describing the same event differently.
+ *
+ * Says WAITING COUNTS, because it does: the ceiling is wall clock, and a turn
+ * parked on a human approval ages it exactly as fast as one doing work.
+ */
+function describeTurnCeilingAbort(): string {
+  return (
+    `cyboflow stopped this turn: it exceeded the ${Math.round(OMP_TURN_TIMEOUT_MS / 60_000)}-minute ` +
+    'ceiling. This was NOT a user interrupt. The ceiling is wall clock, so time spent waiting on ' +
+    'human tool approvals counts against it. Start a new turn to continue.'
+  );
+}
 
 /** Budget for the RPC handshake (ready frame + optional v2 negotiation). */
 const OMP_HANDSHAKE_TIMEOUT_MS = 20_000;
@@ -201,6 +228,18 @@ interface OmpTurnContext {
   completedCleanly: boolean;
   /** Set when the turn's terminal result was an error, so the await can throw. */
   turnError: string | null;
+  /** Accurate replacement for OMP's generic "Interrupted by user" after bridge failure. */
+  questionBridgeError: string | null;
+  /**
+   * Set when {@link OMP_TURN_TIMEOUT_MS} expired and WE aborted the turn.
+   *
+   * The ceiling stops the turn through OMP's `abort` command — the same command
+   * a real user interrupt uses — so without this the turn reports OMP's generic
+   * "Interrupted by user" and blames the human for a stop they did not make.
+   * Observed live on 2026-08-23: a run whose only visible failure was that
+   * phrase, 30 minutes to the second after the turn began.
+   */
+  turnCeilingAborted: boolean;
 }
 
 /** A warm (persistent) `omp --mode rpc-ui` child parked between turns. */
@@ -208,6 +247,7 @@ interface WarmOmpEntry {
   client: OmpRpcClientLike;
   rawEventSink: OmpRawEventSink;
   approvalBridge: OmpApprovalBridge;
+  questionBridge: OmpQuestionBridge;
   unsubscribe: (() => void) | null;
   command: string;
   /** The OMP session FILE PATH — the external session id and the resume target. */
@@ -368,6 +408,7 @@ export class OmpSdkManager extends AbstractCliManager {
   private readonly sentinelWaitMs: number;
 
   private cyboflowMcpRuntimeConfig: OmpMcpRuntimeConfig | null = null;
+  private questionRouterProvider: (() => OmpQuestionRouterPort) | null = null;
   private resolvedExecutable: ResolvedOmpExecutable | null = null;
 
   constructor(
@@ -408,6 +449,10 @@ export class OmpSdkManager extends AbstractCliManager {
 
   setCyboflowMcpRuntimeConfig(config: OmpMcpRuntimeConfig): void {
     this.cyboflowMcpRuntimeConfig = config;
+  }
+
+  setQuestionRouterProvider(provider: () => OmpQuestionRouterPort): void {
+    this.questionRouterProvider = provider;
   }
 
   /** The model picker's catalogue, served from the shared 5-minute cache. */
@@ -618,11 +663,21 @@ export class OmpSdkManager extends AbstractCliManager {
       os.tmpdir(),
       `cyboflow-omp-gate-${randomUUID()}.json`,
     );
+    // The raised human-decision budget and the config overlay that makes it
+    // legal are ONE change: the overlay tells OMP to allow a longer handler,
+    // the budget tells the gate to use it. `overlayPath === null` means either
+    // this binary ignores the setting or the file could not be written, and
+    // BOTH halves then stay at their defaults (30s cap, ~25s budget) — never
+    // one without the other.
+    const overlayPath = this.resolveHandlerTimeoutOverlay(executable.version);
     const gateConfig = buildOmpGateConfig({
       permissionMode,
       ...(options.disallowedTools ? { disallowedTools: options.disallowedTools } : {}),
       allowRules: loadMergedPermissionRules(options.worktreePath).allow,
       cyboflowMcpAvailable: !this.isInPlaceSession(options.sessionId),
+      ...(overlayPath !== null
+        ? { humanDecisionBudgetMs: OMP_RAISED_DECISION_BUDGET_MS }
+        : {}),
     });
     const model = resolveAgentModelAlias('omp', options.model);
     const thinking = this.resolveThinkingLevel(options);
@@ -659,7 +714,7 @@ export class OmpSdkManager extends AbstractCliManager {
     ];
     assertOmpSdkSpawnFlags(baseArgs);
 
-    const env = this.buildSpawnEnvironment(runId, sentinelPath, gateConfig, runtimeConfig);
+    const env = this.buildSpawnEnvironment(runId, sentinelPath, gateConfig, runtimeConfig, overlayPath);
     const fingerprint = sha1(
       stableSerialize({
         executablePath: executable.executablePath,
@@ -692,6 +747,7 @@ export class OmpSdkManager extends AbstractCliManager {
     sentinelPath: string,
     gateConfig: OmpGateConfig,
     runtimeConfig: OmpMcpRuntimeConfig,
+    overlayPath: string | null,
   ): NodeJS.ProcessEnv {
     const inherited = process.env;
     const pathKey = Object.keys(inherited).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
@@ -707,11 +763,51 @@ export class OmpSdkManager extends AbstractCliManager {
       CYBOFLOW_RUN_ARTIFACTS_DIR: getCyboflowSubdirectory('artifacts', 'runs', runId),
       CYBOFLOW_OMP_GATE_CONFIG: JSON.stringify(gateConfig),
       CYBOFLOW_OMP_GATE_SENTINEL: sentinelPath,
+      // Raises OMP's tool_call handler cap so a human approval is not forced
+      // to be answered in ~25s (ompHandlerTimeoutOverlay.ts). The user's own
+      // PI_CONFIG_FILES entries are preserved and ours appended last, so a
+      // project that configures OMP itself keeps doing so. Absent when the
+      // raise is not in effect — an unset var is exactly OMP's default.
+      ...(overlayPath !== null
+        ? { PI_CONFIG_FILES: composePiConfigFiles(inherited['PI_CONFIG_FILES'], overlayPath) }
+        : {}),
       // Every command the OMP agent shells out to — including a project gate —
       // inherits this, which is what makes an OMP lane self-govern its vitest
       // fork pool.
       ...managedTestConcurrencyEnv(),
     };
+  }
+
+  /**
+   * Resolve the config overlay that raises OMP's extension-handler cap, or
+   * `null` to leave this spawn on OMP's 30s default.
+   *
+   * Two independent reasons to answer `null`, both non-fatal:
+   *  - the binary predates `extensionHandlers.toolCallTimeoutMs` (17.3.5), so
+   *    the setting would be read and ignored while our gate waited past the
+   *    cap OMP still enforces;
+   *  - the file could not be written, in which case naming it anyway would
+   *    take the whole spawn down (OMP throws "Config overlay not found"
+   *    BEFORE starting the session — see ompHandlerTimeoutOverlay.ts).
+   *
+   * The path is stable rather than per-spawn deliberately: it rides in the env
+   * that feeds the warm-session fingerprint, and a fresh temp path per spawn
+   * would make every turn look like a config change and cold-respawn.
+   */
+  private resolveHandlerTimeoutOverlay(version: string): string | null {
+    if (!supportsConfigurableHandlerTimeout(version)) {
+      this.logger?.info(
+        `[OmpSdkManager] omp ${version} predates configurable extension-handler timeouts; ` +
+          'OMP approvals for this session must be answered within ~25s or the gate hangs up ' +
+          'and asks the model to retry',
+      );
+      return null;
+    }
+    return ensureHandlerTimeoutOverlay(
+      getCyboflowSubdirectory('omp'),
+      OMP_HANDLER_TIMEOUT_MS,
+      this.logger,
+    );
   }
 
   private resolvePermissionMode(options: ClaudeSpawnerOptions): PermissionMode {
@@ -802,6 +898,7 @@ export class OmpSdkManager extends AbstractCliManager {
       client: undefined as unknown as OmpRpcClientLike,
       rawEventSink: new OmpRawEventSink(this.db, this.logger),
       approvalBridge: undefined as unknown as OmpApprovalBridge,
+      questionBridge: undefined as unknown as OmpQuestionBridge,
       unsubscribe: null,
       command: executable.executablePath,
       sessionFilePath: options.resumeSessionId ?? null,
@@ -819,10 +916,18 @@ export class OmpSdkManager extends AbstractCliManager {
       currentContext: null,
     };
 
+    entry.questionBridge = new OmpQuestionBridge({
+      getRunId: () => entry.currentContext?.runId ?? null,
+      getQuestionRouter: () => this.requireQuestionRouter(),
+      respond: (response) => entry.client.respondToExtensionUi(response),
+      onError: (error) => this.handleQuestionBridgeError(entry, error),
+      ...(this.logger ? { logger: this.logger } : {}),
+    });
     entry.approvalBridge = new OmpApprovalBridge({
       respond: (response) => entry.client.respondToExtensionUi(response),
       isGateVerified: () => entry.gateVerified,
       onSurfacedError: (message) => this.surfaceError(entry, message),
+      onQuestionRequest: (event) => entry.questionBridge.handleUiRequest(event),
       ...(this.logger ? { logger: this.logger } : {}),
     });
 
@@ -888,6 +993,8 @@ export class OmpSdkManager extends AbstractCliManager {
       terminalResultEmitted: false,
       completedCleanly: false,
       turnError: null,
+      questionBridgeError: null,
+      turnCeilingAborted: false,
     };
     entry.currentContext = ctx;
 
@@ -1000,7 +1107,9 @@ export class OmpSdkManager extends AbstractCliManager {
         exitCode = 1;
         const message = error instanceof Error ? error.message : String(error);
         this.logger?.error(`[OmpSdkManager] OMP RPC run error for panel ${displayPanelId}: ${message}`);
-        this.emit('error', { panelId: displayPanelId, sessionId: options.sessionId, error: message });
+        if (message !== ctx.questionBridgeError) {
+          this.emit('error', { panelId: displayPanelId, sessionId: options.sessionId, error: message });
+        }
         if (!ctx.terminalResultEmitted) {
           ctx.terminalResultEmitted = true;
           this.emitProjected(
@@ -1096,13 +1205,17 @@ export class OmpSdkManager extends AbstractCliManager {
         this.logger?.warn(
           `[OmpSdkManager] turn exceeded ${OMP_TURN_TIMEOUT_MS}ms — aborting run ${entry.runId}`,
         );
+        // Recorded BEFORE the abort: OMP's aborted `agent_end` is what carries
+        // the misleading "Interrupted by user", and it can arrive as soon as
+        // the abort lands.
+        if (entry.currentContext) entry.currentContext.turnCeilingAborted = true;
         void entry.client.abort().catch(() => undefined);
         grace = setTimeout(
           () =>
             reject(
               new Error(
-                `OMP turn exceeded ${OMP_TURN_TIMEOUT_MS}ms and did not stop within ` +
-                  `${OMP_TURN_ABORT_GRACE_MS}ms of an abort`,
+                `${describeTurnCeilingAbort()} (OMP did not stop within ` +
+                  `${OMP_TURN_ABORT_GRACE_MS}ms of the abort.)`,
               ),
             ),
           OMP_TURN_ABORT_GRACE_MS,
@@ -1214,16 +1327,29 @@ export class OmpSdkManager extends AbstractCliManager {
     if (!ctx) return; // stray event while parked
 
     for (const projected of ctx.projector.project(event)) {
-      if (projected.type === 'agent_result') {
+      // OMP reports every abort as "Interrupted by user", including the ones we
+      // caused. Name the real cause when we know it — a bridge failure first,
+      // since it is the more specific diagnosis, then our own turn ceiling.
+      const trueCause =
+        ctx.questionBridgeError ??
+        (ctx.turnCeilingAborted ? describeTurnCeilingAbort() : null);
+      const effective =
+        projected.type === 'agent_result' &&
+        projected.is_error &&
+        projected.result === 'Interrupted by user' &&
+        trueCause !== null
+          ? { ...projected, result: trueCause }
+          : projected;
+      if (effective.type === 'agent_result') {
         if (ctx.terminalResultEmitted) continue;
         ctx.terminalResultEmitted = true;
       }
-      this.emitProjected(ctx.router, ctx.runId, ctx.displayPanelId, ctx.sessionId, projected);
-      if (projected.type === 'agent_result') {
-        if (projected.is_error) {
+      this.emitProjected(ctx.router, ctx.runId, ctx.displayPanelId, ctx.sessionId, effective);
+      if (effective.type === 'agent_result') {
+        if (effective.is_error) {
           // Recorded rather than thrown: `runTurn` still resolves on this same
           // `agent_end`, and the awaiting turn converts it into the failure.
-          ctx.turnError = projected.result ?? 'OMP turn failed';
+          ctx.turnError = effective.result ?? 'OMP turn failed';
         } else {
           ctx.completedCleanly = true;
         }
@@ -1265,6 +1391,20 @@ export class OmpSdkManager extends AbstractCliManager {
     });
   }
 
+  private handleQuestionBridgeError(entry: WarmOmpEntry, error: Error): void {
+    const detail = error.cause instanceof Error ? `: ${error.cause.message}` : '';
+    const message = `${error.message}${detail}`;
+    if (entry.currentContext) entry.currentContext.questionBridgeError = message;
+    this.surfaceError(entry, message);
+  }
+
+  private requireQuestionRouter(): OmpQuestionRouterPort {
+    if (!this.questionRouterProvider) {
+      throw new Error('OMP question router provider is not configured');
+    }
+    return this.questionRouterProvider();
+  }
+
   // -------------------------------------------------------------------------
   // Teardown
   // -------------------------------------------------------------------------
@@ -1276,6 +1416,7 @@ export class OmpSdkManager extends AbstractCliManager {
     this.clearWarmIdleTimer(entry);
     if (this.warmOmpRuns.get(spawnKey) === entry) this.warmOmpRuns.delete(spawnKey);
     entry.teardownPromise = (async () => {
+      entry.questionBridge.teardown();
       if (interrupt) {
         // A first-class RPC abort, not a signal: it lets OMP stop the turn
         // cleanly and flush its own aborted `agent_end`.

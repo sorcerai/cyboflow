@@ -1,6 +1,7 @@
 import { IpcMain, shell } from 'electron';
 import type { AppServices } from './types';
 import { getDemoSandboxPath, DEMO_PROJECT_NAME, DEMO_REMOTE_URL } from '../services/demo/demoEnvironment';
+import { isSafeExternalOpenTarget } from './artifactFrameGuard';
 
 export function registerAppHandlers(ipcMain: IpcMain, services: AppServices): void {
   const { app } = services;
@@ -17,6 +18,16 @@ export function registerAppHandlers(ipcMain: IpcMain, services: AppServices): vo
   // System utilities
   ipcMain.handle('openExternal', async (_event, url: string) => {
     try {
+      // `shell.openExternal` is an OS launcher, not a browser: `file:` opens a
+      // local document in its registered app and a custom scheme reaches
+      // whatever app claimed it. The url here comes straight from the renderer
+      // (this channel is on the generic-invoke allowlist), so restrict it to
+      // web + mail before the OS ever sees it. See ipc/artifactFrameGuard.ts.
+      if (!isSafeExternalOpenTarget(url)) {
+        console.warn('[Main] Blocked openExternal for non-web scheme:', url);
+        return { success: false, error: 'Only http, https and mailto URLs can be opened externally' };
+      }
+
       // Demo mode: the sandbox's origin is a fake github.com URL (pushes go to
       // a local bare repo — see demoEnvironment.ts). Opening it would 404 in
       // the browser mid-tour, so report success without opening; the Create-PR

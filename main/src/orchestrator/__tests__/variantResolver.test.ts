@@ -44,6 +44,7 @@ function makeDb(): Database.Database {
       agent_runtime TEXT,
       weight INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'draft',
+      archived_at TEXT,  -- migration 116
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -85,11 +86,13 @@ function seedVariant(
     agentOverridesJson?: string | null;
     agentProvider?: string | null;
     agentRuntime?: string | null;
+    /** Migration 116 archive stamp; non-null = archived. */
+    archivedAt?: string | null;
   } = {},
 ): void {
   db.prepare(
-    `INSERT INTO workflow_variants (id, workflow_id, label, spec_json, weight, status, model, execution_model, agent_overrides_json, agent_provider, agent_runtime)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO workflow_variants (id, workflow_id, label, spec_json, weight, status, model, execution_model, agent_overrides_json, agent_provider, agent_runtime, archived_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     opts.workflowId ?? WF,
@@ -102,6 +105,7 @@ function seedVariant(
     opts.agentOverridesJson ?? null,
     opts.agentProvider ?? null,
     opts.agentRuntime ?? null,
+    opts.archivedAt ?? null,
   );
 }
 
@@ -135,6 +139,22 @@ describe('VariantResolver', () => {
     const a = resolver.resolveForLaunch(WF);
     expect(a.variant).toBeNull();
     expect(a.source).toBe('none');
+  });
+
+  it('excludes ARCHIVED active variants from rotation (migration 116, source=none)', () => {
+    seedVariant(db, 'v1', { status: 'active', weight: 1, archivedAt: '2026-08-01T00:00:00Z' });
+    const resolver = new VariantResolver(dbAdapter(db), () => 0);
+    const a = resolver.resolveForLaunch(WF);
+    expect(a.variant).toBeNull();
+    expect(a.source).toBe('none');
+  });
+
+  it('explicit pin loads an ARCHIVED variant (a restart must reproduce a historical run)', () => {
+    seedVariant(db, 'v1', { status: 'active', archivedAt: '2026-08-01T00:00:00Z' });
+    const resolver = new VariantResolver(dbAdapter(db), () => 0);
+    const a = resolver.resolveForLaunch(WF, 'v1');
+    expect(a.variant?.variantId).toBe('v1');
+    expect(a.source).toBe('pin');
   });
 
   it('rng=()=>0 deterministically picks the first active candidate (source=rotation)', () => {

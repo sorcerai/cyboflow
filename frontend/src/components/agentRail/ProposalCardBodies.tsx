@@ -106,18 +106,23 @@ export function LaunchRunBody({ payload }: { payload: LaunchRunProposalPayload }
 /**
  * Absolute-urgency glyph for a target priority. The payload carries no PRIOR
  * priority to diff against (`ReprioritizeBacklogItem` is target-only), so this
- * is deliberately NOT a before/after delta — it reads P0 as "promoted" (green
- * up), P1 as neutral, P2 as "lowered" (muted down), mirroring the packet's
- * green-up / muted-down/neutral color split without fabricating data the
- * payload doesn't have.
+ * is deliberately NOT a before/after delta — it reads a target against three
+ * bands on the 7-level P0-P6 scale (migration 117 widen): P0-P1 "promoted"
+ * (green up), P2-P3 neutral, P4-P6 "lowered" (muted down), mirroring the
+ * packet's green-up / muted-down/neutral color split without fabricating data
+ * the payload doesn't have.
  */
 export function priorityGlyph(priority: Priority): { glyph: string; className: string } {
   switch (priority) {
     case 'P0':
-      return { glyph: '↑', className: 'text-status-success' }; // ↑
-    case 'P2':
-      return { glyph: '↓', className: 'text-text-tertiary' }; // ↓
     case 'P1':
+      return { glyph: '↑', className: 'text-status-success' }; // ↑
+    case 'P4':
+    case 'P5':
+    case 'P6':
+      return { glyph: '↓', className: 'text-text-tertiary' }; // ↓
+    case 'P2':
+    case 'P3':
     default:
       return { glyph: '—', className: 'text-text-tertiary' }; // —
   }

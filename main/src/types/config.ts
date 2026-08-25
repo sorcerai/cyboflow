@@ -1,8 +1,10 @@
 import type { AgentProviderAccess, AgentRuntime } from '../../../shared/types/agentRuntime';
 import type { AssistantContextRetention } from '../../../shared/types/agentThread';
 import type { CliSubstrate } from '../../../shared/types/substrate';
+import type { SprintMaxTasksOverrides } from '../../../shared/types/sprintBatch';
 import type { PermissionMode } from '../../../shared/types/workflows';
 import type { ExecutionModel } from '../../../shared/types/executionModel';
+import type { FanOutDispatch } from '../../../shared/types/fanOutDispatch';
 import type { QuickSessionWorktreeMode } from '../../../shared/types/worktreeMode';
 import type { VisualVerifyConfig } from '../../../shared/types/visualVerification';
 import type { RunTypeDefaults } from '../../../shared/types/sessionDefaults';
@@ -121,6 +123,21 @@ export interface AppConfig {
   // (which hard-pins 'orchestrated'). NOT seeded into the constructor defaults, so existing
   // config.json files stay byte-identical.
   defaultExecutionModel?: ExecutionModel;
+  // Fan-out dispatch mode for orchestrated INTERACTIVE runs ('prose' | 'workflow').
+  // 'workflow' dispatches each inner stage of a wave to a pre-installed dynamic
+  // workflow script instead of the agent driving lanes by hand; the orchestrator
+  // stays the single writer either way. Defaults to 'workflow' when unset, and is NOT
+  // seeded into the constructor defaults so existing config.json files stay
+  // byte-identical.
+  fanOutDispatch?: FanOutDispatch;
+  // Per-substrate override of the sprint task-selection cap N (how many tasks may
+  // be multi-selected into ONE sprint batch). SPARSE: an absent member falls back
+  // to SPRINT_BATCH_MAX_TASKS_DEFAULTS for that substrate, so an install that never
+  // touches the setting keeps the built-in 15 (sdk) / 10 (interactive). Read via
+  // getSprintMaxTasks() and resolved with resolveSprintMaxTasks() — values are
+  // clamped to [SPRINT_MAX_TASKS_MIN, SPRINT_MAX_TASKS_MAX] on read because
+  // config.json is hand-editable. NOT seeded into the constructor defaults.
+  sprintMaxTasks?: SprintMaxTasksOverrides;
   // Global default for where QUICK sessions work ('worktree' | 'in-place').
   // Read via getQuickSessionWorktreeMode() (floor 'worktree') by the
   // sessions:create-quick handler when the request omits worktreeMode. NOT
@@ -200,6 +217,26 @@ export interface AppConfig {
   // exercised live. Mirrors the CYBOFLOW_DEV_FORCE_GATE_STREAM_CLOSED env var.
   // Floored to false when unset; never fires in a packaged release.
   forceAskUserQuestionGateFailure?: boolean;
+  /**
+   * Aria mode — which OMP flavor this install runs.
+   *
+   * OFF (default): the LOCAL OMP runtimes (`omp-sdk` / `omp-pty`) are offered
+   * and the fleet supervisor is hidden. ON: Cyboflow supervises a REMOTE OMP
+   * fleet over the Prime bridge (`omp-fleet`) and the local runtimes are hidden.
+   * The two are alternatives, not a stack — one panel is either a local OMP
+   * process or a remote worker, never both.
+   *
+   * This is also the GRANT of the `omp:supervise` capability: spawning and
+   * killing remote workers is authorized by the operator saying so here, not by
+   * the bridge merely being reachable. `CYBOFLOW_OMP_SUPERVISE` remains an
+   * override for headless/CI hosts that have no Settings UI.
+   *
+   * Read at boot when the fleet session manager is constructed, so a change
+   * takes effect on the next launch (like `additionalPaths`). Independent of
+   * the `omp` provider toggle in Settings -> Integrations, which still has to
+   * be on for ANY OMP runtime to appear.
+   */
+  ariaMode?: boolean;
   // Demo mode: boots the app against a throwaway demo database + sandbox repo
   // with scripted agent runs. Read ONCE at startup — toggling relaunches the app.
   demoMode?: boolean;
@@ -277,6 +314,15 @@ export interface UpdateConfigRequest {
   defaultAgentRuntime?: AgentRuntime;
   // Global default execution model for new SDK workflow runs ('orchestrated' | 'programmatic').
   defaultExecutionModel?: ExecutionModel;
+  // Fan-out dispatch mode for orchestrated INTERACTIVE runs ('prose' | 'workflow').
+  // 'workflow' dispatches each inner stage of a wave to a pre-installed dynamic
+  // workflow script instead of the agent driving lanes by hand; the orchestrator
+  // stays the single writer either way. Defaults to 'workflow' when unset, and is NOT
+  // seeded into the constructor defaults so existing config.json files stay
+  // byte-identical.
+  fanOutDispatch?: FanOutDispatch;
+  // Per-substrate override of the sprint task-selection cap (see AppConfig.sprintMaxTasks).
+  sprintMaxTasks?: SprintMaxTasksOverrides;
   // Global default for where QUICK sessions work (see AppConfig.quickSessionWorktreeMode).
   quickSessionWorktreeMode?: QuickSessionWorktreeMode;
   // Global default CLI substrate for new QUICK sessions (see AppConfig.quickSessionDefaultSubstrate).
@@ -306,6 +352,8 @@ export interface UpdateConfigRequest {
   devMode?: boolean;
   // DEV-ONLY testing affordance (see AppConfig.forceAskUserQuestionGateFailure).
   forceAskUserQuestionGateFailure?: boolean;
+  // Aria mode (see AppConfig.ariaMode) — applied on next launch.
+  ariaMode?: boolean;
   // Demo mode (see AppConfig.demoMode) — applied on next launch.
   demoMode?: boolean;
   // Telemetry settings (see AppConfig.telemetry). Opt-OUT model: both flags default

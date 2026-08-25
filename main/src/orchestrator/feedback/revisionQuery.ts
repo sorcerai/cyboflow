@@ -22,7 +22,7 @@
  * Standalone-typecheck note: nothing here imports electron / better-sqlite3 / a
  * concrete service beyond the claude-exe resolver.
  */
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { loadSdkQuery } from '../../utils/lazyAgentSdk';
 import type { LoggerLike } from '../types';
 import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
 
@@ -107,6 +107,7 @@ export function makeRevisionQuery(
       // interactive canUseTool "ask" — so it never needs stdin held open for
       // control roundtrips, and closing stdin after the message lets the CLI exit
       // cleanly on its own. (Mirrors evalJudgeQuery.)
+      const query = await loadSdkQuery();
       const q = query({
         prompt,
         options: {

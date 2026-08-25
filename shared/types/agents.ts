@@ -78,6 +78,19 @@ export function agentModelLabel(model: AgentModelAlias | null): string {
 }
 
 /**
+ * The three pin fields that together decide what an agent actually runs as.
+ * Named so surfaces that render this triple (the Agents-catalogue chip, the
+ * workflow-editor step card) can pass one value instead of re-declaring the
+ * shape — and cannot quietly drop `runtime`/`providerModel` and fall back to
+ * reading the Claude alias alone.
+ */
+export interface AgentRunTarget {
+  runtime: WorkflowAgentRuntime | null;
+  model: AgentModelAlias | null;
+  providerModel: string | null;
+}
+
+/**
  * Compact "what will this agent run as" label for the Agents-catalogue card chip.
  * Folds the agent's pinned runtime + model into ONE deterministic string, so a
  * Codex-pinned agent no longer reads as "inherits run model" (the old chip looked
@@ -95,11 +108,7 @@ export function agentModelLabel(model: AgentModelAlias | null): string {
  * Claude arm and read as "inherits run model" — the exact bug this function was
  * written to fix, one provider later.
  */
-export function agentRunTargetLabel(cfg: {
-  runtime: WorkflowAgentRuntime | null;
-  model: AgentModelAlias | null;
-  providerModel: string | null;
-}): string {
+export function agentRunTargetLabel(cfg: AgentRunTarget): string {
   const { runtime, model, providerModel } = cfg;
   if (runtime === null) {
     return model === null ? INHERIT_RUN_MODEL_LABEL : AGENT_MODEL_LABELS[model];

@@ -60,8 +60,10 @@ import {
   listRunDecomposedIdeaIds,
   listRunCreatedTaskIds,
   listRunCreatedEpicIds,
+  listRunOwnedIdeaIds,
 } from './runEntityOwnership';
 import { AgentInvocationStore } from './agentInvocationStore';
+import { launchDesignSessionForFork, type DesignSessionLaunchDeps } from './designSessionLaunch';
 
 export type { QuestionRequest, QuestionAnswer, QuestionPayload };
 
@@ -102,6 +104,19 @@ const PLAN_GATED_WORKFLOW_NAMES = new Set(['planner', 'ship', 'launch']);
  * its children.
  */
 const DECOMPOSE_STEP_ID = 'decompose';
+
+/**
+ * The planner's single-idea `approve-idea` gate step id (planner.md step 2),
+ * where — only when context flagged `DESIGN_MODE: yes` — the human may pick
+ * the DESIGN FORK option ("Approve → design mode") instead of a plain Approve.
+ * Verified against planner.md's "## Step reporting" step-id list. Distinct
+ * from both APPROVE_PLAN_STEP_ID and DECOMPOSE_STEP_ID, which is what keeps
+ * launchDesignModeOnFork from ever interacting with promoteTasksOnPlanApproval
+ * / retireShipIdeasOnPlanApproval / deletePendingDraftsOnPlanDecline /
+ * finalizePlannerRun — those are gated on the OTHER step ids and never fire
+ * for an approve-idea answer regardless of its text.
+ */
+const APPROVE_IDEA_STEP_ID = 'approve-idea';
 
 /**
  * Ship (defense-in-depth): the `ship` workflow concatenates planner → sprint in
@@ -347,6 +362,22 @@ export class QuestionRouter extends EventEmitter {
       this.questionQueues.set(runId, q);
     }
     return q;
+  }
+
+  /**
+   * The design-mode-fork launch capability (see designSessionLaunch.ts), wired
+   * once at boot (main/src/index.ts) via {@link setDesignSessionLaunchDeps} —
+   * mirrors how ProposalExecutorDeps is wired for proposalExecutor.ts's
+   * launch-run saga. `null` until wired (every test DB / a build that never
+   * calls the setter): launchDesignModeOnFork degrades to a logged no-op
+   * rather than throwing, since respond() must never fail because of it.
+   */
+  private designSessionLaunchDeps: DesignSessionLaunchDeps | null = null;
+
+  /** Wire the design-mode launch capability. Called once at boot, after the
+   *  composition root's session-create + full-dismiss primitives are ready. */
+  setDesignSessionLaunchDeps(deps: DesignSessionLaunchDeps): void {
+    this.designSessionLaunchDeps = deps;
   }
 
   /**
@@ -784,6 +815,7 @@ export class QuestionRouter extends EventEmitter {
       await this.retireShipIdeasOnPlanApproval(request.runId, effectiveAnswer);
       await this.deletePendingDraftsOnPlanDecline(request.runId, effectiveAnswer, request.questions);
       await this.finalizePlannerRun(request.runId, effectiveAnswer);
+      await this.launchDesignModeOnFork(request.runId, effectiveAnswer, request.questions);
     });
   }
 
@@ -1300,6 +1332,130 @@ export class QuestionRouter extends EventEmitter {
    */
   private isArchiveAnswer(answer: QuestionAnswer): boolean {
     return Object.values(answer.answers).some((v) => v.trim().toLowerCase().startsWith('archive'));
+  }
+
+  /**
+   * Decide whether an `approve-idea` gate answer selected the DESIGN-MODE FORK
+   * option (planner.md step 2 "The design fork" — "Approve → design mode",
+   * offered alongside "Approve → keep planning" / "Revise" / "Reject" only
+   * when context flagged `DESIGN_MODE: yes`).
+   *
+   * Requires an EXACT match (case-insensitive, trimmed) against a PRESENTED
+   * option label that BOTH starts with 'approve' AND contains 'design mode' —
+   * mirroring isRejectAnswer's exact-label-match discipline (never a
+   * prefix/substring match on free text, and never a guess when the fork
+   * wasn't even offered).
+   *
+   * This is deliberately a SEPARATE predicate from isApproveAnswer, not a
+   * reuse of it: isApproveAnswer would in fact return true for "Approve →
+   * design mode" (it only requires a value to start with 'approve' and
+   * contain neither 'revise' nor 'reject'). The two can never collide in
+   * practice, though, because every call site of isApproveAnswer /
+   * isRejectAnswer (promoteTasksOnPlanApproval, retireShipIdeasOnPlanApproval,
+   * deletePendingDraftsOnPlanDecline) is ITSELF gated on
+   * `current_step_id === APPROVE_PLAN_STEP_ID` ('approve-plan') — a different
+   * step id than this gate's 'approve-idea' — so an approve-idea answer never
+   * reaches those methods regardless of its text. Requiring BOTH the 'design
+   * mode' substring AND a presented-option exact match here additionally means
+   * this predicate itself could never be satisfied by a plain 'Approve' /
+   * 'Approve → keep planning' / 'Revise' / 'Reject' answer, independent of
+   * step id — a second, self-contained guarantee against collision.
+   */
+  isDesignModeForkAnswer(answer: QuestionAnswer, questions?: ReadonlyArray<QuestionPayload>): boolean {
+    const values = Object.values(answer.answers).map((v) => v.trim().toLowerCase());
+    if (values.length === 0) return false;
+
+    const forkLabels = new Set<string>();
+    for (const q of questions ?? []) {
+      for (const opt of q.options ?? []) {
+        const label = opt.label.trim().toLowerCase();
+        if (label.startsWith('approve') && label.includes('design mode')) forkLabels.add(label);
+      }
+    }
+    if (forkLabels.size === 0) return false; // the fork was never presented — never guess from free text.
+
+    return values.some((v) => forkLabels.has(v));
+  }
+
+  /**
+   * When the human answers the planner's `approve-idea` gate with the
+   * DESIGN-MODE FORK option, launch a Design Mode session linked to the
+   * gate's idea (designSessionLaunch.ts's launchDesignSessionForFork saga) so
+   * the fork is a real hand-off instead of a prompt that claims one happens.
+   *
+   * The idea is resolved via listRunOwnedIdeaIds — the single-idea
+   * `approve-idea` path (as opposed to the batch `approve-ideas` gate, which
+   * never reaches this method) always owns exactly one idea (its seed, or the
+   * one idea `context` created for a promptless launch); anything other than
+   * exactly one owned idea is treated as unresolvable and reported rather than
+   * guessed.
+   *
+   * Unlike the OTHER post-answer methods above (promoteTasksOnPlanApproval and
+   * siblings — fail-soft best-effort reveals of an ALREADY-successful gate
+   * answer, silently no-op on failure), a launch failure here is ALWAYS
+   * surfaced through designSessionLaunchDeps.reportLaunchFailure (via the
+   * saga) — a fork that silently does nothing is worse than one that reports
+   * it could not launch. Only the OUTER guard (a thrown current_step_id read
+   * on a DB fixture that lacks the column) is fail-soft, matching the sibling
+   * methods' defensive style; it never reaches deps in that case because
+   * nothing about the gate could be determined.
+   *
+   * A `null` designSessionLaunchDeps (never wired — expected only in a test
+   * fixture that does not exercise this behavior) is a logged no-op: respond()
+   * must never fail because of it.
+   */
+  private async launchDesignModeOnFork(
+    runId: string,
+    answer: QuestionAnswer,
+    questions?: ReadonlyArray<QuestionPayload>,
+  ): Promise<void> {
+    try {
+      const run = this.db
+        .prepare('SELECT project_id AS projectId, current_step_id AS currentStepId FROM workflow_runs WHERE id = ?')
+        .get(runId) as { projectId?: unknown; currentStepId?: unknown } | undefined;
+      if (!run) return;
+      if (run.currentStepId !== APPROVE_IDEA_STEP_ID) return;
+      if (!this.isDesignModeForkAnswer(answer, questions)) return;
+
+      const deps = this.designSessionLaunchDeps;
+      if (!deps) {
+        console.warn(
+          `[QuestionRouter] design-mode fork answered for run ${runId} but no launch deps are wired — skipping`,
+        );
+        return;
+      }
+
+      const projectId = typeof run.projectId === 'number' ? run.projectId : Number(run.projectId);
+      const ownedIdeaIds = listRunOwnedIdeaIds(this.db, runId);
+      if (ownedIdeaIds.length !== 1) {
+        deps.reportLaunchFailure({
+          projectId,
+          ideaId: ownedIdeaIds[0] ?? 'unknown',
+          runId,
+          error: `expected exactly 1 owned idea for the approve-idea gate on run ${runId}, found ${ownedIdeaIds.length}`,
+        });
+        return;
+      }
+      const ideaId = ownedIdeaIds[0];
+
+      const result = await launchDesignSessionForFork(deps, {
+        projectId,
+        ideaId,
+        runId,
+        nameHint: `design-${ideaId.slice(0, 8)}-${runId.slice(0, 8)}`,
+      });
+      if (result.ok) {
+        console.log(
+          `[QuestionRouter] design-mode fork: launched session ${result.sessionId} (run ${result.runId}) for idea ${ideaId}`,
+        );
+      }
+      // result.ok === false: launchDesignSessionForFork has already reported
+      // the failure via deps.reportLaunchFailure — nothing further to do here.
+    } catch (err) {
+      console.warn(
+        `[QuestionRouter] launchDesignModeOnFork skipped for run ${runId} (fail-soft outer guard): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**

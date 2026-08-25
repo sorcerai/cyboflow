@@ -2,6 +2,8 @@ import type { AgentProviderAccess, AgentRuntime } from '../../../shared/types/ag
 import type { AssistantContextRetention } from '../../../shared/types/agentThread';
 import type { CliSubstrate } from '../../../shared/types/substrate';
 import type { ExecutionModel } from '../../../shared/types/executionModel';
+import type { FanOutDispatch } from '../../../shared/types/fanOutDispatch';
+import type { SprintMaxTasksOverrides } from '../../../shared/types/sprintBatch';
 import type { PermissionMode } from '../../../shared/types/workflows';
 import type { QuickSessionWorktreeMode } from '../../../shared/types/worktreeMode';
 import type { VisualVerifyConfig } from '../../../shared/types/visualVerification';
@@ -70,6 +72,19 @@ export interface AppConfig {
   // default to the in-process host loop; the interactive substrate always
   // hard-pins 'orchestrated' regardless of this value.
   defaultExecutionModel?: ExecutionModel;
+  // Fan-out dispatch mode for orchestrated INTERACTIVE runs ('prose' | 'workflow').
+  // 'workflow' dispatches each inner stage of a wave to a pre-installed dynamic
+  // workflow script instead of the agent driving lanes by hand; the orchestrator
+  // stays the single writer either way. Defaults to 'workflow' when unset, and is NOT
+  // seeded into the constructor defaults so existing config.json files stay
+  // byte-identical.
+  fanOutDispatch?: FanOutDispatch;
+  // Per-substrate override of the sprint task-selection cap N (how many tasks may
+  // be multi-selected into ONE sprint batch). SPARSE: an absent member falls back
+  // to SPRINT_BATCH_MAX_TASKS_DEFAULTS for that substrate. Always read through
+  // resolveSprintMaxTasks() — never the raw map — so the picker's client-side cap
+  // matches the server-side 400 in runs.start.
+  sprintMaxTasks?: SprintMaxTasksOverrides;
   // Global default for where QUICK sessions work ('worktree' | 'in-place').
   // Floors to 'worktree' when unset. The launch wizard's Advanced "Workspace"
   // tri-state overrides it per launch; workflow-host sessions always pin
@@ -123,6 +138,12 @@ export interface AppConfig {
   // the durable recovery gate can be exercised live. Only takes effect in dev
   // (unpackaged) runs; never fires in a packaged release.
   forceAskUserQuestionGateFailure?: boolean;
+  // Aria mode: supervise a REMOTE OMP fleet (`omp-fleet`) over the Prime bridge
+  // instead of running the LOCAL OMP runtimes (`omp-sdk`/`omp-pty`). The two are
+  // alternatives — the runtime picker offers one or the other, never both. Also
+  // the grant of the `omp:supervise` capability. Read at boot when the fleet
+  // session manager is built, so a change takes effect on the next launch.
+  ariaMode?: boolean;
   // Demo mode: throwaway demo database + sandbox repo with scripted agent runs.
   // Read once at startup — toggling relaunches the app.
   demoMode?: boolean;

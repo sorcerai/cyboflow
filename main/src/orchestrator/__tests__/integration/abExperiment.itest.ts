@@ -60,7 +60,7 @@ import {
   type ExperimentsDeps,
 } from '../../trpc/routers/experiments';
 import { PairwiseJudgeWorker } from '../../eval/pairwiseJudgeWorker';
-import type { PairwiseJudgeWorkerDeps } from '../../eval/pairwiseJudgeWorker';
+import type { PairwiseJudgeWorkerDeps, PairwisePanelSlot } from '../../eval/pairwiseJudgeWorker';
 import type {
   PairwiseJudgeClient,
   PairwiseGradeInput,
@@ -162,6 +162,19 @@ class FakeJudge implements PairwiseJudgeClient {
   grade(input: PairwiseGradeInput): Promise<PairwiseRawResult> {
     return this.impl(input);
   }
+}
+
+/**
+ * A production-SHAPED three-slot panel (claude-1 / claude-2 / codex-1) backed
+ * entirely by FAKE judges — the codex slot is a fake too, so this integration test
+ * never spawns a real Codex app-server.
+ */
+function fakePanel(judge: PairwiseJudgeClient): PairwisePanelSlot[] {
+  return [
+    { slot: 'claude-1', provider: 'claude', model: judge.resolvedModel ?? null, judge },
+    { slot: 'claude-2', provider: 'claude', model: judge.resolvedModel ?? null, judge },
+    { slot: 'codex-1', provider: 'codex', model: judge.resolvedModel ?? null, judge },
+  ];
 }
 
 interface ExpHarness {
@@ -277,7 +290,7 @@ function makeExpHarness(t: TestDb, registry: WorkflowRegistry, tcr: TaskChangeRo
 
 function makePairwiseWorker(
   t: TestDb,
-  judge: PairwiseJudgeClient,
+  panel: PairwisePanelSlot[],
   over: Partial<PairwiseJudgeWorkerDeps> = {},
 ): PairwiseJudgeWorker {
   PairwiseJudgeWorker._resetForTesting();
@@ -285,7 +298,7 @@ function makePairwiseWorker(
     // Canned per-arm diffs keyed off the stamped worktree path.
     gitDiff: async (worktreePath: string) =>
       worktreePath.includes('-A') ? diffFor('a.ts', 'DIFF-A') : diffFor('b.ts', 'DIFF-B'),
-    judge,
+    panel,
     reviewItemWriter: async (projectId, change) => {
       const { reviewItemId } = await ReviewItemRouter.getInstance().applyReviewItem(projectId, change);
       return { reviewItemId };
@@ -487,7 +500,7 @@ describe('Tier-3 A/B testing: variants, rotation, side-by-side experiments, pair
     // -- Pairwise judge (FAKE judge): snapshot → aggregate → mint decision item --
     const worker = makePairwiseWorker(
       t,
-      new FakeJudge(async () => ({ preference: '1', confidence: 0.9, rationale: 'A wins' })),
+      fakePanel(new FakeJudge(async () => ({ preference: '1', confidence: 0.9, rationale: 'A wins' }))),
     );
     const outcome = await worker.maybeSnapshotAndEnqueue(res.experimentId);
     expect(outcome).toBe('enqueued');

@@ -161,6 +161,15 @@ export interface EvalWorkerDeps {
    * ON). Closure keeps the module free of a concrete-service import.
    */
   isVariantAutoGradeEnabled?: () => boolean;
+  /**
+   * Repo paths the run's RUNBOOK BOOTSTRAP wrote, passed straight through to the
+   * snapshot, which excises them from the frozen diff
+   * (docs/proposals/lane-runbook-bootstrap.md §11). Optional for the same reason
+   * as the toggle above: the unit tests drive this worker against a fake
+   * DatabaseLike with no stamp store, and absent means nothing is excised —
+   * byte-identical to the pre-bootstrap behavior.
+   */
+  bootstrapWrittenPaths?: (runId: string) => string[];
   /** Whole-eval retries; defaults to DEFAULT_MAX_RETRIES. */
   maxRetries?: number;
   /** Backoff sleeper (injectable so tests run instantly). */
@@ -281,6 +290,9 @@ export class EvalWorker {
       isEvalEnabled: this.deps.isEvalEnabled,
       ...(this.deps.isVariantAutoGradeEnabled
         ? { isVariantAutoGradeEnabled: this.deps.isVariantAutoGradeEnabled }
+        : {}),
+      ...(this.deps.bootstrapWrittenPaths
+        ? { bootstrapWrittenPaths: this.deps.bootstrapWrittenPaths }
         : {}),
       enqueue: (r, v) => this.enqueue(r, v),
     };

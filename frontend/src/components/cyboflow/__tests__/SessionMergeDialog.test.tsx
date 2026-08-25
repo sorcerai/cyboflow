@@ -9,6 +9,7 @@ vi.mock('../../../utils/api', () => ({
       rebaseToMain: vi.fn(),
       delete: vi.fn(),
       getBranchCommitSubjects: vi.fn(),
+      markComplete: vi.fn(),
     },
   },
 }));
@@ -29,6 +30,7 @@ beforeEach(() => {
   vi.mocked(API.sessions.squashAndRebaseToMain).mockResolvedValue({ success: true });
   vi.mocked(API.sessions.rebaseToMain).mockResolvedValue({ success: true });
   vi.mocked(API.sessions.delete).mockResolvedValue({ success: true });
+  vi.mocked(API.sessions.markComplete).mockResolvedValue({ success: true, data: { stamped: 1 } });
   // Prefill probe fires on open; empty subjects = no prefill (tests own the field).
   vi.mocked(API.sessions.getBranchCommitSubjects).mockResolvedValue({
     success: true,
@@ -156,6 +158,85 @@ describe('SessionMergeDialog', () => {
     expect(defaultProps.onClose).not.toHaveBeenCalled();
     // Dialog stays usable — confirm is re-enabled for a retry after rebasing.
     expect(screen.getByTestId('merge-confirm')).not.toBeDisabled();
+  });
+
+  it('alreadyUpToDate: shows the inline notice instead of an error, skips delete, and keeps the dialog open', async () => {
+    vi.mocked(API.sessions.rebaseToMain).mockResolvedValue({
+      success: false,
+      alreadyUpToDate: true,
+      error: 'Branch has no commits ahead of main.',
+    });
+
+    render(<SessionMergeDialog {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('strategy-preserve'));
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('merge-confirm'));
+    });
+
+    expect(screen.getByTestId('merge-already-up-to-date-notice')).toBeInTheDocument();
+    expect(mockShowError).not.toHaveBeenCalled();
+    expect(API.sessions.delete).not.toHaveBeenCalled();
+    expect(API.sessions.markComplete).not.toHaveBeenCalled();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+    expect(defaultProps.onClose).not.toHaveBeenCalled();
+  });
+
+  it('alreadyUpToDate notice: Mark session complete calls markComplete then delete, then onSuccess + onClose', async () => {
+    vi.mocked(API.sessions.squashAndRebaseToMain).mockResolvedValue({
+      success: false,
+      alreadyUpToDate: true,
+    });
+
+    const callOrder: string[] = [];
+    vi.mocked(API.sessions.markComplete).mockImplementation(async () => {
+      callOrder.push('markComplete');
+      return { success: true, data: { stamped: 1 } };
+    });
+    vi.mocked(API.sessions.delete).mockImplementation(async () => {
+      callOrder.push('delete');
+      return { success: true };
+    });
+
+    render(<SessionMergeDialog {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('strategy-squash'));
+    fireEvent.change(screen.getByPlaceholderText('Describe the changes...'), { target: { value: 'msg' } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('merge-confirm'));
+    });
+    expect(screen.getByTestId('merge-already-up-to-date-notice')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('merge-mark-complete'));
+    });
+
+    expect(callOrder).toEqual(['markComplete', 'delete']);
+    expect(defaultProps.onSuccess).toHaveBeenCalled();
+    expect(defaultProps.onClose).toHaveBeenCalled();
+  });
+
+  it('alreadyUpToDate notice: a failed markComplete does not call delete', async () => {
+    vi.mocked(API.sessions.rebaseToMain).mockResolvedValue({ success: false, alreadyUpToDate: true });
+    vi.mocked(API.sessions.markComplete).mockResolvedValue({ success: false, error: 'stamp failed' });
+
+    render(<SessionMergeDialog {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('strategy-preserve'));
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('merge-confirm'));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('merge-mark-complete'));
+    });
+
+    expect(API.sessions.delete).not.toHaveBeenCalled();
+    expect(defaultProps.onSuccess).not.toHaveBeenCalled();
+    expect(mockShowError).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Mark complete failed',
+      error: 'stamp failed',
+    }));
   });
 
   it('shows loading state on confirm button during merge', async () => {

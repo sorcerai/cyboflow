@@ -16,7 +16,7 @@ Two-way sync between cyboflow's backlog and external issue trackers. Issues impo
 | Parent completion | Shared "close parent when all mirrored children done" write in the provider-agnostic sync core. Idempotent no-op where Linear's native auto-close automation already fired; primary mechanism for Plane (no native equivalent). |
 | Auth (v1) | **Personal API keys**, no OAuth: Linear personal API key; Plane personal access token (`X-API-Key`) + instance base URL for self-hosted. OAuth can slot behind the same wizard step later. |
 | Plane scope | **First-class in v1** — two live adapters day one. |
-| Catalog rows | **Linear + Plane only.** Drop the prototype's GitHub/Jira/Slack rows. Existing Claude/Codex provider rows in the Integrations tab stay as they are. |
+| Catalog rows | **Linear + Plane only** in v1 (Dart added later — see "Provider adapter seam"). Drop the prototype's GitHub/Jira/Slack rows. Existing Claude/Codex provider rows in the Integrations tab stay as they are. |
 | Conflict resolution | Per-connection mode: **Auto** or **Manual** (see below). |
 | Local delete of a linked entity | **Prompt the user** for what happens to the tracker issue. |
 | Remote delete of a linked issue | Routed through conflict resolution: Auto → archive the cyboflow idea/task; Manual → per-item decision. |
@@ -105,7 +105,7 @@ No existing pattern for app-owned third-party secrets exists (no keytar/safeStor
 
 ```ts
 interface TrackerAdapter {
-  provider: 'linear' | 'plane';
+  provider: 'linear' | 'plane' | 'dart';
   validateCredentials(creds): Promise<WorkspaceIdentity>;
   listHierarchy(): Promise<SourceTree>;            // teams/projects → narrows (views, cycles, modules)
   listStates(source): Promise<TrackerState[]>;     // id, name, color, canonical group
@@ -115,14 +115,37 @@ interface TrackerAdapter {
   createSubIssue(parentExternalId, draft, clientKey): Promise<TrackerIssue>;
   updateIssueState(externalId, stateId): Promise<void>;
   capabilities: {
-    nativeParentAutoClose: boolean;   // Linear true, Plane false
-    selfHostedBaseUrl: boolean;       // Plane true
-    idempotentCreate: boolean;        // Linear true (client-supplied issue id); Plane false → reconcile-by-lookup
+    nativeParentAutoClose: boolean;   // Linear true; Plane and Dart false
+    selfHostedBaseUrl: boolean;       // Plane true; Linear and Dart cloud-only
+    idempotentCreate: boolean;        // Linear true (client-supplied issue id); Plane and Dart false → reconcile-by-lookup
   };
 }
 ```
 
-Linear = GraphQL client; Plane = REST client (`X-API-Key`, configurable base URL). The wizard, sync engine, mapping table, conflict machinery, and mirroring logic are all provider-agnostic above this seam.
+Linear = GraphQL client; Plane = REST client (`X-API-Key`, configurable base URL); Dart = REST client (`Bearer` token, cloud-only). The wizard, sync engine, mapping table, conflict machinery, and mirroring logic are all provider-agnostic above this seam.
+
+**Dart (added after v1)** exercised the seam for the first time and cost one adapter plus eight mechanical widenings — no change to the wizard, the sync engine, or any frontend component beyond a row in `TRACKER_PROVIDERS`. Three things about its API have no Linear or Plane analogue and are worth knowing before touching `dartAdapter.ts`:
+
+- **Titles, not ids.** `GET /config` is the only discovery endpoint and returns dartboards and statuses as bare strings, so `TrackerSourceContainer.id` and `TrackerState.id` *are* those titles. A rename in Dart therefore invalidates a connection's stored source selection and state-mapping keys. Since `GET /tasks/list` answers a vanished dartboard with an empty page — which `listIssueIds` would hand the deletion sweep as "everything was deleted remotely" — the adapter guards every pass with `assertContainerExists` and fails loudly instead.
+- **List responses omit the description.** Dart's list shape (`ConciseTask`) drops `description`, which the three-way merge and the recovery marker both need, so `listIssues` hydrates every row through `GET /tasks/{id}` at bounded concurrency. `listIssueIds` deliberately does not, keeping the deletion sweep cheap.
+- **No state grouping.** Dart publishes no state type or category, so `inferStateGroup` guesses `TrackerStateGroup` from the status name. Low-stakes by construction: the group only seeds the wizard's mapping defaults, which the user then overrides.
+- **Sub-issue placement is not inherited.** A `parentId`-only create lands the child on the API user's *default* dartboard, not the parent's — where this connection's dartboard-scoped reads can never see it. `createSubIssue` therefore reads the parent's board and names it explicitly. This one contradicted the obvious reading of the spec and was only caught by running it.
+
+Dart also exposes no workspace identity (`/me` returns only the user, and `/config` carries no space id or name), so `TrackerWorkspaceIdentity.workspaceId` binds to the *account*. The rotation guard (`TrackerIdentityMismatchError`) is correspondingly weaker there: it catches a token pasted from a different account, but not the same user's token for a different space. **Open risk**: if Dart tokens are space-scoped, that gap lets a rotation retain links whose issues the new token cannot see, and the sweep's `getIssue` confirmation would then read them as genuinely deleted. Verifying it needs a second space on one account.
+
+**Measured against a live space (2026-08-18)**, since the spec leaves these open and each one is load-bearing:
+
+| Behaviour | Result |
+| --- | --- |
+| `updated_at_after` bound | **Inclusive** (gte) — the contract's requirement, met natively |
+| `description` list filter | **Contains** — the client-key fast path does hit |
+| Unknown dartboard title | **200 + empty page**, never an error — `assertContainerExists` is load-bearing |
+| Empty `dartboard=` | Filter dropped: returns the **whole space** |
+| Trashed task | **404s** on `GET /tasks/{id}`, absent from listings unless `in_trash=true` |
+| Default filters | `meta.defaultsApplied: false` on a fresh space; `no_defaults=true` changes nothing |
+| `ids` filter | **Silently ignored** in every serialization — a documented param that does nothing |
+
+That last row is the general lesson: Dart drops filters it does not honour rather than erroring, so a test that only asserts "the row I wanted came back" can pass against a filter that never ran. The adapter's own filters (`dartboard`, `parent_id`, `description`, `updated_at_after`) were each re-checked with a negative control.
 
 ## Implementation notes (v1 as landed)
 
@@ -140,7 +163,90 @@ Where the build refined the design above — the spec stands, these are the delt
 - **Plane flags for the live smoke**: docs are mid-rename `/issues/` → `/work-items/` (adapter uses `/issues/`; one-line segment swap if a real instance disagrees); assignees need `expand=assignees`; the workspace slug is part of credentials.
 - **Local-delete flow (shipped, staged-ruling design)**: archiving/deleting a linked entity from the board's card menu interposes a two-choice dialog — "Keep in <provider>" or "Cancel in <provider>" — that only STAGES the ruling (10-minute in-memory TTL, mutates nothing). The real delete/archive event consumes it server-side: cascade members inherit the root's ruling (cancel enqueues before each orphan), an inbound-applied archive never stages so provider actors can't trigger it, and a zombie sweep orphans any link whose entity vanished without an event. Backing out of the final confirm leaves everything untouched. The cancel choice enqueues like any other write — a direct per-issue instruction recorded as durable intent, drained under the status direction's mode. Known residual: an unlinked epic with linked mirrored children cleans their links on cascade but offers no cancel/keep prompt for them.
 
+## Multi-project mapping (rev 4, 2026-08-20)
+
+Replaces the wizard's single "target cyboflow project" pick (old Step 1) and single source
+pick (old Step 2) with one **Map** step: the tracker's project-level groupings map N:1 onto
+cyboflow projects, so one connect flow routes issues into several cyboflow projects. The
+grouping unit per provider (Krishna's ruling): **Linear → projects** (plus whole teams as a
+fallback section, since many Linear workspaces don't use projects), **Plane → projects**,
+**Dart → spaces**.
+
+### Shape: N sibling connection rows, not a join table
+
+A mapping is persisted as **one `tracker_connections` row per (tracker group → cyboflow
+project) pair**, minted by the wizard in one pass, all sharing the same credentials (each row
+stores its own safeStorage blob). This was chosen over a `tracker_project_mappings` join table
+because every durability seam — the compound crash-safe cursor, outbox scoping and ambiguous
+recovery, StateCache, the deletion sweep's remote-id set, the zombie-link sweep (which cannot
+read a project off a deleted entity), echo suppression, and revival identity — keys off one
+connection row = one (project, source) pair. N rows preserve all of those invariants per
+mapping for free, give per-group state mappings (Linear states are per-team, Plane per-project),
+and require **zero data migration for existing connections** — they already ARE the new model
+with one mapping.
+
+### Groups (adapter seam)
+
+New `TrackerAdapter.listGroups(): Promise<TrackerGroupTree>` — sections of
+`TrackerGroup { id, name, key, sourceLabel, selection, stateScopeKey, pushContainerId? }`.
+The group carries its READY-MADE `TrackerSourceSelection`, so the engine consumes it with no
+new scope concepts except Dart's:
+
+- **Linear**: "Projects" section from a new root `projects` query with `teams` — one group per
+  (project × team) pair when a project spans teams (selection `{containerId: teamId,
+  narrowId: projectId, narrowKind: 'project'}` — the existing team+project filter, so no
+  engine change and no cross-team state ambiguity); "Whole teams" section (`narrowKind: 'all'`).
+  `stateScopeKey` = team id. Issues in no project only import via a team group.
+- **Plane**: one group per project (existing container), `stateScopeKey` = project id.
+- **Dart**: spaces derived from the `/config` dartboard-title prefix before the first `/`
+  (`"Engineering/Sprint"` → space `Engineering`); a title with no `/` becomes its own
+  single-board group with the plain dartboard selection. Space groups use the new
+  `narrowKind: 'space'`: the adapter resolves member boards from `/config` at call time and
+  unions per-board fetches (list/ids/recovery); `assertContainerExists` becomes "space still
+  has ≥1 board". Creates need a concrete board, so the group carries `pushContainerId`
+  (default: the space's first board), persisted inside `source_json` and threaded through
+  `TrackerSourceSelection.pushContainerId?`. NOTE: the `/`-prefix convention is observed, not
+  documented by Dart — degrades gracefully to per-board groups.
+
+### Engine deltas (small, additive)
+
+- `tracker_connections.push_target INTEGER NOT NULL DEFAULT 1` (migration; ALTER ADD COLUMN,
+  replay-safe). When several mappings target the same cyboflow project, exactly one row per
+  provider has it set; `handleIdeaPush` skips rows with `push_target = 0` — otherwise a new
+  idea would enqueue one `create_issue` per sibling row and duplicate remotely.
+- **Cross-row duplicate-import guard**: before `importIssueAsIdea`, skip (with a log line) any
+  issue whose `external_id` is already linked by another connection with the same
+  (provider, workspace_id, base_url) — covers overlapping scopes (a Linear team group + a
+  project group under it) and issues moved between mapped groups remotely.
+- **Revival identity gains the source**: `findDisconnectedConnection` also matches
+  `source_json.containerId`, so reviving one mapping can't grab a sibling's row.
+- **`updateCredentials` fans out** to every row sharing (provider, workspace_id, base_url)
+  after the identity probe passes — one paste resumes all mappings.
+- **`connect()` idempotency**: a live row matching (project, provider, workspace, and the FULL
+  source scope — containerId + narrowId + narrowKind, since every Linear project group under one
+  team shares the team's containerId) makes `connect` a no-op returning the existing id, so
+  re-submitting a partially failed multi-mapping wizard never duplicates rows. The no-op still
+  applies what a re-submit legitimately carries fresh: the just-validated key (resuming a paused
+  row) and the push-target choice. Revival matches the same scope, widening-only (a
+  whole-container scope claims its narrows; a Dart space claims member boards), so legacy rows
+  revive without sibling capture. `connect` claims the push target atomically per (project,
+  provider) — demoting armed siblings across wizard runs — and boot demotes replay-manufactured
+  duplicates.
+
+### Wizard (Connect · Map · Tasks · States · Reconcile · Review)
+
+Map lists `wizardGroups` sections with a cyboflow-project select per group (default unmapped =
+don't import) and a push-target radio where N groups share a project. Tasks keeps the three
+selection modes chosen once, with issues fetched per mapping (`wizardIssues` per selection) and
+manual picks grouped by mapping. States renders one table per distinct `stateScopeKey`.
+Reconcile runs `reconcilePreview` per mapped cyboflow project; a link decision routes to the
+mapping whose issue set contains it. Review calls the existing `connect` once per mapping,
+sequentially, with per-mapping progress and retry (safe via connect idempotency). Narrow
+filters (Linear views/cycles, Plane cycles/modules) are not offered by the Map step; existing
+narrowed connections keep working untouched.
+
 ## V2 (explicitly out of v1 scope)
 
 - **Smart import**: an agent classifies incoming issues (idea vs. task, nesting, epic assignment) instead of ideas-by-default.
-- OAuth flows (hosted token exchange), additional providers (Jira, GitHub), assignee/estimate/priority mapping (v1 imports them as display metadata only), configurable cadence, real-time webhooks.
+- OAuth flows (hosted token exchange), further providers (Jira, GitHub — Dart has since landed), assignee/estimate/priority mapping (v1 imports them as display metadata only), configurable cadence, real-time webhooks.
+- Multi-project mapping follow-ups: per-mapping direction modes, a Linear "no project" pseudo-group. (SHIPPED since rev 4: mapping management from Settings — a "Project mappings" card on the connected view listing every sibling of the workspace identity with per-row remove + push-target control (`mappings`/`setPushTarget` procs), an "Add mapping" wizard mode that reuses the stored key (`credentials` XOR `connectionId` on the probes and `sourceConnectionId` on connect — no key re-paste, nothing key-shaped crosses IPC), and the catalog's Connect CTA now rendered only for providers with no live connection. Push-target invariants hardened alongside: disconnect promotes the oldest surviving sibling, setPushTarget refuses a paused row while an active sibling pushes, and the add-mapping wizard defers to an incumbent pusher instead of silently claiming.)

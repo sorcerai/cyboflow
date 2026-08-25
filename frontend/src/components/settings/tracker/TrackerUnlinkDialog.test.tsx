@@ -4,14 +4,17 @@
  * Same harness as the other tracker component tests: the real component over a
  * module mock of the tRPC client.
  *
- * Coverage: both design choices are offered and named after the provider; each
- * STAGES its own `cancelRemote` — and stages ONLY, never `unlinkEntity`, so
- * nothing is mutated while the delete confirm behind this dialog is still
- * dismissible — and only then hands control back; the copy says so, and says the
- * ruling covers synced children on a cascading delete; dismissing rules nothing
- * and additionally CLEARS any ruling still staged for the entity (a staged
- * ruling is keyed by entity alone, so an abandoned one would stay consumable);
- * a rejected staging keeps the dialog open and does NOT let the delete through.
+ * Coverage: both design choices are offered and named after the provider(s) —
+ * `links` carries EVERY live link the entity has, and a two-provider case
+ * discloses both in the title, body and buttons rather than naming only the
+ * first; each STAGES its own `cancelRemote` — and stages ONLY, never
+ * `unlinkEntity`, so nothing is mutated while the delete confirm behind this
+ * dialog is still dismissible — and only then hands control back; the copy
+ * says so, and says the ruling covers synced children on a cascading delete;
+ * dismissing rules nothing and additionally CLEARS any ruling still staged for
+ * the entity (a staged ruling is keyed by entity alone, so an abandoned one
+ * would stay consumable); a rejected staging keeps the dialog open and does NOT
+ * let the delete through.
  */
 import '@testing-library/jest-dom';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -44,6 +47,14 @@ const LINK: TrackerEntityLinkRef = {
   provider: 'linear',
   externalIdentifier: 'CORE-142',
   externalUrl: 'https://linear.app/acme/issue/CORE-142',
+  removalAction: 'archive',
+};
+
+const DART_LINK: TrackerEntityLinkRef = {
+  provider: 'dart',
+  externalIdentifier: 'DART-7',
+  externalUrl: 'https://app.itsdart.com/t/DART-7',
+  removalAction: 'archive',
 };
 
 const onClose = vi.fn();
@@ -56,7 +67,7 @@ function renderDialog(props: Partial<Parameters<typeof TrackerUnlinkDialog>[0]> 
       entityId="tsk_1"
       entityRef="TASK-001"
       action="delete"
-      link={LINK}
+      links={[LINK]}
       isOpen
       onClose={onClose}
       onResolved={onResolved}
@@ -83,7 +94,7 @@ describe('TrackerUnlinkDialog', () => {
     renderDialog();
     expect(screen.getByTestId('tracker-unlink-keep')).toHaveTextContent('Keep in Linear');
     expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
-      'Cancel in Linear',
+      'Archive in Linear',
     );
     // The promise the design makes: cyboflow never deletes the remote issue.
     expect(screen.getByTestId('tracker-unlink-dialog')).toHaveTextContent(
@@ -93,6 +104,62 @@ describe('TrackerUnlinkDialog', () => {
     // ...and the staging promise: this dialog changes nothing on its own.
     expect(screen.getByTestId('tracker-unlink-dialog')).toHaveTextContent(
       /Nothing happens until you confirm/i,
+    );
+  });
+
+  it('an entity linked to TWO providers discloses both, not just the first', () => {
+    // The regression this fixes: the old single-link shape let the dialog say
+    // "Archive in Linear" while the ruling was applied to every live link — an
+    // entity ALSO synced to Dart had its Dart task trashed undisclosed. Passing
+    // the whole array makes the copy name every provider involved.
+    renderDialog({ links: [LINK, DART_LINK] });
+
+    expect(screen.getByTestId('tracker-unlink-keep')).toHaveTextContent('Keep in Linear and Dart');
+    expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
+      'Archive in Linear and Dart',
+    );
+    const dialog = screen.getByTestId('tracker-unlink-dialog');
+    expect(dialog).toHaveTextContent('CORE-142');
+    expect(dialog).toHaveTextContent('DART-7');
+  });
+
+  it('promises "Mark cancelled", never "Archive", when every link would only cancel', () => {
+    // Finding 2 of adversarial round 3: under the DEFAULT archive_sync_mode
+    // 'off' (and for Plane always), the ruling's remote action is the
+    // cancelled-state write — a button that says "Archive" would promise an
+    // action the service does not perform.
+    renderDialog({ links: [{ ...LINK, removalAction: 'cancel' }] });
+    expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
+      'Mark cancelled in Linear',
+    );
+    expect(screen.getByTestId('tracker-unlink-fine-print')).toHaveTextContent(
+      /marked cancelled instead/i,
+    );
+    expect(screen.getByTestId('tracker-unlink-fine-print')).not.toHaveTextContent(
+      /trash or archive/i,
+    );
+  });
+
+  it('a MIXED archive/cancel link set annotates each issue with its real outcome', () => {
+    renderDialog({
+      links: [LINK, { ...DART_LINK, removalAction: 'cancel' }],
+    });
+    expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
+      'Archive / mark cancelled',
+    );
+    const list = screen.getByTestId('tracker-unlink-issue-list');
+    expect(list).toHaveTextContent('CORE-142 in Linear · moved to trash/archive');
+    expect(list).toHaveTextContent('DART-7 in Dart · marked cancelled');
+  });
+
+  it('the single-link case still reads exactly as it did before the array change', () => {
+    renderDialog({ links: [LINK] });
+    expect(screen.getByTestId('tracker-unlink-keep')).toHaveTextContent('Keep in Linear');
+    expect(screen.getByTestId('tracker-unlink-cancel-remote')).toHaveTextContent(
+      'Archive in Linear',
+    );
+    expect(screen.getByTestId('tracker-unlink-dialog')).toHaveTextContent(
+      "Deleting this task does not delete CORE-142 in Linear",
     );
   });
 
@@ -114,7 +181,7 @@ describe('TrackerUnlinkDialog', () => {
     expect(mockClear).not.toHaveBeenCalled();
   });
 
-  it('"Cancel in <provider>" stages the remote cancel, then releases the delete', async () => {
+  it('"Archive in <provider>" stages the remote archive, then releases the delete', async () => {
     renderDialog({ action: 'archive', entityType: 'idea', entityId: 'ide_9' });
     fireEvent.click(screen.getByTestId('tracker-unlink-cancel-remote'));
 

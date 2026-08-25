@@ -22,6 +22,13 @@ import * as path from 'path';
 import type Database from 'better-sqlite3';
 import type { LoggerLike } from '../../../orchestrator/types';
 import { resolveWorkflowBundle } from '../../../orchestrator/workflows/workflowBundle';
+import { resolveWorkflowDefinition } from '../../../../../shared/types/workflows';
+import {
+  DEFAULT_FAN_OUT_DISPATCH,
+  type FanOutDispatch,
+} from '../../../../../shared/types/fanOutDispatch';
+import { renderFanOutBatchScripts } from '../../../orchestrator/prompts/fanOutStageScript';
+import { resolveRunFrozenSpec } from '../../../orchestrator/runFrozenSpec';
 import type { WorkflowBundleWriter } from './workflowBundleWriter';
 import { installAgentOverlay } from './agentOverlayWriter';
 
@@ -38,6 +45,16 @@ const CYBOFLOW_EXCLUDE_PATTERNS = [
   '.claude/agents/cyboflow-*.md',
   '.claude/commands/cyboflow-*.md',
 ];
+
+/**
+ * Exclude pattern for RENDERED dynamic-workflow stage scripts. Kept OUT of the
+ * always-applied list above and appended only when scripts are actually being
+ * installed: `ensureBundleExcluded` runs on every spawn, so folding this in
+ * unconditionally would mutate `.git/info/exclude` in every worktree even for
+ * runs that never render a script — breaking the "dispatch off ⇒ nothing on
+ * disk changes" floor.
+ */
+const CYBOFLOW_SCRIPT_EXCLUDE_PATTERN = '.claude/workflows/cyboflow-*.js';
 
 /**
  * True when a failed `git` invocation failed *because the cwd is not a git
@@ -69,7 +86,8 @@ function isNotAGitRepositoryError(err: unknown): boolean {
  * nothing to exclude. That case is logged at debug and returns; every OTHER git
  * or fs failure still warns, because those are real and worth seeing.
  */
-function ensureBundleExcluded(worktreePath: string, logger?: LoggerLike): void {
+function ensureBundleExcluded(worktreePath: string, extraPatterns: string[], logger?: LoggerLike): void {
+  const patterns = [...CYBOFLOW_EXCLUDE_PATTERNS, ...extraPatterns];
   try {
     const raw = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], {
       cwd: worktreePath,
@@ -90,7 +108,7 @@ function ensureBundleExcluded(worktreePath: string, logger?: LoggerLike): void {
       /* file absent — created below */
     }
     const lines = existing.split(/\r?\n/);
-    const missing = CYBOFLOW_EXCLUDE_PATTERNS.filter((p) => !lines.includes(p));
+    const missing = patterns.filter((p) => !lines.includes(p));
     if (missing.length === 0) return;
 
     const parts: string[] = [];
@@ -142,6 +160,54 @@ function getRunWorkflowPath(db: Database.Database, runId: string, logger?: Logge
 }
 
 /**
+ * Render the run's fan-out STAGE scripts from its EFFECTIVE workflow definition.
+ *
+ * Resolves through `resolveRunFrozenSpec` — the run's frozen A/B variant graph,
+ * falling back to the live spec — deliberately NOT the live `workflows.spec_json`
+ * join used for `workflow_path`. The prompt side resolves the frozen spec too
+ * (interactiveClaudeManager.resolveRunEffectiveDefinition); reading the live row
+ * here would let a variant run install scripts for a DIFFERENT inner chain than
+ * the one its prompt walks, and the mismatch would surface only as the agent
+ * naming a workflow that does not exist.
+ *
+ * Fail-soft to `[]` on any DB/resolve error — a missing script degrades to the
+ * prose path, which is the correct floor.
+ */
+function resolveStageScripts(
+  db: Database.Database,
+  runId: string,
+  logger?: LoggerLike,
+): Array<{ name: string; content: string }> {
+  try {
+    const row = db
+      .prepare(
+        `SELECT w.name AS name, w.spec_json AS specJson
+           FROM workflow_runs r
+           JOIN workflows w ON w.id = r.workflow_id
+          WHERE r.id = ?`,
+      )
+      .get(runId) as { name?: unknown; specJson?: unknown } | undefined;
+    if (typeof row?.name !== 'string') return [];
+
+    const frozen = resolveRunFrozenSpec(db, runId)?.specJson;
+    const specJson = typeof frozen === 'string'
+      ? frozen
+      : (typeof row.specJson === 'string' ? row.specJson : '{}');
+
+    const def = resolveWorkflowDefinition(row.name, specJson);
+    if (def === null) return [];
+
+    const steps = def.phases.flatMap((phase) => phase.steps);
+    return renderFanOutBatchScripts(row.name, steps);
+  } catch (err) {
+    logger?.warn(
+      `[WorkflowBundleInstall] stage-script render failed for runId=${runId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
  * Resolve + install the run's co-located command/agent bundle into `worktreePath`.
  * No-op (writes nothing) when the run has no resolvable `workflow_path` or no
  * sibling bundle dir. Never throws — a bundle failure must not break a spawn.
@@ -152,14 +218,26 @@ export function installWorkflowBundle(
   runId: string,
   worktreePath: string,
   logger?: LoggerLike,
+  dispatch: FanOutDispatch = DEFAULT_FAN_OUT_DISPATCH,
 ): void {
   try {
-    // Keep the generated cyboflow-*.md files out of git (run diff + commits)
-    // BEFORE writing them, so they never flicker into a diff poll.
-    ensureBundleExcluded(worktreePath, logger);
+    // Stage scripts for the fan-out steps — ONLY in 'workflow' dispatch. The
+    // mode is a threaded ARGUMENT, not a global config read: this seam is
+    // substrate-shared (the SDK manager calls it too) and the SDK consumes no
+    // scripts, so reading a global here would litter SDK worktrees.
+    const scripts = dispatch === 'workflow' ? resolveStageScripts(db, runId, logger) : [];
+
+    // Keep the generated cyboflow files out of git (run diff + commits) BEFORE
+    // writing them, so they never flicker into a diff poll. The scripts glob is
+    // added only when scripts are actually being installed.
+    ensureBundleExcluded(
+      worktreePath,
+      scripts.length > 0 ? [CYBOFLOW_SCRIPT_EXCLUDE_PATTERN] : [],
+      logger,
+    );
 
     const workflowPath = getRunWorkflowPath(db, runId, logger);
-    const bundle = resolveWorkflowBundle(workflowPath);
+    const bundle = { ...resolveWorkflowBundle(workflowPath), scripts };
     writer.write(worktreePath, bundle);
     // Overlay the project's FULL effective agent set (built-ins + agent_overrides)
     // on top of the flow bundle, so a custom/quick flow still gets the project's

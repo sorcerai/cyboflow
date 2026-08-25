@@ -74,14 +74,25 @@
  * NON-BLOCKING review-queue finding carrying both values, through the optional
  * `reviewRouter` seam. See {@link fileAutoResolutionFinding}.
  *
- * ERRORS. A per-issue failure (a rejected applyChange — active runs, a
- * forbidden stage, a vanished entity) propagates out of runInboundSync. That
- * is intentional: the cursor has not advanced past the failing item, so the
- * next pass replays it. The service layer owns logging/backoff.
+ * ERRORS. An UNEXPECTED per-issue failure propagates out of runInboundSync.
+ * That is intentional: the cursor has not advanced past the failing item, so
+ * the next pass replays it. The service layer owns logging/backoff.
+ *
+ * The two EXPECTED rejections are handled per-item instead, because letting
+ * them propagate wedges the connection rather than delaying one row. A linked
+ * entity refuses a stage move while it has a live run ('active_runs') or when
+ * the target stage is orchestrator-derived ('forbidden_stage') — and in
+ * cyboflow the first is ordinary, not exotic: an item pulled into a session has
+ * a non-terminal run for as long as the session lasts. Propagating aborted the
+ * whole pass, left the cursor pinned on that item, and skipped every issue
+ * behind it AND the deletion sweep — so one live run stopped the connection's
+ * entire inbound flow until it ended. Both now defer the item exactly as a held
+ * direction does (see {@link isDeferrableRejection}).
  */
 import type Database from 'better-sqlite3';
 import type { EntityExternalLinkRow, TrackerConnectionRow } from '../../database/models';
 import type { TaskChange, TaskFieldChanges } from '../../orchestrator/taskChangeRouter';
+import type { EntityCategory, Priority } from '../../../../shared/types/tasks';
 import type { ReviewItemCreate } from '../../orchestrator/reviewItemRouter';
 import type { TrackerAdapter } from './adapterTypes';
 import type {
@@ -94,6 +105,7 @@ import type {
 } from '../../../../shared/types/trackerSync';
 import {
   advanceCursor,
+  findSiblingLinkForExternal,
   getLinkByEntity,
   getLinkByExternal,
   hasOpenConflictForLink,
@@ -111,8 +123,22 @@ import {
   resolveStageIds,
   type TrackerStageIds,
 } from './stateMapping';
+import {
+  localPriorityForToken,
+  providerPriorityToken,
+  providerTokensEqual,
+  resolveEffectivePriorityMapping,
+  type PriorityMapping,
+} from './priorityMapping';
+import {
+  localCategoryForToken,
+  providerCategoryToken,
+  providerSupportsCategorySync,
+  resolveEffectiveCategoryMapping,
+  type CategoryMapping,
+} from './categoryMapping';
 import { isWriteBackGroup, parseJsonObject, type WriteBackGroup } from './writeBack';
-import { PROVENANCE_MARKER_PREFIX, provenanceMarker } from './provenance';
+import { provenanceMarker, splitBody, joinBody, normalizeDescription } from './provenance';
 
 // ---------------------------------------------------------------------------
 // Dependencies + public shapes
@@ -192,6 +218,23 @@ export interface TrackerBaseline {
   description: string | null;
   stateId: string;
   updatedAt: string;
+  /**
+   * The remote's PROVIDER-RAW priority / type tokens (see
+   * {@link TrackerIssue.priority} for why raw). OPTIONAL, and the difference
+   * between `undefined` and `null` is load-bearing:
+   *
+   *   undefined — this baseline was written before the field was synced at all,
+   *               so we do not know where the remote stood. The merge must do
+   *               NOTHING with it (invariant 3): no diff, no conflict, no apply.
+   *               `composeBaselineJson`'s unconditional overlay heals it at the
+   *               end of the same pass, and merging starts from the next change.
+   *   null      — we looked, and the remote genuinely has no value there.
+   *
+   * Collapsing the two would open a conflict (or silently overwrite the local
+   * value) on every linked entity the first time a pass ran this code.
+   */
+  priority?: string | null;
+  category?: string | null;
 }
 
 /**
@@ -213,6 +256,21 @@ export interface TrackerConflictPayload {
   remoteStateId?: string;
   /** STAGE conflicts only: that state's write-back group, null when it has none. */
   remoteGroup?: WriteBackGroup | null;
+  /**
+   * PRIORITY / CATEGORY conflicts only: the LOCAL value (`P0`… / `bug`…) the
+   * remote token resolved to when the conflict was detected.
+   *
+   * The mirror image of `remoteStateId`, and it exists for the same reason: a
+   * mapped field's `remote_value` cannot be acted on with only the row in hand.
+   * A stage row stores the raw state because its `remote_value` is already
+   * mapped; these store the mapped value because their `remote_value` is
+   * deliberately RAW (invariant 2). Resolving the token later would mean
+   * rebuilding the effective mapping — which needs the provider's LIVE option
+   * list, i.e. a network call from a UI click, and one that could answer
+   * differently than the pass did. Recording the pass's own answer keeps the
+   * ruling faithful to the conflict the user was actually shown.
+   */
+  remoteLocal?: string;
 }
 
 /**
@@ -229,6 +287,20 @@ export function readConflictRemoteState(
     stateId: payload.remoteStateId,
     group: isWriteBackGroup(payload.remoteGroup) ? payload.remoteGroup : null,
   };
+}
+
+/**
+ * The LOCAL value a mapped-field conflict recorded for its remote side, or null
+ * when the row carries none — a title/description/stage conflict, or a
+ * priority/category row written before this key existed. Still a bare string
+ * here: the caller narrows it to a `Priority` or an `EntityCategory` depending
+ * on which field it is resolving. See {@link TrackerConflictPayload.remoteLocal}.
+ */
+export function readConflictRemoteLocal(payloadJson: string | null): string | null {
+  const payload = parseJsonObject(payloadJson);
+  return typeof payload.remoteLocal === 'string' && payload.remoteLocal.length > 0
+    ? payload.remoteLocal
+    : null;
 }
 
 /**
@@ -252,9 +324,10 @@ export interface InboundSyncReport {
   updated: number;
   /**
    * Fetched issues deliberately NOT applied: don't-import states, selection
-   * filtered out, an open conflict pausing the item, an orphaned link, a
-   * locally-deleted entity, or a first-pass baseline seed. Overlap-window
-   * replays are dropped BEFORE this loop and are not counted.
+   * filtered out, an issue a sibling mapping already owns, an open conflict
+   * pausing the item, an orphaned link, a locally-deleted entity, or a
+   * first-pass baseline seed. Overlap-window replays are dropped BEFORE this
+   * loop and are not counted.
    */
   skipped: number;
   /** Manual-mode conflict rows opened for the user this pass. */
@@ -263,6 +336,12 @@ export interface InboundSyncReport {
   autoResolved: number;
   /** Linked entities archived because the remote issue was archived. */
   archivedRemotely: number;
+  /**
+   * Unlinked issues another mapping on the same tracker identity already owns
+   * (see {@link isOwnedBySiblingMapping}). Also counted in {@link skipped} —
+   * this is the REASON breakdown of a permanent skip, not a separate outcome.
+   */
+  crossScopeSkips: number;
   /**
    * Remote stage changes recognized but NOT applied because the status
    * direction is held ({@link InboundSyncDeps.applyLinkedStage}). Each one also
@@ -275,6 +354,34 @@ export interface InboundSyncReport {
    * same reason: a held import must be delayed, never dropped.
    */
   importDeferred: number;
+  /**
+   * Remote CONTENT changes an item PARKED behind an open conflict is sitting
+   * on, which no conflict row records (see {@link outcomeForParkedLink}). Pins
+   * the cursor: nothing else holds these, so letting the window move past one
+   * would lose a remote edit outright.
+   */
+  contentDeferred: number;
+  /**
+   * Remote changes recognized but NOT applied because the LOCAL entity refused
+   * the write — a live run owns its stage, or the mapped stage is
+   * orchestrator-derived. Pins the cursor like the other deferrals: the entity
+   * is unlocked by time, not by a user decision, so the change is re-offered
+   * every pass until one lands it. See {@link isDeferrableRejection}.
+   */
+  entityLocked: number;
+  /**
+   * Remote priority/category values this pass could not express locally: the
+   * provider token has no entry in the effective mapping, because the workspace
+   * renamed it or defines a value the mapping never named (both are ordinary on
+   * Dart, which addresses these fields BY TITLE).
+   *
+   * Nothing is applied and no conflict is opened — we will not guess a level or
+   * a classification the user never chose. The count exists so the sync log can
+   * say "confirm the mapping", and the merge deliberately keeps the field's half
+   * of the baseline PINNED so the warning re-derives every pass instead of going
+   * quiet after the first one.
+   */
+  unmappedFieldValues: number;
   /** Filled in by {@link runDeletionSweep} when the service folds its result in. */
   sweepArchived?: number;
   /** External id the batch stopped at because our own write is still in flight. */
@@ -293,6 +400,12 @@ export interface InboundSweepReport {
    * them; the count exists so the sync log can say so.
    */
   outOfScope: number;
+  /**
+   * Links whose remote issue is gone but whose local entity refused the archive
+   * (a live run owns it). Nothing was written, so the link stays active and the
+   * next sweep retries it. See {@link isDeferrableRejection}.
+   */
+  entityLocked: number;
 }
 
 /** The connection is not configured well enough to sync (bad/absent source_json). */
@@ -314,54 +427,29 @@ export const OVERLAP_WINDOW_MS = 10 * 60 * 1000;
 // Provenance footer
 // ---------------------------------------------------------------------------
 
-const PROVIDER_LABEL: Record<TrackerProvider, string> = { linear: 'Linear', plane: 'Plane' };
-
-/** The markdown rule the footer block opens with. */
-const FOOTER_FENCE = '---\n';
-/** The substring that identifies a footer block inside a stored body. */
-const FOOTER_START = FOOTER_FENCE + PROVENANCE_MARKER_PREFIX;
+const PROVIDER_LABEL: Record<TrackerProvider, string> = {
+  linear: 'Linear',
+  plane: 'Plane',
+  dart: 'Dart',
+};
 
 /** The provenance block appended to an imported idea's body (issue ref + URL). */
 function buildProvenanceFooter(provider: TrackerProvider, issue: TrackerIssue): string {
   const marker = provenanceMarker(provider, issue.externalId);
-  return `${marker}\nImported from ${PROVIDER_LABEL[provider]} · [${issue.identifier}](${issue.url})`;
+  return `${marker}\nImported from ${PROVIDER_LABEL[provider]} \u00b7 [${issue.identifier}](${issue.url})`;
 }
 
 /**
- * Split a stored body into the remote-owned description half and the
- * cyboflow-owned provenance footer half. A body with no footer (a
- * pre-existing entity linked through the wizard's Reconcile step) reads back
- * as description-only, and rejoins without one — we never retro-fit a footer
- * onto an entity the user wrote themselves.
+ * The body-split helpers now live in provenance.ts, beside the marker that
+ * DEFINES where a footer begins — writeBack.ts's content trigger needs the same
+ * description half, and this module already imports from writeBack, so keeping
+ * them here would close an import cycle.
  *
- * Exported (with {@link joinBody}) for the service layer's manual
- * conflict-resolution path, which applies a stored `remote_value` description
- * onto an entity and must preserve that entity's footer exactly as this pass
- * would have.
+ * Re-exported under their historical names so every existing call site (the
+ * outbox worker's body alignment, the service's conflict resolution, the tests)
+ * keeps importing them from the module that used to own them.
  */
-export function splitBody(body: string | null): { description: string | null; footer: string | null } {
-  if (body === null) return { description: null, footer: null };
-  const at = body.indexOf(FOOTER_START);
-  if (at < 0) return { description: body.length > 0 ? body : null, footer: null };
-  const description = body.slice(0, at).replace(/\s+$/, '');
-  return {
-    description: description.length > 0 ? description : null,
-    footer: body.slice(at + FOOTER_FENCE.length),
-  };
-}
-
-/** Inverse of {@link splitBody}. */
-export function joinBody(description: string | null, footer: string | null): string | null {
-  const desc = description !== null && description.trim().length > 0 ? description : null;
-  if (footer === null) return desc;
-  const block = `${FOOTER_FENCE}${footer}`;
-  return desc === null ? block : `${desc}\n\n${block}`;
-}
-
-/** Empty and absent descriptions are the same thing on both sides of a diff. */
-function normalizeDescription(value: string | null): string {
-  return value === null ? '' : value.trim();
-}
+export { splitBody, joinBody, normalizeDescription } from './provenance';
 
 // ---------------------------------------------------------------------------
 // Compound cursor
@@ -427,11 +515,18 @@ function parseSourceSelection(connection: TrackerConnectionRow): TrackerSourceSe
   if (typeof candidate.containerId !== 'string' || typeof candidate.narrowId !== 'string') {
     throw new TrackerSyncConfigError(`connection ${connection.id} source_json is missing container/narrow ids`);
   }
-  return {
+  const selection: TrackerSourceSelection = {
     containerId: candidate.containerId,
     narrowId: candidate.narrowId,
     narrowKind: candidate.narrowKind ?? 'all',
   };
+  // Dart space groups only: the concrete board a CREATE is filed against. Read
+  // here so ONE parse serves the whole pass; nothing inbound uses it, and it is
+  // never invented — a selection without one simply has none.
+  if (typeof candidate.pushContainerId === 'string') {
+    selection.pushContainerId = candidate.pushContainerId;
+  }
+  return selection;
 }
 
 /** Parse `selection_json`; a missing/corrupt blob reads back as an empty selection. */
@@ -468,21 +563,42 @@ function parseBaseline(baselineJson: string | null): TrackerBaseline | null {
   if (typeof parsed !== 'object' || parsed === null) return null;
   const candidate = parsed as Record<string, unknown>;
   if (typeof candidate.title !== 'string' || typeof candidate.stateId !== 'string') return null;
-  return {
+  const baseline: TrackerBaseline = {
     title: candidate.title,
     description: typeof candidate.description === 'string' ? candidate.description : null,
     stateId: candidate.stateId,
     updatedAt: typeof candidate.updatedAt === 'string' ? candidate.updatedAt : '',
   };
+  // KEY PRESENCE, not value truthiness: an absent key must stay `undefined` so
+  // the backfill arm can recognize a pre-feature baseline, while a stored null
+  // is a real "the remote has no priority" answer. Defaulting either one would
+  // erase that distinction — see TrackerBaseline.priority.
+  if ('priority' in candidate) baseline.priority = asNullableString(candidate.priority);
+  if ('category' in candidate) baseline.category = asNullableString(candidate.category);
+  return baseline;
 }
 
-/** Snapshot an issue's merge-relevant fields for `baseline_json`. */
+/** A stored token, or null for anything that is not a usable string. */
+function asNullableString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * Snapshot an issue's merge-relevant fields for `baseline_json`.
+ *
+ * `priority` / `category` are ALWAYS emitted, including as null. That is what
+ * makes the backfill arm self-healing: the first pass over a pre-feature link
+ * declines to merge the field and then writes this snapshot over the blob, so
+ * the NEXT pass has a real baseline to diff against.
+ */
 function snapshotOf(issue: TrackerIssue): TrackerBaseline {
   return {
     title: issue.title,
     description: issue.description,
     stateId: issue.stateId,
     updatedAt: issue.updatedAt,
+    priority: issue.priority,
+    category: issue.category,
   };
 }
 
@@ -526,6 +642,14 @@ interface LocalEntity {
   title: string;
   body: string | null;
   stageId: string;
+  /**
+   * Both columns are NOT NULL with defaults on all THREE entity tables — 015
+   * created `priority` on each, 059 added `category` to each — so the merge's
+   * priority and category arms apply uniformly to ideas, epics and tasks, with
+   * no per-table branch.
+   */
+  priority: Priority;
+  category: EntityCategory;
 }
 
 /**
@@ -540,7 +664,7 @@ function readLocalEntity(
 ): LocalEntity | null {
   const row = db
     .prepare(
-      `SELECT ref, title, body, stage_id AS stageId
+      `SELECT ref, title, body, stage_id AS stageId, priority, category
          FROM ${ENTITY_TABLE[entityType]}
         WHERE id = ?`,
     )
@@ -599,6 +723,18 @@ interface SyncContext {
   mapping: TrackerStateMapping;
   /** stateId -> the provider state's CANONICAL group (the write-back stamp's input). */
   stateGroups: Record<string, TrackerStateGroup>;
+  /**
+   * The connection's effective field mappings, resolved ONCE per pass beside
+   * the state mapping (same seed → overlay shape). Both are consulted only at
+   * the merge edge: the diff itself runs in provider space (invariant 2).
+   */
+  priorityMapping: PriorityMapping;
+  categoryMapping: CategoryMapping;
+  /**
+   * Does this provider model a type the category can live on? False stands the
+   * whole category arm down — see {@link providerSupportsCategorySync}.
+   */
+  categorySync: boolean;
   /** See {@link InboundSyncDeps.applyLinkedStage}. */
   applyLinkedStage: boolean;
   /** See {@link InboundSyncDeps.importNewIssues}. */
@@ -606,9 +742,18 @@ interface SyncContext {
   report: InboundSyncReport;
 }
 
-/** The mapping target for an issue's state; an unmapped state never imports. */
+/**
+ * The mapping target for an issue's state; an unmapped state never imports.
+ *
+ * `'indev'` is normalized to `'dont'` HERE rather than being handled at each of
+ * the branches below: it is an outbound-only pin (see TrackerMappingTarget), so
+ * inbound must behave as though the state were simply not imported. Collapsing
+ * it once, at the single point every inbound decision reads, is what keeps the
+ * rest of this file from needing to know the target exists.
+ */
 function targetFor(ctx: SyncContext, issue: TrackerIssue): TrackerMappingTarget {
-  return ctx.mapping[issue.stateId] ?? 'dont';
+  const target = ctx.mapping[issue.stateId] ?? 'dont';
+  return target === 'indev' ? 'dont' : target;
 }
 
 /**
@@ -661,6 +806,33 @@ function stampRemoteGroup(
   return next;
 }
 
+/**
+ * The two {@link TaskChangeError} codes that mean "not now" rather than
+ * "never": the local entity refused this write for a reason that is about the
+ * entity's CURRENT state, not about the change being wrong.
+ *
+ *   - 'active_runs'     — a non-terminal run owns the entity's stage, so a
+ *     non-orchestrator actor may not move it (TaskChangeRouter's stage-move and
+ *     archive guards). Ordinary in cyboflow: any item pulled into a session
+ *     holds one for the life of that session.
+ *   - 'forbidden_stage' — the target stage is orchestrator-derived.
+ *
+ * Matched STRUCTURALLY, on `code`, rather than with `instanceof`. This module
+ * depends on the router only through the {@link EntityWriteRouter} seam (module
+ * header), and a test double throwing its own shaped error must be recognized
+ * the same way the real router's is.
+ *
+ * Everything else still propagates — a rejection nobody predicted is a bug, and
+ * swallowing it here would hide it behind a counter.
+ */
+const DEFERRABLE_REJECTION_CODES: ReadonlySet<string> = new Set(['active_runs', 'forbidden_stage']);
+
+function isDeferrableRejection(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && DEFERRABLE_REJECTION_CODES.has(code);
+}
+
 // ---------------------------------------------------------------------------
 // runInboundSync
 // ---------------------------------------------------------------------------
@@ -678,17 +850,49 @@ export async function runInboundSync(
     imported: 0,
     updated: 0,
     skipped: 0,
+    crossScopeSkips: 0,
     conflictsOpened: 0,
     autoResolved: 0,
     archivedRemotely: 0,
     stageDeferred: 0,
     importDeferred: 0,
+    contentDeferred: 0,
+    entityLocked: 0,
+    unmappedFieldValues: 0,
   };
 
   const selection = parseSourceSelection(connection);
   const stageIds = resolveStageIds(db, connection.project_id);
   const states = await adapter.listStates(selection);
   const mapping = resolveEffectiveMapping(states, connection.state_mapping_json);
+  // Fetched beside the states, for the same reason: both are per-pass provider
+  // vocabulary the merge needs before it can compare anything. Free on every
+  // provider — Linear and Plane state their fixed scales, and Dart serves this
+  // off the same cached `/config` listStates just used.
+  const fieldOptions = await adapter.listFieldOptions();
+  // Migration 118 columns: an empty '{}' overlay (every pre-Phase-6 connection)
+  // resolves to the seed, exactly like Phase 2's `null` placeholder did.
+  // A persisted mapping entry the workspace no longer offers is dropped rather
+  // than sent, and counted like the inbound values it cannot express: both are
+  // "the tracker renamed this out from under your mapping", both are fixed by
+  // confirming the mapping, and the pass's ⚠ line already says exactly that.
+  // Counted ONCE per pass, and re-counted every pass while the overlay stays
+  // stale — the same never-goes-quiet property the inbound half has.
+  const onStaleOverlayToken = (): void => {
+    report.unmappedFieldValues++;
+  };
+  const priorityMapping = resolveEffectivePriorityMapping(
+    connection.provider,
+    fieldOptions.priorities,
+    connection.priority_mapping_json,
+    onStaleOverlayToken,
+  );
+  const categoryMapping = resolveEffectiveCategoryMapping(
+    connection.provider,
+    fieldOptions.categories,
+    connection.category_mapping_json,
+    onStaleOverlayToken,
+  );
 
   const issues = await adapter.listIssues(selection, computeSince(connection));
 
@@ -720,6 +924,9 @@ export async function runInboundSync(
     stageIds,
     mapping,
     stateGroups,
+    priorityMapping,
+    categoryMapping,
+    categorySync: providerSupportsCategorySync(connection.provider),
     applyLinkedStage: deps.applyLinkedStage !== false,
     importNewIssues: deps.importNewIssues !== false,
     report,
@@ -748,6 +955,8 @@ export async function runInboundSync(
     if (outcome !== 'applied') {
       cursorAdvances = false;
       if (outcome === 'stage-deferred') report.stageDeferred++;
+      else if (outcome === 'entity-locked') report.entityLocked++;
+      else if (outcome === 'content-deferred') report.contentDeferred++;
       else report.importDeferred++;
     }
     if (cursorAdvances) advanceCursor(db, connection.id, issue.updatedAt, issue.externalId);
@@ -758,12 +967,22 @@ export async function runInboundSync(
 
 /**
  * What {@link applyIssue} did with one issue, as far as the CURSOR is concerned.
- * Both deferrals mean the issue is NOT finished with — a held direction
- * recognized work and declined to do it — so the cursor must not move past it:
- *   - 'stage-deferred'  — a remote stage change the status direction is holding.
- *   - 'import-deferred' — a new issue the import direction is holding.
+ * Every deferral means the issue is NOT finished with — something recognized
+ * work and declined to do it — so the cursor must not move past it:
+ *   - 'stage-deferred'   — a remote stage change the status direction is holding.
+ *   - 'import-deferred'  — a new issue the import direction is holding.
+ *   - 'content-deferred' — a parked item is sitting on a remote content change
+ *     that no open conflict row records; see {@link outcomeForParkedLink}.
+ *   - 'entity-locked'    — a write the LOCAL entity refused; see
+ *     {@link isDeferrableRejection}. Held by a live run rather than by a
+ *     setting, but identical as far as the cursor is concerned.
  */
-type ApplyOutcome = 'applied' | 'stage-deferred' | 'import-deferred';
+type ApplyOutcome =
+  | 'applied'
+  | 'stage-deferred'
+  | 'import-deferred'
+  | 'content-deferred'
+  | 'entity-locked';
 
 /** What the unresolved outbox makes untouchable this pass — see {@link collectOutboxBlockers}. */
 interface OutboxBlockers {
@@ -865,6 +1084,14 @@ async function applyIssue(ctx: SyncContext, issue: TrackerIssue): Promise<ApplyO
       report.skipped++;
       return 'applied';
     }
+    // A sibling mapping already imported this issue. PERMANENT, so it is a skip
+    // rather than a deferral — and it deliberately sits AHEAD of the import
+    // hold below, which exists to delay work we will eventually do.
+    if (isOwnedBySiblingMapping(ctx, issue)) {
+      report.skipped++;
+      report.crossScopeSkips++;
+      return 'applied';
+    }
     if (!ctx.importNewIssues) {
       // Deferred, NOT skipped: the cursor holds so this issue is re-offered
       // until a pass may import it.
@@ -918,6 +1145,41 @@ async function applyIssue(ctx: SyncContext, issue: TrackerIssue): Promise<ApplyO
 }
 
 /**
+ * Is this UNLINKED issue already owned by another mapping of the same tracker?
+ *
+ * Multi-project mapping (design doc "Multi-project mapping (rev 4)") gives one
+ * workspace N sibling connections, and their scopes legitimately OVERLAP: a
+ * Linear team group and a project group beneath it both fetch every issue in
+ * that project, and an issue MOVED remotely between two mapped groups is
+ * suddenly in-scope for a connection that never imported it. Both cases arrive
+ * here as "unlinked issue" — the link belongs to the sibling, so
+ * getLinkByExternal (scoped to one connection) cannot see it — and importing
+ * would mint a SECOND idea for one remote issue, with two connections then
+ * write-backing at it from different local entities.
+ *
+ * Scoped to the tracker IDENTITY rather than to the project, because the
+ * duplicate that matters is the remote one: the sibling's idea may live in an
+ * entirely different cyboflow project and still be the same issue.
+ *
+ * A connection whose `workspace_id` was never recorded owns no identity to
+ * compare, so it claims nothing and is claimed by nothing — the same reading
+ * store.connectionMatchesIdentity takes.
+ */
+function isOwnedBySiblingMapping(ctx: SyncContext, issue: TrackerIssue): boolean {
+  const { connection } = ctx;
+  if (connection.workspace_id === null) return false;
+  return (
+    findSiblingLinkForExternal(ctx.db, {
+      provider: connection.provider,
+      workspaceId: connection.workspace_id,
+      baseUrl: connection.base_url,
+      externalId: issue.externalId,
+      excludeConnectionId: connection.id,
+    }) !== null
+  );
+}
+
+/**
  * What a link PARKED behind an open conflict means for the cursor.
  *
  * The park applies nothing and leaves the baseline where it was, so the whole
@@ -962,9 +1224,68 @@ function outcomeForParkedLink(
   // The same delta mergeLinkedIssue computes, asked only for its existence.
   const baselineStageId = mappingTargetToStageId(ctx.mapping[baseline.stateId] ?? 'dont', ctx.stageIds);
   const remoteStageId = mappingTargetToStageId(targetFor(ctx, issue), ctx.stageIds);
-  const waiting =
+  const stageWaiting =
     remoteStageId !== null && remoteStageId !== baselineStageId && remoteStageId !== local.stageId;
-  return waiting ? 'stage-deferred' : 'applied';
+  if (stageWaiting) return 'stage-deferred';
+  return hasUnrecordedContentDelta(ctx, issue, link, baseline) ? 'content-deferred' : 'applied';
+}
+
+/**
+ * Is this parked item holding a remote CONTENT change that no open conflict
+ * records?
+ *
+ * THE SAME QUESTION THE STAGE ARM ASKS, about the other four fields. A park
+ * applies nothing, so every delta it computed is dropped on the floor; a delta
+ * that an open conflict row CARRIES is durable (resolving it applies or
+ * deliberately declines the change), and one that no row carries exists nowhere
+ * but in the fetched issue. Let the cursor past THAT one and it is gone for
+ * good — the issue is only ever refetched if the tracker touches it again.
+ *
+ * The ordinary shape of the hazard: an item parked by a TITLE conflict whose
+ * remote DESCRIPTION also changed. Resolving the title advances only the title
+ * half of the baseline, so nothing ever re-derives the description delta.
+ *
+ * THE COST IS A PINNED CURSOR, and it is the trade the stage arm already makes
+ * for a held direction: the fetch window stays open at this issue until the
+ * user answers the conflict the UI is showing them. Losing an edit silently is
+ * the worse of the two, and unlike the stage arm's `remote_deleted` escape
+ * there is no row here that would make the change durable on its own.
+ *
+ * PROVIDER SPACE for the two mapped fields (invariant 2), and an `undefined`
+ * baseline half is NOT a delta (invariant 3) — the same two rules the merge
+ * itself runs by, because this must agree with it exactly or the cursor would
+ * pin on a delta the merge would never compute.
+ */
+function hasUnrecordedContentDelta(
+  ctx: SyncContext,
+  issue: TrackerIssue,
+  link: EntityExternalLinkRow,
+  baseline: TrackerBaseline,
+): boolean {
+  const { db } = ctx;
+  const unrecorded = (field: FieldConflict['field'], changed: boolean): boolean =>
+    changed && !hasOpenConflictForLink(db, link.id, field);
+
+  if (unrecorded('title', issue.title !== baseline.title)) return true;
+  if (
+    unrecorded(
+      'description',
+      normalizeDescription(issue.description) !== normalizeDescription(baseline.description),
+    )
+  ) {
+    return true;
+  }
+  if (
+    baseline.priority !== undefined &&
+    unrecorded('priority', !providerTokensEqual(issue.priority, baseline.priority))
+  ) {
+    return true;
+  }
+  return (
+    ctx.categorySync &&
+    baseline.category !== undefined &&
+    unrecorded('category', !providerTokensEqual(issue.category, baseline.category))
+  );
 }
 
 /**
@@ -999,6 +1320,39 @@ async function repairHalfImport(
   if (link !== null) await applyRemoteArchive(ctx, issue, link);
 }
 
+/**
+ * The mapped fields a fresh IMPORT carries over from the remote issue, as a
+ * patch to fold into the create.
+ *
+ * WHY THE IMPORT HAS TO SET THESE. Everything else about a new idea comes from
+ * the issue, but priority and category would otherwise take the table's
+ * defaults (P2 / feature) while the link's baseline recorded the remote's REAL
+ * token. That gap never closes on its own: the next pass reads remote-unchanged
+ * and local-changed, which is "the user re-prioritized it locally" — so an
+ * Urgent issue would import as Medium and, once outbound content write-back
+ * exists, be DEMOTED in the tracker to match.
+ *
+ * An unmapped or unsupported value is simply omitted (the local default
+ * stands), and deliberately NOT counted in `unmappedFieldValues`: that counter
+ * reports a remote value that CHANGED and could not be mirrored, which is a
+ * mapping the user should confirm. An import has no prior expectation to
+ * violate, and counting it would make every single import on a workspace that
+ * models no categories warn, forever.
+ *
+ * Only the CREATE branch calls this. An adopted half-import was created by an
+ * earlier run of this same code and already carries them.
+ */
+function mappedFieldsFor(ctx: SyncContext, issue: TrackerIssue): TaskFieldChanges {
+  const fields: TaskFieldChanges = {};
+  const priority = localPriorityForToken(ctx.connection.provider, ctx.priorityMapping, issue.priority);
+  if (priority !== null) fields.priority = priority;
+  if (ctx.categorySync) {
+    const category = localCategoryForToken(ctx.categoryMapping, issue.category);
+    if (category !== null) fields.category = category;
+  }
+  return fields;
+}
+
 /** selection_mode gate — applied only to issues that would import as NEW ideas. */
 function passesSelectionFilter(connection: TrackerConnectionRow, issue: TrackerIssue): boolean {
   if (connection.selection_mode === 'all') return true;
@@ -1013,8 +1367,10 @@ function passesSelectionFilter(connection: TrackerConnectionRow, issue: TrackerI
 /**
  * Import an orphaned tracker item as an IDEA (v1's ideas-by-default rule; the
  * agent-driven smart import is V2). The body carries the remote description
- * plus a provenance footer, and the mapped stage is applied as a follow-up
- * move so the import reads as "created, then placed" in the entity event log.
+ * plus a provenance footer, the mapped priority/category ride along on the
+ * create ({@link mappedFieldsFor}), and the mapped stage is applied as a
+ * follow-up move so the import reads as "created, then placed" in the entity
+ * event log.
  *
  * CRASH-IDEMPOTENT (module header, IMPORT RECOVERY). The three writes cannot
  * share a transaction, so the order is chosen to make every interruption
@@ -1044,7 +1400,7 @@ async function importIssueAsIdea(
     const created = await ctx.router.applyChange(connection.project_id, {
       actor: connection.provider,
       entityType: 'idea',
-      fields: { title: issue.title, body },
+      fields: { title: issue.title, body, ...mappedFieldsFor(ctx, issue) },
     });
     entityId = created.taskId;
   }
@@ -1086,16 +1442,119 @@ async function importIssueAsIdea(
   report.imported++;
 }
 
-/** One field's three-way verdict, carried from the diff into the per-mode apply. */
+/**
+ * One field's three-way verdict, carried from the diff into the per-mode apply.
+ *
+ * The two VALUE members are in whatever space that field's diff ran in: content
+ * fields carry their literal text, a stage row's `remoteValue` is the mapped
+ * board stage id, and a priority/category row carries BOTH sides as
+ * provider-raw tokens (invariant 2 — see the priority arm). `tracker_conflicts.field`
+ * has no CHECK constraint, so widening this union needs no migration.
+ */
 interface FieldConflict {
-  field: 'title' | 'description' | 'stage';
+  field: 'title' | 'description' | 'stage' | 'priority' | 'category';
   localValue: string | null;
   remoteValue: string | null;
+  /**
+   * MAPPED fields only: the local value `remoteValue` resolved to under the
+   * effective mapping — recorded so a later ruling need not re-resolve it. See
+   * {@link TrackerConflictPayload.remoteLocal}.
+   */
+  remoteLocalValue?: string;
+}
+
+/**
+ * What one MAPPED-field arm decided, so the caller can act on all three
+ * outcomes without the arm reaching into `fields` / `conflicts` / the snapshot
+ * itself.
+ *
+ *   'none'      — nothing to do (converged, or only the local side moved).
+ *   'unmapped'  — the remote token has no local meaning; counted, not applied,
+ *                 and the baseline half stays PINNED so it re-derives.
+ *   'conflict'  — both sides moved; the conflict has been pushed.
+ *   'apply'     — a remote-only change to mirror; the field has been set.
+ */
+type FieldArmOutcome = 'none' | 'unmapped' | 'conflict' | 'apply';
+
+/** One mapped field's inputs — see {@link mergeMappedField}. */
+interface MappedFieldArm<T extends string> {
+  field: 'priority' | 'category';
+  /** The link baseline's token; `undefined` = never synced (the backfill arm). */
+  baselineToken: string | null | undefined;
+  /** The remote's current token, provider-raw. */
+  remoteToken: string | null;
+  /** The local entity's current value. */
+  localValue: T;
+  /** Local value -> provider token, through the connection's effective mapping. */
+  toProvider(value: T): string | null;
+  /** Provider token -> local value; null when the token has no local meaning. */
+  toLocal(token: string | null): T | null;
+  /** Where a both-sides-changed verdict is filed. */
+  conflicts: FieldConflict[];
+  /** Mirror a remote-only change onto the local entity. */
+  apply(value: T): void;
+}
+
+/**
+ * THREE-WAY MERGE of one MAPPED field — priority or category — entirely in
+ * PROVIDER SPACE (invariant 2).
+ *
+ * Both fields are lossy in the outbound direction (seven local priorities onto
+ * four or five provider rungs; three categories onto whatever types a workspace
+ * happens to define), so the comparison converts the LOCAL side out through
+ * `toProvider` rather than converting the remote side in. A local-space diff
+ * would read "P3 here, P2 there" on an issue nobody touched and demote the
+ * user's P3 on every pass. The conversion back through `toLocal` happens once,
+ * at the single point a remote change is actually applied.
+ *
+ * The gates, in order, and why that order:
+ *
+ *  1. BACKFILL (invariant 3). An `undefined` baseline token is a link written
+ *     before this field was synced: we do not know where the remote stood, so
+ *     any verdict would be invented. Doing nothing lets `composeBaselineJson`'s
+ *     unconditional overlay heal the baseline at the end of the same pass.
+ *  2. REMOTE UNCHANGED — nothing happened on their side.
+ *  3. CONVERGED — the two sides already mean the same provider value. This is
+ *     what keeps a P3 (`medium`) quiet when the remote moves to `medium`.
+ *  4. UNMAPPED, ahead of the conflict gate on purpose: if the remote token has
+ *     no local meaning we cannot apply it, so opening a conflict would offer
+ *     the user a "take theirs" button that could not do anything. It is
+ *     reported instead.
+ *  5. Both sides moved -> conflict; only theirs -> apply.
+ */
+function mergeMappedField<T extends string>(arm: MappedFieldArm<T>): FieldArmOutcome {
+  const { baselineToken, remoteToken } = arm;
+  if (baselineToken === undefined) return 'none';
+  if (providerTokensEqual(remoteToken, baselineToken)) return 'none';
+
+  const localToken = arm.toProvider(arm.localValue);
+  if (providerTokensEqual(remoteToken, localToken)) return 'none';
+
+  const nextLocal = arm.toLocal(remoteToken);
+  if (nextLocal === null) return 'unmapped';
+
+  if (!providerTokensEqual(localToken, baselineToken)) {
+    arm.conflicts.push({
+      field: arm.field,
+      localValue: localToken,
+      remoteValue: remoteToken,
+      remoteLocalValue: nextLocal,
+    });
+    return 'conflict';
+  }
+  // Unreachable while `toLocal` and `toProvider` agree (gate 3 would have
+  // caught it), but a persisted overlay can carry the two halves independently
+  // and a no-op field write would still emit an entity event.
+  if (nextLocal === arm.localValue) return 'none';
+  arm.apply(nextLocal);
+  return 'apply';
 }
 
 /**
  * Compose a field conflict's `payload_json`. See {@link TrackerConflictPayload}
  * for why a STAGE row carries the remote's raw state on top of the common keys.
+ * Priority and category need nothing extra: unlike a stage, their `remote_value`
+ * IS the value the baseline stamp wants (invariant 2 keeps both raw).
  */
 function conflictPayloadJson(
   ctx: SyncContext,
@@ -1112,21 +1571,26 @@ function conflictPayloadJson(
     payload.remoteStateId = issue.stateId;
     payload.remoteGroup = remoteWriteBackGroup(ctx, issue);
   }
+  if (conflict.remoteLocalValue !== undefined) payload.remoteLocal = conflict.remoteLocalValue;
   return JSON.stringify(payload);
 }
 
 /**
  * THREE-WAY MERGE of a linked issue against its baseline, per field
- * (title, description, remote state → local stage).
+ * (title, description, priority, category, and remote state → local stage).
  *
  *  - remote changed only  → apply the remote value locally
  *  - local changed only   → leave it (outbound owns pushing it back)
  *  - both changed to the same value → converged, nothing to do
  *  - both changed, differently → a conflict, resolved per the connection's mode
  *
- * Auto mode: content fields (title/description) take the REMOTE value, stage
- * keeps the LOCAL one, and every override is recorded as an already-resolved
- * conflict row so the log can show what was overridden.
+ * The title/description arms diff literal text. Priority and category are
+ * MAPPED fields and diff in PROVIDER space instead, with two extra outcomes
+ * (never-synced and unmappable) — {@link mergeMappedField} owns all of it.
+ *
+ * Auto mode: every field except stage takes the REMOTE value, stage keeps the
+ * LOCAL one, and every override is recorded as an already-resolved conflict row
+ * so the log can show what was overridden.
  *
  * Manual mode: an OPEN conflict row per conflicting field, NOTHING applied for
  * this issue, and the baseline deliberately left where it was — so the next
@@ -1178,6 +1642,42 @@ async function mergeLinkedIssue(
       fields.body = joinBody(issue.description, localBody.footer);
     }
   }
+
+  // ----- priority (compared in PROVIDER space — see mergeMappedField) -----
+  const priorityOutcome = mergeMappedField<Priority>({
+    field: 'priority',
+    baselineToken: baseline.priority,
+    remoteToken: issue.priority,
+    localValue: local.priority,
+    toProvider: (value) => providerPriorityToken(ctx.priorityMapping, value),
+    toLocal: (token) => localPriorityForToken(ctx.connection.provider, ctx.priorityMapping, token),
+    conflicts,
+    apply: (value) => {
+      fields.priority = value;
+    },
+  });
+  if (priorityOutcome === 'unmapped') report.unmappedFieldValues++;
+
+  // ----- category (Dart only) -----
+  // Gated on the PROVIDER's capability, not on the value: Linear and Plane send
+  // a structural null here because they model no issue type at all, and running
+  // the arm on that would read the absence of the concept as "the tracker
+  // cleared this entity's category".
+  const categoryOutcome: FieldArmOutcome = !ctx.categorySync
+    ? 'none'
+    : mergeMappedField<EntityCategory>({
+        field: 'category',
+        baselineToken: baseline.category,
+        remoteToken: issue.category,
+        localValue: local.category,
+        toProvider: (value) => providerCategoryToken(ctx.categoryMapping, value),
+        toLocal: (token) => localCategoryForToken(ctx.categoryMapping, token),
+        conflicts,
+        apply: (value) => {
+          fields.category = value;
+        },
+      });
+  if (categoryOutcome === 'unmapped') report.unmappedFieldValues++;
 
   // ----- stage (remote state, mapped) -----
   // A state mapped to 'dont' yields a null stage: we cannot say where it should
@@ -1232,10 +1732,7 @@ async function mergeLinkedIssue(
   // as an already-resolved conflict row before applying it.
   for (const conflict of conflicts) {
     const remoteWins = conflict.field !== 'stage';
-    if (remoteWins) {
-      if (conflict.field === 'title') fields.title = issue.title;
-      else fields.body = joinBody(issue.description, localBody.footer);
-    }
+    if (remoteWins) applyRemoteConflictValue(ctx, issue, localBody.footer, conflict, fields);
     await recordAutoResolution(
       ctx,
       link,
@@ -1246,20 +1743,45 @@ async function mergeLinkedIssue(
     );
   }
 
-  if (Object.keys(fields).length > 0 || stageMove !== undefined) {
+  /** The entity refused the stage move; content still landed. */
+  let entityLocked = false;
+  const hasFields = Object.keys(fields).length > 0;
+  if (hasFields || stageMove !== undefined) {
     // The stage move is ours to mirror, not to announce back — stamp where the
     // remote stands before the write-back listener sees the event.
     if (stageMove !== undefined) {
       baselineJson = stampRemoteGroup(ctx, link, baselineJson, remoteWriteBackGroup(ctx, issue));
     }
-    await ctx.router.applyChange(connection.project_id, {
-      actor: connection.provider,
-      entityType: link.entity_type,
-      taskId: link.entity_id,
-      ...(Object.keys(fields).length > 0 ? { fields } : {}),
-      ...(stageMove !== undefined ? { stageId: stageMove } : {}),
-    });
-    report.updated++;
+    try {
+      await ctx.router.applyChange(connection.project_id, {
+        actor: connection.provider,
+        entityType: link.entity_type,
+        taskId: link.entity_id,
+        ...(hasFields ? { fields } : {}),
+        ...(stageMove !== undefined ? { stageId: stageMove } : {}),
+      });
+      report.updated++;
+    } catch (err) {
+      // Only the STAGE half can draw these codes, so a rejection with no stage
+      // move in the request is somebody else's problem — rethrow it.
+      if (stageMove === undefined || !isDeferrableRejection(err)) throw err;
+      entityLocked = true;
+      // The content merge is independent of the stage and already has its
+      // conflicts recorded above; re-running the whole item next pass would
+      // file those findings a second time. So retry the half that CAN land.
+      if (hasFields) {
+        await ctx.router.applyChange(connection.project_id, {
+          actor: connection.provider,
+          entityType: link.entity_type,
+          taskId: link.entity_id,
+          fields,
+        });
+        report.updated++;
+      }
+      // The stamp written above is deliberately NOT rolled back: it says where
+      // the REMOTE stands, which is true whether or not we mirrored it (see
+      // {@link stampRemoteGroup}).
+    }
   }
 
   // The STATE half of the snapshot is pinned to the old baseline when the stage
@@ -1271,9 +1793,65 @@ async function mergeLinkedIssue(
   // ride along on a content update is exactly the cross-field clobber that has
   // bitten this function before.
   const snapshot = snapshotOf(issue);
-  if (!ctx.applyLinkedStage) snapshot.stateId = baseline.stateId;
+  // A refused move pins the state half for the SAME reason a held direction
+  // does: the remote change has not been mirrored, so it must stay "unseen" or
+  // the next pass would compute no delta and silently drop it.
+  if (!ctx.applyLinkedStage || entityLocked) snapshot.stateId = baseline.stateId;
+  // An UNMAPPED remote value pins its own half, for a third reason: the pass
+  // could not express the change, and letting the snapshot advance would make
+  // the next pass see no delta and stop reporting it — so a one-line warning
+  // about a renamed tracker value would scroll away after a single pass and
+  // never appear again. Pinned, it re-derives until the mapping is fixed. The
+  // CURSOR still advances (unlike a deferral): the condition is not one that
+  // time resolves, and stalling the fetch window on it would block every issue
+  // behind this one indefinitely.
+  if (priorityOutcome === 'unmapped') snapshot.priority = baseline.priority;
+  if (categoryOutcome === 'unmapped') snapshot.category = baseline.category;
   updateBaseline(db, link.id, composeBaselineJson(baselineJson, snapshot));
+  if (entityLocked) return 'entity-locked';
   return stageDeferred ? 'stage-deferred' : 'applied';
+}
+
+/**
+ * Stage the REMOTE side of a conflict Auto mode is resolving in the tracker's
+ * favour, onto the `fields` patch the caller is about to apply.
+ *
+ * An exhaustive switch rather than the two-way branch this replaced: with five
+ * conflict fields, a fall-through `else` would silently treat a new field as a
+ * description write. `stage` is listed and does nothing — Auto gives status to
+ * cyboflow, so its override keeps the LOCAL value and there is nothing to
+ * stage.
+ */
+function applyRemoteConflictValue(
+  ctx: SyncContext,
+  issue: TrackerIssue,
+  footer: string | null,
+  conflict: FieldConflict,
+  fields: TaskFieldChanges,
+): void {
+  switch (conflict.field) {
+    case 'title':
+      fields.title = issue.title;
+      return;
+    case 'description':
+      fields.body = joinBody(issue.description, footer);
+      return;
+    case 'priority': {
+      // The arm never files a conflict for a token it could not map, so this is
+      // always present — guarded rather than asserted because the two halves of
+      // a persisted mapping can be edited independently.
+      const next = localPriorityForToken(ctx.connection.provider, ctx.priorityMapping, issue.priority);
+      if (next !== null) fields.priority = next;
+      return;
+    }
+    case 'category': {
+      const next = localCategoryForToken(ctx.categoryMapping, issue.category);
+      if (next !== null) fields.category = next;
+      return;
+    }
+    case 'stage':
+      return;
+  }
 }
 
 /**
@@ -1482,7 +2060,12 @@ export async function runDeletionSweep(
   connection: TrackerConnectionRow,
 ): Promise<InboundSweepReport> {
   const { db, adapter, router } = deps;
-  const sweep: InboundSweepReport = { sweepArchived: 0, conflictsOpened: 0, outOfScope: 0 };
+  const sweep: InboundSweepReport = {
+    sweepArchived: 0,
+    conflictsOpened: 0,
+    outOfScope: 0,
+    entityLocked: 0,
+  };
 
   const selection = parseSourceSelection(connection);
   const remoteIds = new Set(await adapter.listIssueIds(selection));
@@ -1518,12 +2101,21 @@ export async function runDeletionSweep(
       continue;
     }
 
-    await router.applyChange(connection.project_id, {
-      actor: connection.provider,
-      entityType: link.entity_type,
-      taskId: link.entity_id,
-      archived: true,
-    });
+    try {
+      await router.applyChange(connection.project_id, {
+        actor: connection.provider,
+        entityType: link.entity_type,
+        taskId: link.entity_id,
+        archived: true,
+      });
+    } catch (err) {
+      if (!isDeferrableRejection(err)) throw err;
+      // A live run owns the entity. Nothing below has run, so the link stays
+      // active, no conflict row is filed, and the next sweep retries it —
+      // whereas letting this propagate abandoned every link behind it.
+      sweep.entityLocked++;
+      continue;
+    }
     markOrphaned(db, link.id);
     const row = insertConflict(db, {
       connection_id: connection.id,

@@ -133,30 +133,36 @@ export const SESSION_AGENT_RUNTIMES = [
  * the step inspector and the global Agents-pane editor. */
 export const WORKFLOW_AGENT_RUNTIME_LABELS: Record<WorkflowLaunchableRuntime, string> = {
   'claude-sdk': 'Claude SDK',
-  'claude-interactive': 'Claude interactive',
+  'claude-interactive': 'Claude Interactive (CLI)',
   'codex-sdk': 'Codex SDK',
   'omp-sdk': 'OMP',
 };
 
 /**
- * Human labels for every SESSION runtime, matching what `SubstrateSelector`'s
- * `RUNTIME_OPTIONS` renders (minus its scope-specific suffixes, e.g.
- * "(default)" / "— quick sessions only"). Exhaustive over `SessionAgentRuntime`
- * — unlike {@link WORKFLOW_AGENT_RUNTIME_LABELS}, which is scoped to the
+ * Human labels for every SESSION runtime — THE single source every runtime
+ * picker renders (`SubstrateSelector`, the Settings runtime list, the variant
+ * editor), minus each surface's own scope suffix ("(default)" / "— quick
+ * sessions only"). Exhaustive over `SessionAgentRuntime` — unlike
+ * {@link WORKFLOW_AGENT_RUNTIME_LABELS}, which is scoped to the
  * workflow-launchable subset and uses shorter labels for the agent-config
- * editors — so the two terminal-only runtimes (`codex-pty`, `omp-pty`),
- * `omp-fleet`, and `claude-interactive`'s "(PTY)" suffix are covered too. Any
- * summary echoing a launched runtime (e.g. the wizard's launch-summary Runtime
- * row) should read this instead of hand-rolling a ternary that silently
- * defaults an unhandled runtime to the wrong label.
+ * editors — so the two terminal-driven runtimes (`codex-pty`, `omp-pty`) and
+ * the fleet supervisor (`omp-fleet`) are covered too. Any summary echoing a
+ * launched runtime (e.g. the wizard's launch-summary Runtime row) should read
+ * this instead of hand-rolling a ternary that silently defaults an unhandled
+ * runtime to the wrong label.
+ *
+ * "(CLI)" — never "(PTY)" — is the user-facing word for a terminal-driven
+ * runtime. PTY is the transport's implementation name and stays in code
+ * identifiers (`omp-pty`, `OmpPtyManager`); it is not vocabulary a user has to
+ * learn to pick a runtime.
  */
 export const AGENT_RUNTIME_LABELS: Record<SessionAgentRuntime, string> = {
   'claude-sdk': 'Claude SDK',
-  'claude-interactive': 'Claude interactive (PTY)',
+  'claude-interactive': 'Claude Interactive (CLI)',
   'codex-sdk': 'Codex SDK',
-  'codex-pty': 'Codex PTY',
+  'codex-pty': 'Codex (CLI)',
   'omp-sdk': 'OMP',
-  'omp-pty': 'OMP terminal',
+  'omp-pty': 'OMP (CLI)',
   'omp-fleet': 'OMP fleet',
 };
 

@@ -91,7 +91,7 @@ function rethrowAsTRPCError(err: unknown): never {
 // ---------------------------------------------------------------------------
 
 const taskTypeSchema = z.enum(['idea', 'epic', 'task']);
-const prioritySchema = z.enum(['P0', 'P1', 'P2']);
+const prioritySchema = z.enum(['P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6']); // migration 117 widen
 const categorySchema = z.enum(['feature', 'bug', 'chore']);
 const scopeSchema = z.enum(['small', 'large']);
 

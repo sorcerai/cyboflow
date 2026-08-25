@@ -1,7 +1,117 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { createHash } from 'node:crypto';
+/**
+ * Content-Security-Policy for the PACKAGED renderer.
+ *
+ * The packaged app loads `frontend/dist/index.html` over `file://`, so there is
+ * no response header to attach a policy to — a `<meta http-equiv>` baked into
+ * the BUILT html is the only mechanism. It is injected at build time rather
+ * than written into `index.html` by hand so that dev is completely untouched:
+ * Vite's HMR client and react-refresh preamble are inline scripts injected per
+ * request, which no static hash list could ever cover.
+ *
+ * `script-src` carries HASHES of the two inline theme scripts in index.html
+ * instead of `'unsafe-inline'`. That is the directive that matters: this whole
+ * policy exists so that markup injected into the renderer (a session name, a
+ * rendered diff, agent-authored markdown) cannot execute and reach the IPC
+ * bridge. `'unsafe-inline'` would give that back, and adding hashes makes
+ * browsers ignore any `'unsafe-inline'` in the same directive anyway.
+ *
+ * Per-directive notes:
+ *   script-src   'self' + inline hashes + jsdelivr (see MONACO_CDN below). NO
+ *                'unsafe-eval' — nothing in the bundle was found to need it.
+ *   style-src    'unsafe-inline' is required: Monaco, xterm and react-remark all
+ *                inject <style> elements at runtime. Accepted for v1.
+ *   font-src     @fontsource woff2 ship in the bundle ('self'); `data:` covers
+ *                Monaco's inlined codicon font.
+ *   img-src      artifact screenshots arrive over IPC as base64 `data:` URLs
+ *                (see electron.d.ts artifacts:*), and log/file exports build
+ *                `blob:` object URLs.
+ *   frame-src    the artifact canvases: a design-prototype OOPIF on
+ *                `http://127.0.0.1:<leased port>` and a live-canvas embed on
+ *                `http://localhost:<port>`, both on ports assigned at runtime.
+ *                `about:srcdoc` static-mockup frames are not governed by
+ *                frame-src (they inherit the embedder's policy).
+ *   connect-src  the renderer makes NO direct network calls — Sentry runs
+ *                through @sentry/electron/renderer (IPC to main) and Aptabase
+ *                is main-process only. jsdelivr is listed for the Monaco
+ *                loader's own fetches.
+ *   object-src / base-uri  hard 'none': no plugin content, and no <base> tag
+ *                hijack of the relative asset paths this `base: './'` build uses.
+ *
+ * Deliberately ABSENT: `frame-ancestors`, `report-uri` and `sandbox` are ignored
+ * when delivered via <meta>, so listing them would only produce console noise.
+ */
+/**
+ * Monaco is loaded from jsdelivr at runtime: `@monaco-editor/react` defaults to
+ * the CDN AMD loader and this project never calls `loader.config({ paths })`, so
+ * the editor and diff panels fetch monaco-editor over the network even in the
+ * packaged app. Allowing the host here keeps those panels working; it is also a
+ * standing finding — self-hosting monaco would let this entry (and the
+ * remote-script trust it implies) be deleted.
+ */
+const MONACO_CDN = 'https://cdn.jsdelivr.net';
+function buildCsp(inlineScriptHashes) {
+    const hashes = inlineScriptHashes.map((h) => `'${h}'`).join(' ');
+    return [
+        `default-src 'self'`,
+        `script-src 'self' ${hashes} ${MONACO_CDN}`.replace(/\s+/g, ' '),
+        `style-src 'self' 'unsafe-inline' ${MONACO_CDN}`,
+        `font-src 'self' data: ${MONACO_CDN}`,
+        `img-src 'self' data: blob:`,
+        `media-src 'self' data: blob:`,
+        `connect-src 'self' data: blob: ${MONACO_CDN}`,
+        `worker-src 'self' blob:`,
+        `child-src 'self' blob:`,
+        `frame-src 'self' blob: http://localhost:* http://127.0.0.1:*`,
+        `object-src 'none'`,
+        `base-uri 'none'`,
+        `form-action 'none'`,
+    ].join('; ');
+}
+/**
+ * Inject the CSP `<meta>` as the first element of `<head>` (it must precede any
+ * content it governs) with `script-src` hashes computed from the inline scripts
+ * actually present in the emitted html. Build-only — `apply: 'build'` keeps the
+ * dev server, its HMR websocket and the react-refresh preamble untouched.
+ * `enforce: 'post'` runs it after Vite has injected its own bundle tags, so the
+ * hash set reflects the final document.
+ */
+function cspPlugin() {
+    return {
+        name: 'cyboflow-csp',
+        apply: 'build',
+        enforce: 'post',
+        transformIndexHtml(html) {
+            const inlineScript = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
+            const hashes = [];
+            for (const match of html.matchAll(inlineScript)) {
+                const body = match[1];
+                if (!body)
+                    continue;
+                hashes.push(`sha256-${createHash('sha256').update(body, 'utf8').digest('base64')}`);
+            }
+            const meta = `<meta http-equiv="Content-Security-Policy" content="${buildCsp(hashes)}">`;
+            // Placed AFTER <meta charset> when there is one: the charset declaration
+            // has to land within the document's first 1024 bytes, and this policy is
+            // ~700 of them. Otherwise first thing in <head> — the policy must precede
+            // any content it governs.
+            const charset = /<meta[^>]*\bcharset=[^>]*>/i;
+            if (charset.test(html)) {
+                return html.replace(charset, (m) => `${m}\n    ${meta}`);
+            }
+            // A build whose <head> we cannot find must FAIL rather than silently ship
+            // an unprotected renderer.
+            if (!/<head[^>]*>/i.test(html)) {
+                throw new Error('[cyboflow-csp] no <head> in index.html — cannot inject Content-Security-Policy');
+            }
+            return html.replace(/(<head[^>]*>)/i, `$1\n    ${meta}`);
+        },
+    };
+}
 export default defineConfig({
-    plugins: [react()],
+    plugins: [react(), cspPlugin()],
     server: {
         // Overridable so a verification instance can lease its own renderer port
         // (CYBOFLOW_VITE_PORT) alongside a scoped CDP port + CYBOFLOW_DIR data

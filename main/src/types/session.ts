@@ -102,6 +102,20 @@ export interface Session {
    * frontend/src/types/session.ts Session.
    */
   enabledPlugins?: string[];
+  /**
+   * Idea this session is the persistent home for (sessions.home_idea_id,
+   * migration 113; idea sessions feature). At most one live session per idea
+   * holds this. undefined/null → not an idea-home session. Mirror of
+   * frontend/src/types/session.ts Session.
+   */
+  homeIdeaId?: string | null;
+  /**
+   * Idea whose launch minted this session (sessions.origin_idea_id, migration
+   * 112; sidebar nesting lineage). Many sessions may share the same origin —
+   * it is lineage, not a claim. undefined/null → no recorded launch origin.
+   * Mirror of frontend/src/types/session.ts Session.
+   */
+  originIdeaId?: string | null;
 }
 
 export interface GitStatus {

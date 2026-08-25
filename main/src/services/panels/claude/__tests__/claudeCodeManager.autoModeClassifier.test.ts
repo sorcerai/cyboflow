@@ -52,7 +52,7 @@ vi.mock('../../../../utils/sessionValidation', () => ({
 }));
 vi.mock('../../../../orchestrator/permissionRules', async (orig) => {
   const actual = await orig<typeof import('../../../../orchestrator/permissionRules')>();
-  return { ...actual, loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [] })) };
+  return { ...actual, loadMergedPermissionRules: vi.fn(() => ({ allow: [], deny: [], ask: [] })) };
 });
 
 function createMockSessionManager(): SessionManager {

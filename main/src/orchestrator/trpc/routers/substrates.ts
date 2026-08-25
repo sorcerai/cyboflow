@@ -2,7 +2,8 @@
  * cyboflow.substrates sub-router (feat/parallel-sprint, P3).
  *
  * Exposes the effective substrate the resolver ladder would pick for a launch,
- * so the batch picker can apply the right selection cap N (15 for sdk, 10 for
+ * so the batch picker can apply the right selection cap N (resolveSprintMaxTasks
+ * over the user's Settings override — built-in defaults 15 for sdk, 10 for
  * interactive) BEFORE creating a batch — matching exactly what
  * WorkflowRegistry.createRun would stamp.
  *

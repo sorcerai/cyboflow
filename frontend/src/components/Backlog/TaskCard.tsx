@@ -5,8 +5,13 @@
  * A card shows: a project chip row (All-projects view only, above the tag
  * pills); type tag, priority tag, FlowMarker(s) (multiple when parallel runs),
  * ReviewMarker, DoneFlag, the display ref; the title; the summary; and a
- * footer with repo, compact "Nm ago", and the per-card "Run" action. Epics
- * show an expand control ("N tasks") that reveals nested {@link TaskChildren}.
+ * footer with repo, compact "Nm ago", and the per-card primary action — "Run"
+ * for epics/tasks, **"Open"** for ideas (idea sessions plan, Stage 4:
+ * find-or-create the idea's persistent home session; unlike Run, never
+ * disabled by `inFlow`/In-development — opening the home is always valid —
+ * but disabled with a reason for an archived idea, since the door rejects
+ * one). Epics show an expand control ("N tasks") that reveals nested
+ * {@link TaskChildren}.
  *
  * Archive-in-place: an archived item (`archived_at` stamped) only reaches a card
  * while the header Archived toggle is on — it then renders dimmed (opacity-60)
@@ -19,12 +24,24 @@
  * breathing-glow on an in-flight card honours prefers-reduced-motion
  * (motion-reduce:* variants in the marker + ring).
  *
- * Launch state is threaded as `launchingTaskId` (not a pre-computed boolean) so
- * nested epic children also reflect their own in-flight launch correctly.
+ * In-flight state is threaded as `launchingTaskId` (not a pre-computed
+ * boolean) so nested epic children also reflect their own in-flight launch
+ * correctly. BacklogPane merges TWO launchers into this one prop — a Run
+ * launch (useTaskRunLauncher) and an idea Open (useIdeaSessionOpener) can
+ * never collide on the same card (an idea never renders Run; an epic/task
+ * never renders Open), so one shared id is enough.
+ *
+ * Idea component ledger (shared/types/ideaComponents.ts): ideas render five
+ * LedgerChips (always all five, including skipped ones, so the row reads as a
+ * checklist) plus a SECOND, sibling expand block — `ledger-expand` — next to
+ * the epic's `epic-expand`. Gated on `task.type === 'idea'` so the strip never
+ * reaches a nested child in TaskChildren (children are always epics/tasks,
+ * never ideas, but the guard is the thing that keeps it that way).
  */
 import { useState } from 'react';
 import { ChevronDown, ChevronRight, Play, Loader2, Pencil, Lightbulb } from 'lucide-react';
 import type { BacklogTaskItem } from '../../../../shared/types/tasks';
+import { IDEA_COMPONENT_KEYS } from '../../../../shared/types/ideaComponents';
 import { trpc } from '../../trpc/client';
 import { useBacklogStore } from '../../stores/backlogStore';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -40,9 +57,11 @@ import {
   FlowMarker,
   ReviewMarker,
   DoneFlag,
+  LedgerChip,
 } from './markers';
 import { compactAgo, isArchived, hasRunningFlow } from './backlogSelectors';
 import { CardActionsMenu, type ReorderDirection } from './CardActionsMenu';
+import { LedgerExpand } from './LedgerExpand';
 import { IdeaDetailEditor } from '../IdeaDetailEditor';
 import { EpicDetailEditor } from '../EpicDetailEditor';
 import { TaskDetailModal } from '../cyboflow/TaskDetailModal';
@@ -105,7 +124,7 @@ function MarkerRow({ task }: { task: BacklogTaskItem }): React.JSX.Element | nul
   );
 }
 
-/** Footer: repo · time · root-idea back-link · Edit · Run. */
+/** Footer: repo · time · root-idea back-link · Edit · Run (Open, for ideas). */
 function CardFooter({
   task,
   onRun,
@@ -117,18 +136,33 @@ function CardFooter({
   onReorder,
   canMoveUp,
   canMoveDown,
+  onShowComponents,
 }: TaskBodyProps & {
   onEdit: (e: React.MouseEvent) => void;
   /** Open the originating idea's detail; rendered only when the card has one. */
   onOpenRootIdea: (e: React.MouseEvent) => void;
   /** True while the root-idea fetch is in flight (spins the back-link icon). */
   loadingRootIdea: boolean;
+  /** Open the ledger expand (ideas with a resolved component set only). */
+  onShowComponents?: () => void;
 }): React.JSX.Element {
+  // Shared in-flight indicator for BOTH the idea "Open" and the epic/task
+  // "Run" action — BacklogPane merges useTaskRunLauncher's launchingTaskId
+  // with useIdeaSessionOpener's openingTaskId before it ever reaches this
+  // prop (idea sessions plan, Stage 4), so a single guard works for whichever
+  // one this card renders (an idea never renders Run; an epic/task never
+  // renders Open).
   const isLaunching = launchingTaskId === task.id;
   // A live run association = the task is In development — the backend rejects a
   // second pull (double-pull guard), so don't offer one. The flow pill above
-  // carries the "why" (and opens the working session).
-  const inDevelopment = task.inFlow.length > 0;
+  // carries the "why" (and opens the working session). Ideas are exempt:
+  // opening the idea's persistent home is always valid, in-development or not.
+  const inDevelopment = task.type !== 'idea' && task.inFlow.length > 0;
+  // An archived idea's home cannot be opened — the door rejects it
+  // (validateIdeaSessionLink). Only ideas render the Open button, but this is
+  // computed unconditionally since it's cheap and keeps the JSX below simple.
+  const isIdea = task.type === 'idea';
+  const archived = isIdea && isArchived(task);
   return (
     <div className="flex items-center justify-between gap-2 pt-1.5">
       <div className="flex min-w-0 items-center gap-2 text-[10.5px] text-text-tertiary">
@@ -169,12 +203,24 @@ function CardFooter({
           <Pencil className="h-3 w-3" strokeWidth={2.5} />
           Edit
         </button>
+        {/* Ideas: "Open" — find-or-create the idea's persistent home session
+            (idea sessions plan, Stage 4). Epics/tasks: "Run" — launch a new
+            workflow run, unchanged. Same Play glyph + position; the label,
+            testid, and disable reason are the only things that differ. */}
         <button
           type="button"
           onClick={() => onRun(task)}
-          disabled={isLaunching || inDevelopment}
-          title={inDevelopment ? 'Already in development — a live session is working on this' : undefined}
-          data-testid="task-run-button"
+          disabled={isLaunching || (isIdea ? archived : inDevelopment)}
+          title={
+            isIdea
+              ? archived
+                ? 'Archived — restore to open'
+                : undefined
+              : inDevelopment
+                ? 'Already in development — a live session is working on this'
+                : undefined
+          }
+          data-testid={isIdea ? 'task-open-button' : 'task-run-button'}
           className="inline-flex items-center gap-1 rounded-button border border-interactive/50 px-2 py-0.5 text-[10.5px] font-semibold text-interactive transition-colors hover:bg-interactive hover:text-text-on-interactive disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-interactive"
         >
           {isLaunching ? (
@@ -182,7 +228,7 @@ function CardFooter({
           ) : (
             <Play className="h-3 w-3" strokeWidth={2.5} />
           )}
-          Run
+          {isIdea ? 'Open' : 'Run'}
         </button>
         {/* Secondary actions (Move up/down/top / Change stage… / Archive)
             tucked behind a ⋯ menu. */}
@@ -191,6 +237,7 @@ function CardFooter({
           onReorder={onReorder}
           canMoveUp={canMoveUp}
           canMoveDown={canMoveDown}
+          onShowComponents={onShowComponents}
         />
       </div>
     </div>
@@ -231,6 +278,9 @@ export function TaskBody({
   canMoveDown,
 }: TaskBodyProps): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
+  // Sibling to the epic `expanded` state above — ideas have no expanded state
+  // today, so this is a SECOND, independently-toggled expand (see file header).
+  const [ledgerExpanded, setLedgerExpanded] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   // Root-idea back-link: the fetched originating idea (with its decomposition
   // children) shown in a read-only detail modal; null = closed.
@@ -299,6 +349,18 @@ export function TaskBody({
         <span className="ml-auto font-mono text-[10px] text-text-tertiary">{task.ref}</span>
       </div>
 
+      {/* Idea component ledger chips — ALWAYS all five (including skipped ones)
+          so the row reads as a checklist, not a variable badge pile. May wrap
+          to a second line in a narrow kanban column. */}
+      {task.type === 'idea' && task.components && (
+        <div className="flex flex-wrap items-center gap-1.5" data-testid="ledger-chips-row">
+          {IDEA_COMPONENT_KEYS.map((key) => {
+            const entry = task.components?.find((c) => c.component === key);
+            return entry ? <LedgerChip key={key} component={entry} /> : null;
+          })}
+        </div>
+      )}
+
       <MarkerRow task={task} />
 
       {/* Title */}
@@ -320,6 +382,9 @@ export function TaskBody({
         onReorder={onReorder}
         canMoveUp={canMoveUp}
         canMoveDown={canMoveDown}
+        onShowComponents={
+          task.type === 'idea' && task.components ? () => setLedgerExpanded(true) : undefined
+        }
       />
 
       {/* Type-appropriate detail editor — opened by the dedicated Edit affordance. */}
@@ -344,6 +409,31 @@ export function TaskBody({
           {expanded && task.children && task.children.length > 0 && (
             <TaskChildren tasks={task.children} onRun={onRun} launchingTaskId={launchingTaskId} now={now} />
           )}
+        </div>
+      )}
+
+      {/* Idea component ledger expand — a SECOND, sibling expand block to the
+          epic one above (ideas have no expanded state today). Distinct
+          data-testid ('ledger-expand') so it can't collide with the
+          epic-expand / task-children tests. */}
+      {task.type === 'idea' && task.components && task.components.length > 0 && (
+        <div className="mt-1 border-t border-border-tertiary pt-1.5">
+          <button
+            type="button"
+            onClick={(e) => {
+              // stopPropagation: mirrors every other interactive addition on
+              // this card — it sits inside draggable/clickable ancestors.
+              e.stopPropagation();
+              setLedgerExpanded((v) => !v);
+            }}
+            aria-expanded={ledgerExpanded}
+            data-testid="ledger-expand"
+            className="inline-flex items-center gap-1 text-[10.5px] font-semibold text-text-secondary hover:text-text-primary"
+          >
+            {ledgerExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+            Components
+          </button>
+          {ledgerExpanded && <LedgerExpand ideaId={task.id} components={task.components} now={now} />}
         </div>
       )}
     </div>

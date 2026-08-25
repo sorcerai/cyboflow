@@ -1,8 +1,11 @@
 /**
- * Safely escape shell arguments to prevent command injection
+ * Safely escape shell arguments to prevent command injection.
+ *
+ * Prefer argv-based execution (main/src/utils/runGit.ts, execFile/spawn) for new
+ * code — these string builders exist only for the remaining `/bin/sh` callers
+ * (currently runCommandManager). The git-command-string builders were removed
+ * once every git call site migrated to runGit.
  */
-
-import { buildCommitFooter } from './commitFooter';
 
 /**
  * Escape a string for safe use in shell commands
@@ -19,37 +22,10 @@ export function escapeShellArg(arg: string): string {
 }
 
 /**
- * Build a safe git commit command with proper escaping
- * @param message The commit message
- * @param enableCyboflowFooter If true (default), add the Cyboflow footer
- * @returns The safe commit command
- */
-export function buildGitCommitCommand(message: string, enableCyboflowFooter: boolean = true): string {
-  // Create the full commit message with signature
-  const fullMessage = enableCyboflowFooter
-    ? `${message}\n\n${buildCommitFooter(true)}`
-    : message;
-
-  const escapedMessage = escapeShellArg(fullMessage);
-  return `git commit -m ${escapedMessage}`;
-}
-
-/**
  * Escape an array of shell arguments
  * @param args The arguments to escape
  * @returns The escaped arguments joined with spaces
  */
 export function escapeShellArgs(args: string[]): string {
   return args.map(escapeShellArg).join(' ');
-}
-
-/**
- * Build a safe shell command with escaped arguments
- * @param command The base command
- * @param args The arguments to escape and append
- * @returns The safe command string
- */
-export function buildSafeCommand(command: string, ...args: string[]): string {
-  if (args.length === 0) return command;
-  return `${command} ${escapeShellArgs(args)}`;
 }

@@ -17,7 +17,9 @@ import { eventsRouter } from './routers/events';
 import { feedbackRouter } from './routers/feedback';
 import { filesRouter } from './routers/files';
 import { healthRouter } from './routers/health';
+import { ideaComponentsRouter } from './routers/ideaComponents';
 import { insightsRouter } from './routers/insights';
+import { providerUsageRouter } from './routers/providerUsage';
 import { questionsRouter } from './routers/questions';
 import { tasksRouter } from './routers/tasks';
 import { trackerRouter } from './routers/tracker';
@@ -46,10 +48,12 @@ export const appRouter = router({
     feedback: feedbackRouter,
     files: filesRouter,
     health: healthRouter,
+    ideaComponents: ideaComponentsRouter,
     insights: insightsRouter,
     mcps: mcpsRouter,
     monitor: monitorRouter,
     plugins: pluginsRouter,
+    providerUsage: providerUsageRouter,
     questions: questionsRouter,
     reviewItems: reviewItemsRouter,
     runs: runsRouter,

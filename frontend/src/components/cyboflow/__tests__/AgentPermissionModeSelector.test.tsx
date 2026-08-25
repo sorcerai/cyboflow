@@ -39,7 +39,7 @@ describe('AgentPermissionModeSelector — per-provider option sets', () => {
     expect(screen.queryByText(/skip permissions/i)).not.toBeInTheDocument();
   });
 
-  it('sends OMP terminal approvals to the terminal, not the review queue', () => {
+  it('sends OMP CLI approvals to the terminal, not the review queue', () => {
     render(
       <AgentPermissionModeSelector
         value="default"

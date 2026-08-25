@@ -22,7 +22,17 @@
  *                                  v0, migration 085) also gets an
  *                                  `approved_design` block with a RESOLVED
  *                                  absolute path to the approved prototype
- *                                  snapshot — the zero-export handoff read path.)
+ *                                  snapshot — the zero-export handoff read path.
+ *                                  An idea also gets `components` — the idea
+ *                                  component ledger's full hybrid read model
+ *                                  (migration 101, resolveIdeaComponents),
+ *                                  always all five, carrying `staleAt` so
+ *                                  "needs review" (prior work, re-verify) is
+ *                                  never collapsed into "not started".)
+ *   - mcp-set-idea-component      (WRITE via IdeaComponentRouter's chokepoint;
+ *                                  source:'flow', sourceRunId + the idea's
+ *                                  current version stamped by this handler,
+ *                                  never by the calling agent.)
  *
  * Plus the INTERACTIVE-substrate PreToolUse gate (IDEA-013 S5 / TASK-810):
  *   - shell-approval-request      (ASYNC-DEFERRED — the first handler that does
@@ -113,6 +123,9 @@ import type { ReviewItemCreate, ReviewItemTriage, ReviewItemDbRow } from '../rev
 import { selectFindingForSeed, selectRunFindings } from '../reviewItemListing';
 import { selectProjectBacklog, selectTaskById, resolveBacklogRef, selectIdeaAttachments } from '../taskListing';
 import { getCurrentApprovedDesign } from '../design/approvedDesigns';
+import { resolveIdeaComponents } from '../ideaComponents/resolveIdeaComponents';
+import { IdeaComponentRouter, IdeaComponentError } from '../ideaComponents/ideaComponentRouter';
+import type { IdeaComponentKey, IdeaComponentStateValue } from '../../../../shared/types/ideaComponents';
 import { ArtifactRouter, ArtifactError } from '../artifactRouter';
 import { FeedbackRouter, FeedbackError } from '../feedbackRouter';
 import type { ArtifactActor } from '../artifactRouter';
@@ -121,6 +134,12 @@ import { PROTOTYPE_HTML_RELPATH, MAX_PROTOTYPE_HTML_BYTES, ARTIFACT_POLICIES } f
 import { QUICK_WORKFLOW_NAME, LEGACY_DROPPED_WORKFLOW_NAMES } from '../workflowRegistry';
 import { AgentThreadDbStore } from '../agentThread/agentThreadDbStore';
 import { computeSpecHash } from '../agentThread/specHash';
+import {
+  extractTurnText,
+  excerptAround,
+  truncateHead,
+  TURN_TEXT_MAX_CHARS,
+} from '../agentThread/transcriptSearch';
 import {
   AGENT_PROPOSAL_KINDS,
   AGENT_THREAD_SPAWN_PREFIX,
@@ -162,7 +181,11 @@ import type {
 } from '../../../../shared/types/visualVerification';
 import type { AdHocSnapshotResult } from '../eval/snapshotRunForEval';
 import { SprintLaneStore, SprintLaneError } from '../sprintLaneStore';
-import { SPRINT_BATCH_MAX_TASKS, AWAITING_VERIFY_STEP } from '../../../../shared/types/sprintBatch';
+import {
+  resolveSprintMaxTasks,
+  AWAITING_VERIFY_STEP,
+  type SprintMaxTasksOverrides,
+} from '../../../../shared/types/sprintBatch';
 import type { SprintBatchTaskStatus } from '../../../../shared/types/sprintBatch';
 import { resolveRunFanOutInner, runHasControllerVisualVerify } from '../laneChainResolution';
 import { isCliSubstrate, type CliSubstrate } from '../../../../shared/types/substrate';
@@ -195,6 +218,17 @@ import {
  * approve-plan silent-pass guard in handleReportStep.
  */
 const APPROVE_PLAN_STEP_ID = 'approve-plan';
+
+/**
+ * Provenance stamped on the folded permission review_item, per transport.
+ *
+ * Both the interactive Claude shell hook and the OMP gate extension reach
+ * `handleShellApprovalRequest` over the same socket, so the source is the only
+ * thing in the row that records which substrate is actually blocked.
+ * (Codex has its own, `CODEX_APP_SERVER_APPROVAL_SOURCE`.)
+ */
+const APPROVAL_SOURCE_INTERACTIVE = 'approval:interactive';
+const APPROVAL_SOURCE_OMP = 'approval:omp';
 
 /**
  * Wire error per ad-hoc-eval rejection reason (`cyboflow_run_eval`). Keyed by the
@@ -318,6 +352,26 @@ export type McpQueryMessage =
       dependsOnTaskId: string;
       /** Edge kind; defaults to 'blocking' at the chokepoint. */
       dependencyKind?: TaskDependencyKind;
+    }
+  | {
+      /**
+       * WRITE: set one idea component's ledger state via
+       * IdeaComponentRouter.applyChange's 'set-component-state' op
+       * (source:'flow'). `ideaId` is an opaque idea id OR its display ref
+       * (e.g. 'IDEA-009') — resolved the same way as mcp-get-task
+       * (selectTaskById-by-id first, then resolveBacklogRef-by-ref), scoped to
+       * THIS run's project. `sourceRunId` (this run's id) and
+       * `builtAgainstVersion` (the idea's CURRENT `version` at call time) are
+       * resolved by handleSetIdeaComponent itself — the calling agent never
+       * supplies either.
+       */
+      type: 'mcp-set-idea-component';
+      requestId: string;
+      runId: string;
+      /** Opaque idea id OR display ref (e.g. 'IDEA-009'). */
+      ideaId: string;
+      component: IdeaComponentKey;
+      state: IdeaComponentStateValue;
     }
   | {
       /**
@@ -870,11 +924,55 @@ export type McpQueryMessage =
       maxResults?: number;
     }
   | {
+      /**
+       * READ-ONLY search/paging over the CALLING assistant thread's own durable
+       * transcript (`agent_thread_events`) — the assistant's LONG-TERM MEMORY.
+       * Its live SDK context is reset daily, but every turn it ever exchanged
+       * with the user persists in that table forever, and this is the only way
+       * back to it.
+       *
+       * THREAD-SCOPED, always: the thread comes from
+       * resolveGlobalAgentContext(runId), never from a caller argument, so one
+       * assistant thread can never read another's transcript.
+       *
+       * `query` is a case-insensitive PLAIN-TEXT substring — deliberately NOT a
+       * regex, unlike mcp-fs-grep: the pattern is model-authored and this
+       * handler runs synchronously on the Electron main thread, so a
+       * backtracking blowup in a caller regex would wedge the whole app
+       * (measured: one pathological 15-char pattern froze it for ~110s against
+       * a 61-char turn). indexOf is O(n) unconditionally. Omitted, the tool
+       * BROWSES newest-first instead. `beforeId` is the id-descending paging
+       * cursor (`id < beforeId`) returned as nextBeforeId. Rows are paged in
+       * batches — the table is never loaded whole — under a hard scan cap, a
+       * limit clamped to [1, HISTORY_MAX_LIMIT], and a ~100KB
+       * serialized-payload ceiling.
+       */
+      type: 'mcp-history';
+      requestId: string;
+      runId: string;
+      /** Case-insensitive plain-text substring; omitted/empty = browse mode (no filtering). */
+      query?: string;
+      /** Narrow to one side of the conversation. */
+      role?: 'user' | 'assistant';
+      /** Only turns newer than N days ago (bound into datetime('now', ?)). */
+      daysBack?: number;
+      /** Id-descending cursor: return only turns with id < beforeId. */
+      beforeId?: number;
+      /** Matches to return; clamped to [1, HISTORY_MAX_LIMIT], default HISTORY_DEFAULT_LIMIT. */
+      limit?: number;
+    }
+  | {
       type: 'shell-approval-request';
       requestId: string;
       runId: string;
       toolName: string;
       toolInput: Record<string, unknown>;
+      /**
+       * Which substrate is asking. The interactive-Claude hook omits it; the OMP
+       * gate extension stamps 'omp'. Read ONLY by the socket-died disposition —
+       * see {@link McpQueryHandler.registerInFlightShellApproval}.
+       */
+      substrate?: 'omp';
     }
   | {
       /**
@@ -930,6 +1028,54 @@ export function resolveGlobalAgentContext(
     return { ok: false, error: 'not_a_global_agent_run' };
   }
   return { ok: true, threadId: runId.slice(AGENT_THREAD_SPAWN_PREFIX.length) };
+}
+
+// ---------------------------------------------------------------------------
+// cyboflow_history caps (mcp-history). The transcript table grows without
+// bound — it is the assistant's permanent memory — so every read of it is
+// bounded on FOUR independent axes: how many turns come back (limit), how many
+// rows may be examined to find them (scan cap), how many rows are pulled per
+// round-trip (batch), and how large the serialized reply may get (payload
+// ceiling). Whichever binds first stops the walk and sets `truncated`, with
+// `nextBeforeId` telling the caller exactly where to resume.
+// ---------------------------------------------------------------------------
+
+/** Default number of turns returned when the caller passes no `limit`. */
+const HISTORY_DEFAULT_LIMIT = 20;
+/** Hard ceiling on `limit` — a memory search is a lookup, not a bulk export. */
+const HISTORY_MAX_LIMIT = 50;
+/** Rows fetched per SQL round-trip while paging id-descending. */
+const HISTORY_BATCH_ROWS = 500;
+/** Rows examined before the walk gives up (mostly-plumbing threads page fast). */
+const HISTORY_MAX_SCAN_ROWS = 10_000;
+/** Serialized-turn budget for one reply, mirroring cyboflow_db_query's ceiling. */
+const HISTORY_MAX_PAYLOAD_BYTES = 100_000;
+/**
+ * Ceiling on `daysBack` (~100 years). Not a usability limit — a guard against
+ * SQLite's datetime() overflow: datetime('now', '-N days') silently returns
+ * NULL once N leaves the julian-day range (measured: N=3,650,000 → NULL), and
+ * `created_at >= NULL` filters out EVERY row, so an assistant reaching for a
+ * huge number to mean "search everything" would get a confident false
+ * "no memory of it". Clamped, the widest window just includes the whole table.
+ */
+const HISTORY_MAX_DAYS_BACK = 36_500;
+
+/** One row of the transcript scan (the four columns mcp-history selects). */
+interface AgentThreadEventScanRow {
+  id: number;
+  event_type: string;
+  payload_json: string;
+  created_at: string;
+}
+
+/** One turn as returned to the assistant by cyboflow_history. */
+interface HistoryTurn {
+  eventId: number;
+  at: string;
+  role: 'user' | 'assistant';
+  text: string;
+  /** Present (true) only in search mode, where `text` is a match excerpt. */
+  matched?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1217,7 @@ function isStringArray(v: unknown): v is string[] {
 }
 
 function isAgentPriority(v: unknown): v is Priority {
-  return v === 'P0' || v === 'P1' || v === 'P2';
+  return v === 'P0' || v === 'P1' || v === 'P2' || v === 'P3' || v === 'P4' || v === 'P5' || v === 'P6';
 }
 
 function parseAgentNavigationTarget(raw: unknown): AgentNavigationTarget | null {
@@ -1289,6 +1435,93 @@ interface InFlightShellApproval {
 }
 
 /**
+ * One OMP tool call whose approval outlived its requester.
+ *
+ * The omp-sdk gate can only block for ~25s (OMP kills extension handlers at
+ * 30s), so its socket routinely goes away while the question is still worth
+ * asking. The approval stays pending — {@link ApprovalRouter.orphanPendingForRun}
+ * — and this entry is how the two halves find each other again:
+ *
+ *   - `client === null` while nobody is waiting; the verdict, when it lands, is
+ *     parked in `decision` instead of being written to a dead socket.
+ *   - the model's RETRY of the identical call re-attaches its fresh socket here
+ *     rather than opening a second approval, so one human answer maps to one
+ *     execution and the queue does not fill with duplicates of the same ask.
+ *
+ * `parked` is SINGLE-USE: consumed by the first matching retry and deleted.
+ * A human's "yes" authorizes the call they were shown, not every future call
+ * that happens to serialize identically. It also EXPIRES — see
+ * {@link OMP_PARKED_DECISION_MAX_AGE_MS}.
+ */
+/**
+ * How long a verdict that arrived with no requester keeps authorizing a retry.
+ *
+ * The ENTRY itself is deliberately not reaped — it must survive across turns so
+ * a retry re-attaches to its own card instead of opening a duplicate, and a TTL
+ * on it destroys exactly that. A parked DECISION is a different object: it is a
+ * consumable authorization, and the window it stays valid in used to be bounded
+ * only by the gate's ~25s budget. Raising that budget to 30 minutes
+ * (`OMP_RAISED_DECISION_BUDGET_MS`) turned an incidental bound into a real one:
+ * without this, a "yes" the human gave could sit in memory for the rest of the
+ * run and authorize a call the model issues much later, in a context the human
+ * never saw.
+ *
+ * Expiry is not silent — the retry falls through to a FRESH approval, so the
+ * human is asked again rather than the call being denied out from under them.
+ * Two minutes is generous for the mechanism this serves: OMP retries an
+ * identical call within the same turn, seconds after the handler returns.
+ */
+const OMP_PARKED_DECISION_MAX_AGE_MS = 120_000;
+
+interface DeferredOmpApproval {
+  /** Live requester, or null while the approval is orphaned. */
+  client: net.Socket | null;
+  /** requestId of the CURRENT requester — a retry replaces it. */
+  requestId: string;
+  /**
+   * Verdict that arrived with no requester attached. Single-use, and stamped so
+   * it can also expire: see {@link OMP_PARKED_DECISION_MAX_AGE_MS}. One object
+   * rather than two optional fields, so "decided" and "when" cannot drift.
+   */
+  parked?: { decision: ApprovalDecision; at: number };
+  /**
+   * The approvals row this entry owns, once ApprovalRouter has minted it.
+   *
+   * Undefined only in the window between putDeferredOmpApproval and the
+   * onCreated callback — a window a socket death can land in, which is why the
+   * detach path re-checks rather than assuming it is set. Needed to mark the ask
+   * un-awaited when the gate stops waiting, and awaited again when a retry
+   * re-attaches.
+   */
+  approvalId?: string;
+}
+
+/**
+ * Identity of a tool call for retry matching: name + a key-ordered serialization
+ * of its arguments.
+ *
+ * Key-ORDERED rather than raw `JSON.stringify` because the retry is a fresh
+ * serialization from the model, and object key order is not guaranteed stable
+ * across turns; without the sort an identical call could miss its own orphaned
+ * approval and open a duplicate card. Recursive so nested argument objects sort
+ * too. Non-plain values fall back to their JSON form.
+ */
+function ompCallKey(toolName: string, toolInput: Record<string, unknown>): string {
+  return `${toolName}\u0000${stableJson(toolInput)}`;
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
  * Callback deps this handler needs from main/src/services — ORCHESTRATOR
  * LAYERING RULE: mcpQueryHandler must NOT import from main/src/services, so
  * every such dependency is injected as a plain function rather than a
@@ -1416,6 +1649,19 @@ export interface McpQueryHandlerDeps {
    * without it keep passing unchanged.
    */
   getVisualVerifyConfig?(): ResolvedVisualVerifyConfig;
+
+  /**
+   * The user's per-substrate sprint task-cap override
+   * (ConfigManager.getSprintMaxTasks), already clamped — read LIVE for the same
+   * reason getVisualVerifyConfig is: the cap is a Settings value, not something
+   * frozen onto the run at launch, so `cyboflow_create_sprint_batch` must honor
+   * what the setting says NOW rather than what it said when the run started.
+   *
+   * Absent ⇒ resolveSprintMaxTasks falls back to the built-in per-substrate
+   * defaults (the pre-setting behavior), so every fixture that builds a deps bag
+   * without it keeps passing unchanged.
+   */
+  getSprintMaxTasks?(): SprintMaxTasksOverrides;
 }
 
 /**
@@ -1444,7 +1690,7 @@ export interface WorkflowConfigLike {
     permissionMode?: PermissionMode;
   }): WorkflowRow;
   deleteWorkflow(workflowId: string): void;
-  listVariants(workflowId: string): WorkflowVariantRow[];
+  listVariants(workflowId: string, opts?: { includeArchived?: boolean }): WorkflowVariantRow[];
   createVariantFromCurrent(workflowId: string, label: string): WorkflowVariantRow;
   updateVariant(
     variantId: string,
@@ -1474,6 +1720,12 @@ export class McpQueryHandler {
    * affordance the interactive manager calls before killing the PTY.
    */
   private readonly inFlightShellApprovals = new Map<string, Set<InFlightShellApproval>>();
+
+  /**
+   * Orphaned OMP approvals, keyed runId → {@link ompCallKey} → entry. Populated
+   * only on the omp-sdk lane; cleared with the run's in-flight sockets.
+   */
+  private readonly ompDeferredApprovals = new Map<string, Map<string, DeferredOmpApproval>>();
 
   /**
    * Lazily-opened, cached readonly sibling connection backing
@@ -1540,6 +1792,9 @@ export class McpQueryHandler {
           break;
         case 'mcp-add-task-dependency':
           await this.handleAddTaskDependency(msg, client);
+          break;
+        case 'mcp-set-idea-component':
+          await this.handleSetIdeaComponent(msg, client);
           break;
         case 'mcp-list-tasks':
           // Read-only: projects + flattens selectProjectBacklog's tree. Never writes.
@@ -1695,6 +1950,9 @@ export class McpQueryHandler {
           break;
         case 'mcp-fs-grep':
           this.handleFsGrep(msg, client);
+          break;
+        case 'mcp-history':
+          this.handleAgentHistory(msg, client);
           break;
         case 'shell-approval-request':
           // Async-deferred — the FIRST handler that does NOT writeResponse
@@ -2508,6 +2766,110 @@ export class McpQueryHandler {
     });
   }
 
+  /**
+   * Set one idea's component ledger state (cyboflow_set_idea_component) via
+   * IdeaComponentRouter's 'set-component-state' op, source:'flow'. Resolves
+   * `ideaId` id-then-ref exactly like handleGetTask (an opaque id wins; on a
+   * miss, resolveBacklogRef scoped to this run's project), and rejects
+   * 'not_found' when the resolved entity is missing, cross-project, or not an
+   * idea (epics/tasks carry no ledger) — the same "indistinguishable from a
+   * genuine miss" posture handleGetTask uses for its cross-project guard.
+   *
+   * `sourceRunId` and `builtAgainstVersion` are resolved HERE, never accepted
+   * from the calling agent (per the brief: "the tool resolves those, never the
+   * calling agent") — sourceRunId is this run's own id, and
+   * builtAgainstVersion is the idea's CURRENT `version` at call time (the
+   * version this component is being stamped AGAINST).
+   */
+  private async handleSetIdeaComponent(
+    msg: Extract<McpQueryMessage, { type: 'mcp-set-idea-component' }>,
+    client: net.Socket,
+  ): Promise<void> {
+    const ctx = this.resolveTaskRunContext(msg.runId);
+    if (!ctx.ok) {
+      this.writeResponse(client, {
+        type: 'mcp-query-response',
+        requestId: msg.requestId,
+        ok: false,
+        error: ctx.error,
+      });
+      return;
+    }
+
+    let item = selectTaskById(this.db, msg.ideaId);
+    if (!item) {
+      const resolvedId = resolveBacklogRef(this.db, ctx.projectId, msg.ideaId);
+      if (resolvedId) {
+        item = selectTaskById(this.db, resolvedId);
+      }
+    }
+
+    if (!item || item.project_id !== ctx.projectId || item.type !== 'idea') {
+      this.writeResponse(client, {
+        type: 'mcp-query-response',
+        requestId: msg.requestId,
+        ok: false,
+        error: 'not_found',
+      });
+      return;
+    }
+
+    try {
+      const { states } = await IdeaComponentRouter.getInstance().applyChange(ctx.projectId, {
+        op: 'set-component-state',
+        ideaId: item.id,
+        component: msg.component,
+        state: msg.state,
+        source: 'flow',
+        sourceRunId: msg.runId,
+        builtAgainstVersion: item.version,
+      });
+      this.writeResponse(client, {
+        type: 'mcp-query-response',
+        requestId: msg.requestId,
+        ok: true,
+        data: {
+          idea_id: item.id,
+          ref: item.ref,
+          component: msg.component,
+          state: msg.state,
+          // The fresh merged hybrid snapshot (all five) — lets the calling
+          // agent confirm staleness cleared without a separate get_task round
+          // trip (setComponentState always clears stale_at/stale_reason as a
+          // side effect; see ideaComponentRouter.ts).
+          components: states,
+        },
+      });
+    } catch (err) {
+      this.writeIdeaComponentError(client, msg.requestId, err);
+    }
+  }
+
+  /**
+   * Surface an IdeaComponentRouter chokepoint failure as an ok:false response.
+   * Mirrors writeTaskChangeError's shape for the sibling ledger chokepoint.
+   */
+  private writeIdeaComponentError(client: net.Socket, requestId: string, err: unknown): void {
+    if (err instanceof IdeaComponentError) {
+      this.writeResponse(client, {
+        type: 'mcp-query-response',
+        requestId,
+        ok: false,
+        error: err.code,
+      });
+      return;
+    }
+    this.logger?.error('[Cyboflow MCP Query] idea component change failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    this.writeResponse(client, {
+      type: 'mcp-query-response',
+      requestId,
+      ok: false,
+      error: 'idea_component_change_failed',
+    });
+  }
+
   // --------------------------------------------------------------------------
   // Read-only backlog listing (cyboflow_list_tasks / cyboflow_get_task)
   //
@@ -2797,6 +3159,21 @@ export class McpQueryHandler {
           snapshot_path: path.resolve(approvedDesign.snapshotPath),
         };
       }
+
+      // Idea component ledger (migration 101 / shared/types/ideaComponents.ts):
+      // the hybrid read model, resolved fresh on every get_task rather than
+      // trusted from the listing-path overlay so a same-turn stamp is never
+      // stale. Always all FIVE components — never omitted for an idea (unlike
+      // attachments/approved_design, there is no "component with none" case:
+      // resolveIdeaComponents backfills every component via derivation when no
+      // ledger row exists). Each entry carries `staleAt`, which is the field a
+      // reading agent MUST check, not just `state`: `state: 'incomplete'` alone
+      // is ambiguous between "never started" (staleAt: null) and "needs
+      // review" (staleAt non-null — prior work exists and should be
+      // re-verified against the diff, not redone from scratch). See
+      // planner.md's "component ledger" section for how a flow is expected to
+      // read and act on this.
+      task['components'] = resolveIdeaComponents(this.db, item.id);
     }
 
     this.writeResponse(client, {
@@ -3011,7 +3388,8 @@ export class McpQueryHandler {
    *      (ids the run did not create are dropped); the full created set when no
    *      subset is passed.
    *   4. EMPTY — no resolvable tasks → ok:false 'ship_no_tasks_to_materialize'.
-   *   5. CAP backstop — more tasks than SPRINT_BATCH_MAX_TASKS[substrate] →
+   *   5. CAP backstop — more tasks than the effective per-substrate cap
+   *      (resolveSprintMaxTasks over the user's Settings override) →
    *      ok:false 'ship_batch_too_large' (the human gate is the primary control).
    *   6. createForRun(projectId, substrate, taskIds) → { batchId }.
    *   7. COMPARE-AND-SET — UPDATE workflow_runs SET batch_id WHERE id AND
@@ -3094,7 +3472,7 @@ export class McpQueryHandler {
         }
 
         // 5. CAP backstop (defense — the human gate is the primary control).
-        if (taskIds.length > SPRINT_BATCH_MAX_TASKS[substrate]) {
+        if (taskIds.length > resolveSprintMaxTasks(this.deps.getSprintMaxTasks?.(), substrate)) {
           return { ok: false, error: 'ship_batch_too_large' };
         }
 
@@ -5130,6 +5508,15 @@ export class McpQueryHandler {
         });
         return;
       }
+      // Migration-105 provenance: THIS registration came through the Verify
+      // Setup flow, where a human reviews the proposal and every repo change it
+      // wants before anything is touched. The lane bootstrap stamps
+      // 'lane-bootstrap' on its own registrations, and a human deciding whether
+      // to trust a proven runbook needs to be able to tell the two apart — both
+      // are proven by the same engine-enforced run, and they did not earn the
+      // same amount of trust. Fail-soft: a badge that could not be written must
+      // never undo a registration that succeeded.
+      store.setOrigin(ctx.projectId, msg.modality, 'setup-flow');
       // COMMITTED-AT-HEAD backstop. registerDraft reads the WORKING TREE, but
       // the proof runs against a detached snapshot at a commit — so a runbook
       // that never reached HEAD registers cleanly and then proves against a
@@ -5296,7 +5683,8 @@ export class McpQueryHandler {
    * non-edit tools).
    *
    * P4 fold: requestApproval co-writes a blocking permission review_item into the
-   * unified inbox (source 'approval:interactive') inside its own transaction. The
+   * unified inbox (source 'approval:interactive', or 'approval:omp' when the
+   * requester is the OMP gate extension) inside its own transaction. The
    * socket-held-open contract is UNCHANGED — the review_item is purely additive
    * and the socketReply closure remains the only place a verdict is written.
    *
@@ -5379,9 +5767,62 @@ export class McpQueryHandler {
       }
     }
 
+    // (c0) omp-sdk lane: does this call already have an approval in flight?
+    // A retry of an identical call must land on the ORIGINAL ask rather than
+    // opening a second one — see DeferredOmpApproval. Two hits are possible:
+    // a verdict that arrived while nobody was waiting (answer it now, single
+    // use), or an ask still sitting in the human's queue (re-attach and wait).
+    const ompKey = msg.substrate === 'omp' ? ompCallKey(msg.toolName, msg.toolInput) : null;
+    if (ompKey !== null) {
+      const deferred = this.ompDeferredApprovals.get(msg.runId)?.get(ompKey);
+      if (deferred?.parked !== undefined) {
+        const { decision, at } = deferred.parked;
+        // Consumed either way — a stale verdict is spent, not left to be picked
+        // up by a later retry.
+        this.dropDeferredOmpApproval(msg.runId, ompKey);
+        if (Date.now() - at <= OMP_PARKED_DECISION_MAX_AGE_MS) {
+          this.logger?.debug(
+            '[Cyboflow MCP Query] omp retry matched a decided approval — replaying the human verdict',
+            { runId: msg.runId, toolName: msg.toolName, decision: decision.behavior },
+          );
+          this.writeShellVerdict(client, msg.requestId, decision);
+          return;
+        }
+        // Too old to stand in for consent. Falling through opens a fresh
+        // approval below, so the human is ASKED again rather than denied.
+        this.logger?.debug(
+          '[Cyboflow MCP Query] omp parked verdict expired — asking the human again',
+          { runId: msg.runId, toolName: msg.toolName, ageMs: Date.now() - at },
+        );
+      } else if (deferred !== undefined) {
+        // Still awaiting the human. Adopt the fresh socket as the requester and
+        // register it so ITS disconnect is observed too; no second approvals row.
+        deferred.client = client;
+        deferred.requestId = msg.requestId;
+        this.registerInFlightShellApproval(msg.runId, msg.requestId, client, msg.substrate);
+        // Someone is blocked on this ask again — undo the un-awaited mark the
+        // previous hangup left, so the queue stops describing a live wait as a
+        // standing question.
+        if (deferred.approvalId !== undefined) {
+          this.setOmpApprovalAwaited(deferred.approvalId, true);
+        }
+        this.logger?.debug(
+          '[Cyboflow MCP Query] omp retry re-attached to the pending approval',
+          { runId: msg.runId, toolName: msg.toolName },
+        );
+        return;
+      }
+      this.putDeferredOmpApproval(msg.runId, ompKey, { client, requestId: msg.requestId });
+    }
+
     // (c) Route through ApprovalRouter. Register the held-open socket FIRST so a
     // disconnect during the (async) requestApproval transaction is observed.
-    const entry = this.registerInFlightShellApproval(msg.runId, msg.requestId, client);
+    const entry = this.registerInFlightShellApproval(
+      msg.runId,
+      msg.requestId,
+      client,
+      msg.substrate,
+    );
 
     const router = ApprovalRouter.getInstance();
     void router
@@ -5394,12 +5835,36 @@ export class McpQueryHandler {
           // (Under the SDK path this closure is a no-op; the shell transport uses
           // it — load-bearing, held open across the human-decision window.)
           this.completeInFlightShellApproval(msg.runId, entry);
+          // On the omp lane the requester may have changed (a retry re-attached)
+          // or gone (budget expired), so the deferred entry — not this closure's
+          // captured socket — is the authority on where the verdict goes.
+          if (ompKey !== null) {
+            this.deliverDeferredOmpVerdict(msg.runId, ompKey, decision);
+            return;
+          }
           this.writeShellVerdict(client, msg.requestId, decision);
         },
-        // P4: stamp the folded permission review_item with the interactive
-        // substrate provenance. The co-write happens inside requestApproval's
-        // transaction (commit 1); the socketReply closure above is unchanged.
-        'approval:interactive',
+        // P4: stamp the folded permission review_item with the substrate that
+        // actually asked. Both transports arrive here, and reading every OMP ask
+        // as an interactive-shell one makes the inbox lie about which agent is
+        // blocked — the same attribution gap the pending-approval card had.
+        // The co-write happens inside requestApproval's transaction (commit 1);
+        // the socketReply closure above is unchanged.
+        ompKey === null ? APPROVAL_SOURCE_INTERACTIVE : APPROVAL_SOURCE_OMP,
+        // omp lane only: record which approval this deferred entry owns, so the
+        // ~25s hangup can mark it un-awaited. The entry may already be gone (a
+        // fail-closed catch dropped it); then there is nothing to record.
+        ompKey === null
+          ? undefined
+          : (approvalId) => {
+              const entry = this.ompDeferredApprovals.get(msg.runId)?.get(ompKey);
+              if (entry === undefined) return;
+              entry.approvalId = approvalId;
+              // The gate can hang up DURING requestApproval's transaction, which
+              // parks the entry before it ever learns its id. Reconcile here
+              // rather than leaving the card claiming a wait that already ended.
+              if (entry.client === null) this.setOmpApprovalAwaited(approvalId, false);
+            },
       )
       .then((decision) => {
         // requestApproval resolves with the SAME decision the socketReply got
@@ -5407,6 +5872,10 @@ export class McpQueryHandler {
         // fired). If the socketReply never ran (cancel/supersede path), settle
         // the held-open socket so the PTY does not hang.
         if (this.completeInFlightShellApproval(msg.runId, entry)) {
+          if (ompKey !== null) {
+            this.deliverDeferredOmpVerdict(msg.runId, ompKey, decision);
+            return;
+          }
           this.writeShellVerdict(client, msg.requestId, decision);
         }
       })
@@ -5427,10 +5896,14 @@ export class McpQueryHandler {
           });
         }
         if (this.completeInFlightShellApproval(msg.runId, entry)) {
-          this.writeShellVerdict(client, msg.requestId, {
+          const failClosed: ApprovalDecision = {
             behavior: 'deny',
             message: 'cyboflow approval precondition failed',
-          });
+          };
+          // A precondition failure is terminal for this ask: drop the deferred
+          // entry so a retry re-asks cleanly rather than replaying the deny.
+          if (ompKey !== null) this.dropDeferredOmpApproval(msg.runId, ompKey);
+          this.writeShellVerdict(client, msg.requestId, failClosed);
         }
       });
   }
@@ -5477,6 +5950,10 @@ export class McpQueryHandler {
         // best-effort close
       }
     }
+    // Run teardown ends every deferred ask too: the parked verdicts and
+    // still-pending entries are meaningless once the run is gone, and
+    // clearPendingForRun's DB sweep settles their rows.
+    this.ompDeferredApprovals.delete(runId);
     this.logger?.debug('[Cyboflow MCP Query] denied in-flight shell-approval sockets on cancel', {
       runId,
       count: entries.length,
@@ -5667,10 +6144,35 @@ export class McpQueryHandler {
     runId: string,
     requestId: string,
     client: net.Socket,
+    substrate?: 'omp',
   ): InFlightShellApproval {
     const onDisconnect = (): void => {
       // Socket died before a verdict (orchestrator-down / hook subprocess died).
       if (!this.completeInFlightShellApproval(runId, entry)) return;
+
+      // omp-sdk: the requester stopping is EXPECTED, not a death. OMP caps
+      // extension handlers at 30s, so the gate hangs up at 25s on every ask a
+      // human has not answered yet — settling here is what turned 17 live
+      // approvals into 17 system rejections on 2026-08-19. Keep the ask (and its
+      // review-queue card) alive, park the requester, and hand the run's gate
+      // back so the session keeps executing.
+      if (substrate === 'omp') {
+        this.detachDeferredOmpRequester(runId, client);
+        this.logger?.debug(
+          '[Cyboflow MCP Query] omp gate stopped waiting — approval stays pending for the human',
+          { runId },
+        );
+        try {
+          ApprovalRouter.getInstance().orphanPendingForRun(runId);
+        } catch (err) {
+          this.logger?.debug('[Cyboflow MCP Query] orphanPendingForRun on disconnect failed', {
+            runId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return;
+      }
+
       this.logger?.warn(
         '[Cyboflow MCP Query] shell-approval socket disconnected before verdict — clearing pending approval',
         { runId },
@@ -5725,6 +6227,90 @@ export class McpQueryHandler {
    *   (disconnect / cancel / a prior resolve) — the caller must then NOT write,
    *   preserving the exactly-once verdict contract.
    */
+  /** Record a fresh omp-lane ask so its retries and its verdict can find it. */
+  private putDeferredOmpApproval(runId: string, key: string, entry: DeferredOmpApproval): void {
+    let byKey = this.ompDeferredApprovals.get(runId);
+    if (!byKey) {
+      byKey = new Map<string, DeferredOmpApproval>();
+      this.ompDeferredApprovals.set(runId, byKey);
+    }
+    byKey.set(key, entry);
+  }
+
+  private dropDeferredOmpApproval(runId: string, key: string): void {
+    const byKey = this.ompDeferredApprovals.get(runId);
+    if (!byKey) return;
+    byKey.delete(key);
+    if (byKey.size === 0) this.ompDeferredApprovals.delete(runId);
+  }
+
+  /**
+   * Park the requester whose socket just died, WITHOUT touching the ask.
+   *
+   * Matched by socket identity, not by key: a retry may already have adopted
+   * this entry with a newer socket, and the older socket's late 'close' must not
+   * unhook the live one.
+   */
+  private detachDeferredOmpRequester(runId: string, client: net.Socket): void {
+    const byKey = this.ompDeferredApprovals.get(runId);
+    if (!byKey) return;
+    for (const entry of byKey.values()) {
+      if (entry.client !== client) continue;
+      entry.client = null;
+      // Nothing is blocked on this ask any more. The row stays pending — a
+      // retry can still collect the verdict, even in a later turn — but the
+      // queue must stop painting it as a halted agent.
+      if (entry.approvalId !== undefined) this.setOmpApprovalAwaited(entry.approvalId, false);
+    }
+  }
+
+  /**
+   * Mark an omp approval awaited / un-awaited, fail-soft.
+   *
+   * Wrapped because both callers sit on hot, un-catchable paths — a socket
+   * 'close' listener and the router's own onCreated callback — where a throw
+   * would take down the disconnect handler or roll back a committed grab.
+   */
+  private setOmpApprovalAwaited(approvalId: string, awaited: boolean): void {
+    try {
+      ApprovalRouter.getInstance().setAwaited(approvalId, awaited);
+    } catch (err) {
+      this.logger?.debug('[Cyboflow MCP Query] setAwaited failed', {
+        approvalId,
+        awaited,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Deliver an omp-lane verdict to whoever is waiting — or to nobody.
+   *
+   * With a requester attached this writes the verdict and the ask is done. With
+   * none (the gate's budget expired and no retry has arrived yet) the decision
+   * is PARKED for the next identical call, so a human answering a minute late
+   * still authorizes the work instead of the model re-asking from scratch.
+   */
+  private deliverDeferredOmpVerdict(
+    runId: string,
+    key: string,
+    decision: ApprovalDecision,
+  ): void {
+    const entry = this.ompDeferredApprovals.get(runId)?.get(key);
+    if (!entry) return;
+    if (entry.client === null) {
+      entry.parked = { decision, at: Date.now() };
+      this.logger?.debug(
+        '[Cyboflow MCP Query] omp verdict arrived with no requester — parked for the retry',
+        { runId, decision: decision.behavior },
+      );
+      return;
+    }
+    const { client, requestId } = entry;
+    this.dropDeferredOmpApproval(runId, key);
+    this.writeShellVerdict(client, requestId, decision);
+  }
+
   private completeInFlightShellApproval(runId: string, entry: InFlightShellApproval): boolean {
     const set = this.inFlightShellApprovals.get(runId);
     if (!set || !set.has(entry)) return false;
@@ -7096,6 +7682,236 @@ export class McpQueryHandler {
       requestId: msg.requestId,
       ok: true,
       data: { matches, truncated, filesScanned },
+    });
+  }
+
+  /**
+   * cyboflow_history (mcp-history) — READ-ONLY search/paging over the CALLING
+   * assistant thread's own `agent_thread_events` rows.
+   *
+   * THREAD SCOPING IS THE LOAD-BEARING GUARANTEE: `thread_id` is bound from
+   * resolveGlobalAgentContext(msg.runId), which rejects any non-`agent:` runId
+   * BEFORE a single DB read (mirroring handleAgentQueue). There is no
+   * caller-supplied thread argument at all, so no argument can widen the scope
+   * past the thread that is asking.
+   *
+   * TWO MODES over one walk:
+   *   search (query given) — keep turns whose decoded text contains the
+   *                          case-insensitive substring, each returned as an
+   *                          excerpt around its FIRST occurrence, `matched:
+   *                          true`. Plain indexOf, NEVER a caller regex — see
+   *                          the mcp-history union member's doc for why.
+   *   browse (no query)    — keep every decoded turn, head-truncated.
+   *
+   * The walk pages id-DESCENDING in HISTORY_BATCH_ROWS batches (never
+   * `SELECT *` over the whole table — this table is append-only and permanent)
+   * and stops at the first cap it hits: HISTORY_MAX_SCAN_ROWS rows examined,
+   * HISTORY_MAX_PAYLOAD_BYTES of serialized turns, or a (limit+1)th qualifying
+   * turn FOUND — the page is full and that unreturned find is the proof more
+   * exists. Any of those sets `truncated` and reports `nextBeforeId` — the id
+   * of the last FULLY PROCESSED row — so a follow-up call resumes exactly
+   * where this one stopped, never re-emitting and never skipping. A walk that
+   * fills the page exactly and then runs out of rows is NOT truncated: the
+   * scan keeps going after the limit is reached purely to learn whether more
+   * qualifying turns exist (bounded by the same scan cap), so `truncated:true`
+   * always means "there is more". Rows running out ends the walk with
+   * `truncated:false`, `nextBeforeId:null`.
+   *
+   * Rows whose payload carries no turn text (SDK tool_result plumbing, tool_use
+   * -only assistant events, corrupt JSON) decode to null and are skipped — they
+   * still count toward `scanned`, which is why the scan cap exists separately
+   * from `limit`.
+   */
+  private handleAgentHistory(
+    msg: Extract<McpQueryMessage, { type: 'mcp-history' }>,
+    client: net.Socket,
+  ): void {
+    const ctx = resolveGlobalAgentContext(msg.runId);
+    if (!ctx.ok) {
+      this.writeResponse(client, { type: 'mcp-query-response', requestId: msg.requestId, ok: false, error: ctx.error });
+      return;
+    }
+
+    // --- argument validation ------------------------------------------------
+    if (msg.role !== undefined && msg.role !== 'user' && msg.role !== 'assistant') {
+      this.writeResponse(client, {
+        type: 'mcp-query-response',
+        requestId: msg.requestId,
+        ok: false,
+        error: "invalid_arguments: role must be 'user' or 'assistant'",
+      });
+      return;
+    }
+    for (const [name, value] of [
+      ['daysBack', msg.daysBack],
+      ['beforeId', msg.beforeId],
+      ['limit', msg.limit],
+    ] as const) {
+      if (value === undefined) continue;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        this.writeResponse(client, {
+          type: 'mcp-query-response',
+          requestId: msg.requestId,
+          ok: false,
+          error: `invalid_arguments: ${name} must be a positive finite number`,
+        });
+        return;
+      }
+    }
+
+    // An omitted OR empty query means browse mode (an empty needle would match
+    // every turn, making the two modes differ only in excerpt shape — browsing
+    // is the clearer contract for "no search term"). The needle is matched as
+    // a case-insensitive PLAIN SUBSTRING via indexOf on lowercased text —
+    // deliberately not a RegExp: this handler runs synchronously on the main
+    // process, and a model-authored pattern with catastrophic backtracking
+    // would wedge the entire app (see the mcp-history union member's doc).
+    let needle: string | null = null;
+    if (msg.query !== undefined) {
+      if (typeof msg.query !== 'string') {
+        this.writeResponse(client, {
+          type: 'mcp-query-response',
+          requestId: msg.requestId,
+          ok: false,
+          error: 'invalid_arguments: query must be a string',
+        });
+        return;
+      }
+      if (msg.query.length > 0) {
+        needle = msg.query.toLowerCase();
+      }
+    }
+
+    const limit = Math.max(
+      1,
+      Math.min(msg.limit !== undefined ? Math.floor(msg.limit) : HISTORY_DEFAULT_LIMIT, HISTORY_MAX_LIMIT),
+    );
+    const roleFilter = msg.role;
+    // Bound as a PARAMETER to datetime('now', ?) — never interpolated into the
+    // SQL text, even though it is derived from a validated number. Clamped to
+    // HISTORY_MAX_DAYS_BACK: past the julian-day range datetime() returns NULL
+    // and `created_at >= NULL` silently filters out EVERY row (see the
+    // constant's doc) — a clamped huge value instead means "the whole table".
+    const dayModifier =
+      msg.daysBack !== undefined
+        ? `-${Math.min(Math.max(1, Math.floor(msg.daysBack)), HISTORY_MAX_DAYS_BACK)} days`
+        : null;
+
+    // --- the id-descending walk ---------------------------------------------
+    const turns: HistoryTurn[] = [];
+    let cursor: number | null = msg.beforeId !== undefined ? Math.floor(msg.beforeId) : null;
+    /** Id of the last row processed to completion — the resume point. */
+    let lastProcessedId: number | null = null;
+    let scanned = 0;
+    let payloadBytes = 0;
+    let truncated = false;
+    let stopped = false;
+
+    while (!stopped) {
+      const clauses = [
+        'thread_id = ?',
+        "event_type IN ('user', 'assistant', 'agent_user', 'agent_assistant')",
+      ];
+      const params: unknown[] = [ctx.threadId];
+      if (cursor !== null) {
+        clauses.push('id < ?');
+        params.push(cursor);
+      }
+      if (dayModifier !== null) {
+        clauses.push("created_at >= datetime('now', ?)");
+        params.push(dayModifier);
+      }
+      params.push(HISTORY_BATCH_ROWS);
+
+      const rows = this.db
+        .prepare(
+          `SELECT id, event_type, payload_json, created_at
+             FROM agent_thread_events
+            WHERE ${clauses.join(' AND ')}
+            ORDER BY id DESC
+            LIMIT ?`,
+        )
+        .all(...params) as AgentThreadEventScanRow[];
+      if (rows.length === 0) break; // exhausted — no more transcript to page
+
+      for (const row of rows) {
+        if (scanned >= HISTORY_MAX_SCAN_ROWS) {
+          truncated = true;
+          stopped = true;
+          break;
+        }
+        scanned += 1;
+        cursor = row.id;
+
+        const turn = extractTurnText(row.event_type, row.payload_json);
+        if (turn !== null && (roleFilter === undefined || turn.role === roleFilter)) {
+          let text: string;
+          let matched = false;
+          if (needle !== null) {
+            // Lowercase-both indexOf: unconditionally O(n), immune to the
+            // backtracking blowups a caller regex could smuggle in. The rare
+            // Unicode where toLowerCase changes string length can drift the
+            // excerpt window a few chars — excerptAround clamps, so the worst
+            // case is a slightly off-center excerpt, never a crash or a miss.
+            const matchIndex = turn.text.toLowerCase().indexOf(needle);
+            if (matchIndex === -1) {
+              lastProcessedId = row.id;
+              continue; // searched and missed — row is fully processed
+            }
+            text = excerptAround(turn.text, matchIndex);
+            matched = true;
+          } else {
+            text = truncateHead(turn.text, TURN_TEXT_MAX_CHARS);
+          }
+
+          // Page already full? Then THIS qualifying turn is the proof that
+          // more exists: report truncated WITHOUT emitting it, leaving
+          // lastProcessedId pointing above it so the next page starts here.
+          // (The scan deliberately continues past `limit` to reach this point
+          // — an exact-limit walk that runs out of rows instead is complete,
+          // not truncated, and never costs the caller a wasted empty page.)
+          if (turns.length >= limit) {
+            truncated = true;
+            stopped = true;
+            break;
+          }
+
+          const entry: HistoryTurn = {
+            eventId: row.id,
+            at: row.created_at,
+            role: turn.role,
+            text,
+            ...(matched ? { matched: true } : {}),
+          };
+          const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+          // A single oversized turn is still returned when it would otherwise
+          // be the empty answer — returning nothing would look like "no such
+          // memory" rather than "one very long memory".
+          if (turns.length > 0 && payloadBytes + entryBytes > HISTORY_MAX_PAYLOAD_BYTES) {
+            truncated = true;
+            stopped = true;
+            break; // row NOT processed — lastProcessedId still points above it
+          }
+          turns.push(entry);
+          payloadBytes += entryBytes;
+        }
+
+        lastProcessedId = row.id;
+      }
+
+      if (!stopped && rows.length < HISTORY_BATCH_ROWS) break; // short batch = exhausted
+    }
+
+    this.writeResponse(client, {
+      type: 'mcp-query-response',
+      requestId: msg.requestId,
+      ok: true,
+      data: {
+        turns,
+        truncated,
+        nextBeforeId: truncated ? lastProcessedId : null,
+        scanned,
+      },
     });
   }
 

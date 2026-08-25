@@ -28,13 +28,24 @@
  * session-scoped or the prune effect closes tabs minted under the session's
  * other runs).
  *
+ * EXTERNAL artifact tabs: a tab may point at an artifact that belongs to a
+ * DIFFERENT run/session entirely — the idea-session canvas's idea-scoped links
+ * open deliverables minted by the idea's launched planner/design runs. Those
+ * rows can never appear in the session-scoped list, so such a tab is resolved
+ * by `useExternalArtifact` against its own `runId` instead (and is exempt from
+ * useArtifactTabsSync's prune loop — see `TabItem.external`).
+ *
  * The tab strip is shown only once a second tab exists (progressive disclosure): a
  * resting quick session with just its home tab looks exactly as before. The
  * TerminalDock (the chat) stays mounted across tab switches — only the top plane
  * swaps between the canvas and a file/artifact tab.
+ *
+ * The home tab hosts the IdeaSessionCanvas when the session is an idea's home
+ * (`session.homeIdeaId`), else the resting QuickSessionCanvas.
  */
 import { useEffect, useMemo, type ReactNode, type ReactElement } from 'react';
 import { QuickSessionCanvas } from './QuickSessionCanvas';
+import { IdeaSessionCanvas } from './IdeaSessionCanvas';
 import { CenterPaneTabStrip } from './CenterPaneTabStrip';
 import { FileTabRenderer } from './FileTabRenderer';
 import { ArtifactTabRenderer } from './ArtifactTabRenderer';
@@ -43,6 +54,7 @@ import { useCenterPaneStore, useCenterPaneSession } from '../../stores/centerPan
 import { FLOW_TAB_ID } from '../../../../shared/types/centerPane';
 import { useSessionArtifactsList } from '../../hooks/useArtifactsList';
 import { useArtifactTabsSync } from '../../hooks/useArtifactTabsSync';
+import { useExternalArtifact } from '../../hooks/useExternalArtifact';
 import { hideSupersededPrototypes } from '../../utils/prototypeArtifacts';
 import type { Session } from '../../types/session';
 
@@ -96,6 +108,25 @@ export function QuickSessionCenterPane({
 
   const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId) ?? pane.tabs[0];
 
+  // An EXTERNAL artifact tab's row lives in ANOTHER run, so the session-scoped
+  // list above can never hold it — fetch it by (artifactId, runId, atype), which
+  // is also what reaches the committed on-disk snapshot when the DB row was
+  // deleted on commit (IDEA-039). Resolved at the top level (never inside
+  // renderActiveTab, which would make the hook call conditional); a null target
+  // for every other tab kind makes it inert.
+  const externalTarget =
+    activeTab &&
+    activeTab.kind === 'artifact' &&
+    activeTab.external === true &&
+    activeTab.artifactId !== undefined &&
+    activeTab.runId !== undefined
+      ? { artifactId: activeTab.artifactId, runId: activeTab.runId, atype: activeTab.atype }
+      : null;
+  const { artifact: externalArtifact, loading: externalLoading } = useExternalArtifact(
+    projectId,
+    externalTarget,
+  );
+
   // A quick session has no workflow, so relabel the shared pinned home (Flow) tab
   // to the session's name — it hosts the resting canvas, not a "Flow" graph.
   const homeLabel = session.name || 'Session';
@@ -110,6 +141,28 @@ export function QuickSessionCenterPane({
       // The diff/content source is the pane's session key — sessionId alone is
       // sufficient (no run / base-sha needed); see FileTabRenderer.
       return <FileTabRenderer sessionId={sessionKey} filePath={activeTab.filePath} status={activeTab.status} />;
+    }
+    if (activeTab && activeTab.kind === 'artifact' && externalTarget !== null) {
+      // Cross-run (idea-scoped) artifact — resolved by artifacts.get against the
+      // tab's OWN runId, and rendered with that runId so the renderer's
+      // run-keyed reads (artifacts:load-html, comments, …) address the run that
+      // actually produced it rather than this session's chat sentinel.
+      if (externalArtifact) {
+        return (
+          <ArtifactTabRenderer
+            artifact={externalArtifact}
+            projectId={projectId}
+            runId={externalArtifact.runId}
+          />
+        );
+      }
+      return (
+        <div className="flex h-full items-center justify-center text-sm text-text-secondary">
+          {externalLoading
+            ? `Loading ${activeTab.label}…`
+            : `${activeTab.label} is no longer available.`}
+        </div>
+      );
     }
     if (activeTab && activeTab.kind === 'artifact') {
       // Resolve the backing artifact row from the live list. Prefer the tab's
@@ -133,7 +186,21 @@ export function QuickSessionCenterPane({
         </div>
       );
     }
-    // Home (Flow) tab, or any unknown kind → the resting session canvas.
+    // Home (Flow) tab, or any unknown kind → the resting session canvas. An
+    // IDEA SESSION (the durable per-idea home minted by the backlog card's
+    // "Open") gets the idea canvas instead: its home surface is the idea's
+    // ledger + next-direction tiles, not the quick session's metrics + "add a
+    // workflow" picker.
+    if (session.homeIdeaId) {
+      return (
+        <IdeaSessionCanvas
+          session={session}
+          projectId={projectId}
+          ideaId={session.homeIdeaId}
+          sessionKey={sessionKey}
+        />
+      );
+    }
     return (
       <QuickSessionCanvas
         session={session}

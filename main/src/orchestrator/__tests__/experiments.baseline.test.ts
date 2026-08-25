@@ -93,7 +93,7 @@ function variant(id: string): WorkflowVariantRow {
   return {
     id, workflow_id: 'wf', label: id, spec_json: '{}', agent_overrides_json: null,
     model: null, execution_model: null, agent_provider: null, agent_runtime: null,
-    weight: 1, status: 'draft', created_at: '', updated_at: '',
+    weight: 1, status: 'draft', archived_at: null, created_at: '', updated_at: '',
   };
 }
 

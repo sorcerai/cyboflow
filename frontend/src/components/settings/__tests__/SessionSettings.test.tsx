@@ -16,6 +16,7 @@ import {
   WORKFLOW_AGENT_RUNTIMES,
 } from '../../../../../shared/types/agentRuntime';
 import { isRuntimeSelectableInPickers } from '../../../../../shared/types/agentCapabilities';
+import { SPRINT_BATCH_MAX_TASKS_DEFAULTS } from '../../../../../shared/types/sprintBatch';
 
 vi.mock('../../../utils/telemetry', () => ({
   trackEvent: vi.fn(),
@@ -60,6 +61,27 @@ vi.mock('../../../stores/codexModelCatalogStore', () => ({
   }),
 }));
 
+/**
+ * The OMP catalog, faked the same way. Ids are the canonical `<vendor>/<id>`
+ * form `OmpModelOption` composes — the slash is what `isOmpModelFamily` keys on,
+ * so a bare id here would silently stop exercising the coercion.
+ */
+const OMP_MODEL_OPTIONS = [
+  { id: 'anthropic/claude-opus-4-5', label: 'claude-opus-4-5', ompProvider: 'anthropic' },
+  { id: 'openrouter/qwen3-coder', label: 'qwen3-coder', ompProvider: 'openrouter' },
+];
+
+const ompCatalogState: { options: typeof OMP_MODEL_OPTIONS; loading: boolean; error: string | null } =
+  { options: OMP_MODEL_OPTIONS, loading: false, error: null };
+
+vi.mock('../../../stores/ompModelCatalogStore', () => ({
+  useOmpModelCatalog: () => ({
+    options: ompCatalogState.options,
+    loading: ompCatalogState.loading,
+    error: ompCatalogState.error,
+  }),
+}));
+
 function renderGroup(over: Partial<SessionSettingsProps> = {}) {
   const props: SessionSettingsProps = {
     globalSystemPrompt: '',
@@ -76,6 +98,10 @@ function renderGroup(over: Partial<SessionSettingsProps> = {}) {
     onQuickSessionWorktreeModeChange: vi.fn(),
     quickSessionDefaultSubstrate: 'interactive',
     onQuickSessionDefaultSubstrateChange: vi.fn(),
+    sprintMaxTasksSdk: SPRINT_BATCH_MAX_TASKS_DEFAULTS.sdk,
+    onSprintMaxTasksSdkChange: vi.fn(),
+    sprintMaxTasksInteractive: SPRINT_BATCH_MAX_TASKS_DEFAULTS.interactive,
+    onSprintMaxTasksInteractiveChange: vi.fn(),
     codeReviewEvalEnabled: true,
     onCodeReviewEvalEnabledChange: vi.fn(),
     autoGradeVariantRuns: true,
@@ -93,6 +119,7 @@ const SESSION_SETTINGS_SECTIONS = [
   'Default Launch Model',
   'Default Agent Runtime',
   'Workflow Orchestration',
+  'Sprint Batch Size',
   'Quick Sessions',
   'Quick Session Runtime',
   'Code Review Eval',
@@ -287,6 +314,85 @@ describe('SessionSettings', () => {
       },
     );
 
+    // The defect this covers: the Default Launch Model list was Codex/Claude
+    // BINARY, so selecting an OMP runtime left the Claude aliases on screen —
+    // models an OMP launch drops outright.
+    it.each(['omp-sdk', 'omp-pty'] as const)(
+      'offers the OMP catalog under %s, grouped by vendor, with no Claude alias in sight',
+      (runtime) => {
+        renderGroup({ defaultAgentRuntime: runtime });
+
+        const select = screen.getByLabelText('Select OMP model');
+        expect([...select.querySelectorAll('option')].map((o) => o.value)).toEqual([
+          '',
+          ...OMP_MODEL_OPTIONS.map((o) => o.id),
+        ]);
+        expect([...select.querySelectorAll('optgroup')].map((g) => g.label)).toEqual([
+          'anthropic',
+          'openrouter',
+        ]);
+        // The Claude/Codex button list is gone entirely — 495 models is a
+        // <select>, not a wall of buttons.
+        expect(screen.queryByTestId('default-launch-model-unset')).not.toBeInTheDocument();
+        for (const claudeOnly of ['opus', 'sonnet', 'haiku', 'fable']) {
+          expect(screen.queryByTestId(`default-launch-model-${claudeOnly}`)).not.toBeInTheDocument();
+        }
+      },
+    );
+
+    it('stores an OMP model pick verbatim in its canonical vendor/model form', () => {
+      const props = renderGroup({ defaultAgentRuntime: 'omp-sdk' });
+
+      fireEvent.change(screen.getByLabelText('Select OMP model'), {
+        target: { value: 'openrouter/qwen3-coder' },
+      });
+
+      expect(props.onDefaultLaunchModelChange).toHaveBeenCalledWith('openrouter/qwen3-coder');
+    });
+
+    // "Built-in default" stays reachable on OMP — unlike Codex, whose omitted
+    // model would resolve to the Claude floor. OMP's spawn seam drops that
+    // floor, so absence genuinely means "OMP picks".
+    it('keeps a follow-defaults row on the OMP path and clears to it', () => {
+      const props = renderGroup({
+        defaultAgentRuntime: 'omp-sdk',
+        defaultLaunchModel: 'anthropic/claude-opus-4-5',
+      });
+
+      fireEvent.change(screen.getByLabelText('Select OMP model'), { target: { value: '' } });
+
+      expect(props.onDefaultLaunchModelChange).toHaveBeenCalledWith('');
+    });
+
+    it('moves a stored Claude model off when the runtime flips to OMP', () => {
+      // OMP is absent⇒DISABLED (it postdates the provider toggles), so its
+      // runtime row only renders with the toggle explicitly on.
+      const props = renderGroup({
+        defaultLaunchModel: 'opus',
+        agentProviderAccess: { omp: true },
+      });
+
+      fireEvent.click(screen.getByTestId('default-agent-runtime-omp-sdk'));
+
+      expect(props.onDefaultAgentRuntimeChange).toHaveBeenCalledWith('omp-sdk');
+      // No static OMP id exists to swap in (the catalog is per-host), so the
+      // honest degradation is "let OMP choose".
+      expect(props.onDefaultLaunchModelChange).toHaveBeenCalledWith('');
+    });
+
+    it('moves a stored OMP model off when the runtime flips back to Claude', () => {
+      const props = renderGroup({
+        defaultLaunchModel: 'openrouter/qwen3-coder',
+        defaultAgentRuntime: 'omp-sdk',
+        agentProviderAccess: { omp: true },
+      });
+
+      fireEvent.click(screen.getByTestId('default-agent-runtime-claude-sdk'));
+
+      expect(props.onDefaultAgentRuntimeChange).toHaveBeenCalledWith('claude-sdk');
+      expect(props.onDefaultLaunchModelChange).toHaveBeenCalledWith('');
+    });
+
     // Runtime last — the order two ordinary clicks reach: pick a Claude model,
     // then a Codex runtime.
     it('moves a stored Claude model onto the Codex family when the runtime flips', () => {
@@ -411,7 +517,7 @@ describe('SessionSettings', () => {
 
       const note = screen.getByTestId('default-agent-runtime-workflow-note');
       expect(note).toHaveTextContent(/quick sessions only/i);
-      expect(note).toHaveTextContent(/Codex terminal/);
+      expect(note).toHaveTextContent(/Codex \(CLI\)/);
     });
 
     it.each(WORKFLOW_AGENT_RUNTIMES)('renders no note for the workflow-valid runtime %s', (runtime) => {

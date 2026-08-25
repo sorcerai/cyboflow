@@ -11,11 +11,12 @@
  */
 import type { DatabaseLike } from '../types';
 import type { NativeGrantProbe, VerificationModality } from '../../../../shared/types/visualVerification';
-import type { VerifyRunbookStatus } from '../verify/runbookStore';
+import type { VerifyRunbookStatusDetail } from '../verify/runbookStore';
 import type { PermissionMode, WorkflowRow, WorkflowDefinition } from '../../../../shared/types/workflows';
 import type { CliSubstrate } from '../../../../shared/types/substrate';
 import type { OmpControlPlaneAdapter } from '../../../../shared/types/omp';
 import type { OmpCommandAdapter, OmpPrincipal } from '../../../../shared/types/ompCommand';
+import type { SprintMaxTasksOverrides } from '../../../../shared/types/sprintBatch';
 import type { RunGitDiff } from '../../../../shared/types/runFiles';
 import type { WorkflowDescriptor } from '../workflowRegistry';
 import type { AgentOverrideRow } from '../../database/models';
@@ -95,8 +96,15 @@ export interface WorkflowRegistryLike {
   /** Reverse `archiveWorkflow`. Same guards; a no-op if never archived. */
   unarchiveWorkflow(workflowId: string): void;
   // --- Workflow variants (A/B testing, migration 048) ---
-  /** List a workflow's variants (newest-first). */
-  listVariants(workflowId: string): WorkflowVariantRow[];
+  /** List a workflow's variants (newest-first). Archived rows need `includeArchived`. */
+  listVariants(workflowId: string, opts?: { includeArchived?: boolean }): WorkflowVariantRow[];
+  /**
+   * Archive a variant (migration 116): hides it from the list/pickers/rotation
+   * without touching its status or run history. Throws 'not found' when missing.
+   */
+  archiveVariant(variantId: string): void;
+  /** Reverse `archiveVariant`; a no-op if never archived. */
+  unarchiveVariant(variantId: string): void;
   /**
    * Create a variant snapshotting the workflow's current resolved definition
    * (seeds status='draft'). Throws distinguishable Errors: 'not found' / reserved
@@ -308,6 +316,19 @@ export interface ContextDeps {
   getForcedSubstrate?: () => CliSubstrate | null;
 
   /**
+   * Reads the user's per-substrate sprint task-cap override
+   * (ConfigManager.getSprintMaxTasks), already clamped.
+   *
+   * Injected from `main/src/index.ts` as a closure over the ConfigManager
+   * singleton — a plain callback, like `getForcedSubstrate` above, so the
+   * standalone-typecheck invariant holds (no 'main/src/services/*' import here).
+   * `runs.start` layers it over the built-in defaults via resolveSprintMaxTasks
+   * so the server-side 400 matches the cap the picker showed. Defaults to
+   * `() => ({})` (no override → the built-in per-substrate defaults).
+   */
+  getSprintMaxTasks?: () => SprintMaxTasksOverrides;
+
+  /**
    * Captures the diff of an absolute worktree path. With `baseRef` (the run's
    * base_sha) it diffs the working tree against that ref — surfacing committed,
    * uncommitted, and untracked changes since launch — which is what a flow that
@@ -359,12 +380,26 @@ export interface ContextDeps {
   verifyHostProbes?: VerifyHostProbesLike;
   /** Read-only OMP fleet adapter (getFleetSnapshot). Absent => fleetSnapshot returns 'unavailable'. */
   omp?: OmpControlPlaneAdapter;
-  /** Immutable per-request principal. v1: hardcoded 'local', supervise capability OFF by default. */
-  principal?: OmpPrincipal;
+  /**
+   * The OMP command principal — a VALUE or a RESOLVER. Production passes the
+   * resolver (`currentOmpPrincipal`): the supervise capability comes from Aria
+   * mode, a setting flipped at runtime, and createContext resolves this per
+   * request so granting/revoking takes effect on the next call with no relaunch.
+   * A plain value stays accepted for tests that want a fixed identity.
+   */
+  principal?: OmpPrincipal | (() => OmpPrincipal);
   /** Privileged command adapter. Absent => every ompCommand mutation returns 'unavailable'. */
   ompCommand?: OmpCommandAdapter;
   /** Redacted audit sink for OMP commands (attempted + completed). Injected as a closure like setDockBadge. */
   auditOmp?: (entry: { verb: string; principal: string; outcome: 'attempted' | 'completed'; operationId: string; detail: string }) => void;
+  /**
+   * Whether the boot-built fleet session manager EXISTS. A closure rather than a
+   * boolean so the router reads the live wiring (like `getForcedSubstrate`), and
+   * so the standalone router keeps no services/* import. Absent ⇒ not launchable.
+   */
+  ompFleetLaunchable?: () => boolean;
+  /** Aria mode — remote fleet vs local OMP runtimes (see AppConfig.ariaMode). Absent ⇒ false. */
+  ompAriaMode?: () => boolean;
 
   /**
    * Resolve a (project, modality) runbook's status the way the ENGINE resolves
@@ -397,11 +432,21 @@ export interface ContextDeps {
 /**
  * Resolve one (project, modality) runbook status. See
  * {@link ContextDeps.verifyRunbookStatus} for why this exists at all.
+ *
+ * `probePath` is the TREE whose portable half is checked, and it is optional
+ * because the two callers ask genuinely different questions. The health panel
+ * asks a PROJECT-level one ("has this project proven a runbook, and does that
+ * proof still hold?") and omits it, taking the project root. The scheduler's
+ * §3.2 degrade gate asks a REQUEST-level one ("can THIS request's tree be
+ * verified?") and passes the requesting run's worktree — because that is the
+ * tree whose commands would actually execute, and the tree the enqueue-time
+ * injection has always probed (lane-runbook-bootstrap.md §3).
  */
 export type VerifyRunbookStatusLike = (
   projectId: number,
   modality: VerificationModality,
-) => Promise<VerifyRunbookStatus>;
+  probePath?: string,
+) => Promise<VerifyRunbookStatusDetail>;
 
 /**
  * Creates the tRPC request context.
@@ -422,15 +467,19 @@ export function createContext(deps: ContextDeps = {}): {
   workflowRegistry?: WorkflowRegistryLike;
   agentOverrideRouter?: AgentOverrideRouterLike;
   getForcedSubstrate: () => CliSubstrate | null;
+  getSprintMaxTasks: () => SprintMaxTasksOverrides;
   gitDiff?: (worktreePath: string, baseRef?: string) => Promise<RunGitDiff>;
   agentThreadService?: AgentThreadServiceLike;
   agentThreadStore?: AgentThreadStoreLike;
   agentProposalExecutor?: AgentProposalExecutorLike;
   verifyHostProbes?: VerifyHostProbesLike;
   omp?: OmpControlPlaneAdapter;
+  /** Resolved per request from the deps value-or-resolver — never a boot-time snapshot. */
   principal?: OmpPrincipal;
   ompCommand?: OmpCommandAdapter;
   auditOmp?: (entry: { verb: string; principal: string; outcome: 'attempted' | 'completed'; operationId: string; detail: string }) => void;
+  ompFleetLaunchable?: () => boolean;
+  ompAriaMode?: () => boolean;
   verifyRunbookStatus?: VerifyRunbookStatusLike;
 } {
   const {
@@ -439,6 +488,7 @@ export function createContext(deps: ContextDeps = {}): {
     workflowRegistry,
     agentOverrideRouter,
     getForcedSubstrate = () => null,
+    getSprintMaxTasks = () => ({}),
     gitDiff,
     agentThreadService,
     agentThreadStore,
@@ -448,8 +498,16 @@ export function createContext(deps: ContextDeps = {}): {
     principal,
     ompCommand,
     auditOmp,
+    ompFleetLaunchable,
+    ompAriaMode,
     verifyRunbookStatus,
   } = deps;
+  // Resolve the principal NOW, once per request. Accepting a resolver here is
+  // what makes an Aria-mode flip take effect on the next call in either
+  // direction: a frozen value captured at window-attach would leave
+  // `availability.launchable` and the ompCommand gate stale until relaunch.
+  const resolvedPrincipal =
+    typeof principal === 'function' ? principal() : principal;
   return {
     userId: 'local' as const,
     setDockBadge,
@@ -457,15 +515,18 @@ export function createContext(deps: ContextDeps = {}): {
     workflowRegistry,
     agentOverrideRouter,
     getForcedSubstrate,
+    getSprintMaxTasks,
     gitDiff,
     agentThreadService,
     agentThreadStore,
     agentProposalExecutor,
     verifyHostProbes,
     omp,
-    principal,
+    principal: resolvedPrincipal,
     ompCommand,
     auditOmp,
+    ompFleetLaunchable,
+    ompAriaMode,
     verifyRunbookStatus,
   };
 }

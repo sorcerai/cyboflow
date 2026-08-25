@@ -88,6 +88,18 @@ export interface PersistentPromptInput {
 /**
  * Build the SDKUserMessage the SDK expects for a plain-text user turn.
  *
+ * `origin: { kind: 'human' }` is REQUIRED, not decorative. Through agent-sdk
+ * 0.3.201 an absent `origin` meant "keyboard input from the user"; 0.3.224
+ * inverted that — an unstamped user message is now treated as UNATTRIBUTED and
+ * fails closed at the CLI's strict `isHuman()` trust gates, which is how the
+ * cross-session peer-messaging work distinguishes a real operator turn from a
+ * machine-injected one. Everything this factory builds is first-party host
+ * input carrying the operator's authority (a composer message, or an
+ * orchestrator prompt for a run the operator launched), so stamping `human`
+ * PRESERVES the pre-bump semantics rather than granting new authority. Peer
+ * traffic never reaches this path — the harness stamps `{ kind: 'peer' }` on
+ * that itself, from kernel-verified credentials we cannot forge from here.
+ *
  * `opts.steering` stamps `priority: 'now'` — the CLI's steering-queue priority
  * that interjects the message into the CURRENT in-flight turn at the agent's next
  * loop boundary (the same engine as typing while Claude works in the interactive
@@ -99,8 +111,10 @@ function buildUserMessage(text: string, opts?: { steering?: boolean }): SDKUserM
     message: { role: 'user', content: text },
     parent_tool_use_id: null,
     session_id: '',
-    // Spread nothing on the normal path so the message stays byte-identical to the
-    // pre-steering shape; only a steering push adds the priority discriminator.
+    origin: { kind: 'human' },
+    // Spread nothing else on the normal path so the message stays byte-identical
+    // to the pre-steering shape; only a steering push adds the priority
+    // discriminator.
     ...(opts?.steering ? { priority: 'now' as const } : {}),
   };
 }

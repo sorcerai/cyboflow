@@ -1242,11 +1242,20 @@ export function setupEventListeners(services: AppServices, getMainWindow: () => 
       },
     );
 
-    ompSessionManager.on('error', async ({ panelId, sessionId, error }: { panelId: string; sessionId: string; error: string }) => {
-      if (isCyboflowRunId(panelId) || isCyboflowRunId(sessionId)) return;
-      console.error(`[Events] OMP worker error for panel ${panelId}: ${error}`);
-      await updateAIPanelStatus(panelId, 'error');
-    });
+    ompSessionManager.on(
+      'error',
+      async ({ panelId, sessionId, error, transient }: { panelId: string; sessionId: string; error: string; transient: boolean }) => {
+        if (isCyboflowRunId(panelId) || isCyboflowRunId(sessionId)) return;
+        console.error(`[Events] OMP worker error for panel ${panelId}: ${error}`);
+        // A TRANSIENT error leaves the worker live — one bridge blip must not
+        // park the panel in 'error' forever. Nothing ever clears that badge:
+        // 'spawned' fires once at spawn, so the panel would read as failed for
+        // the rest of a perfectly healthy run. Real termination arrives as
+        // 'exit' and is handled above.
+        if (transient) return;
+        await updateAIPanelStatus(panelId, 'error');
+      },
+    );
   }
 
   // Listen for archive progress events

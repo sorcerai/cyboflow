@@ -19,10 +19,83 @@
  */
 import type { query } from '@anthropic-ai/claude-agent-sdk';
 import { assertAgentProviderAllowed } from '../services/agentProviderGuard';
+import { tryGetProviderUsageStore } from '../services/providerUsage/providerUsageStore';
+import type { RateLimitEvent } from '../../../shared/types/claudeStream';
 
 type SdkQuery = typeof query;
 
 let cachedQuery: Promise<SdkQuery> | undefined;
+
+/**
+ * Tee every SDK message stream so `rate_limit_event` readings reach the
+ * ProviderUsageStore, which feeds the subscription-usage meters in the Human
+ * review queue.
+ *
+ * WHY HERE and not at the managers' EventRouters: this function is the app's
+ * single Claude SDK seam (see the guard rationale below), so one tap covers chat
+ * turns, both eval judges, the programmatic monitor, verification agents, the
+ * runbook drafter, the VLM judge, the session summariser, and the model
+ * catalogue. Attaching per-manager would have missed every one of the
+ * non-chat callers, and the interactive substrate cannot help either — its
+ * transcript normalizer drops every top-level type except assistant/user.
+ *
+ * WHY A PROXY and not a wrapping generator: `Query` is an AsyncGenerator that
+ * ALSO carries control methods, and `claudeModelCatalogService` feature-detects
+ * `supportedModels` / `initializationResult` — replacing the object with a plain
+ * generator would silently empty the model catalogue forever, with no error and
+ * no failing test. The proxy forwards every property, binding methods to the
+ * real target so private-field access resolves.
+ *
+ * Finalization: the tee is `for await`-based, so `return()`/`throw()` propagate
+ * to the underlying generator by construction. That matters — `claudeCodeManager`
+ * breaks out of the loop on abort and every judge ends on a deadline, and a
+ * swallowed finalization would regress subprocess teardown.
+ */
+function isRateLimitMessage(
+  message: unknown,
+): message is RateLimitEvent {
+  if (typeof message !== 'object' || message === null) return false;
+  const record = message as Record<string, unknown>;
+  return record.type === 'rate_limit_event'
+    && typeof record.rate_limit_info === 'object'
+    && record.rate_limit_info !== null;
+}
+
+function observeMessage(message: unknown): void {
+  // Telemetry must never break a turn: a throw here would propagate out of the
+  // caller's `for await`.
+  try {
+    if (!isRateLimitMessage(message)) return;
+    tryGetProviderUsageStore()?.recordClaudeRateLimit(message.rate_limit_info);
+  } catch {
+    // Ignored by design — see above.
+  }
+}
+
+function withUsageTee(realQuery: SdkQuery): SdkQuery {
+  const wrapped = (...args: Parameters<SdkQuery>): ReturnType<SdkQuery> => {
+    const q = realQuery(...args);
+    return new Proxy(q, {
+      get(target, prop) {
+        if (prop === Symbol.asyncIterator) {
+          return function tee(): AsyncGenerator<unknown> {
+            return (async function* () {
+              for await (const message of target) {
+                observeMessage(message);
+                yield message;
+              }
+            })();
+          };
+        }
+        // `target` as the receiver, not the proxy: an unbound method invoked
+        // with `this === proxy` throws on private-field access.
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  return wrapped as SdkQuery;
+}
 
 /**
  * Resolve the SDK's `query`, refusing when the Claude provider is switched off
@@ -40,7 +113,10 @@ let cachedQuery: Promise<SdkQuery> | undefined;
 export function loadSdkQuery(): Promise<SdkQuery> {
   assertAgentProviderAllowed('claude', 'Claude agent calls');
   if (!cachedQuery) {
-    cachedQuery = import('@anthropic-ai/claude-agent-sdk').then((sdk) => sdk.query);
+    // The wrap lives INSIDE the cached `.then()` deliberately: `loadSdkQuery`
+    // itself must stay a plain function whose guard throws SYNCHRONOUSLY (see
+    // agentProviderGuard.test.ts), so it cannot become `async`.
+    cachedQuery = import('@anthropic-ai/claude-agent-sdk').then((sdk) => withUsageTee(sdk.query));
   }
   return cachedQuery;
 }

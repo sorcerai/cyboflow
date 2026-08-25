@@ -23,8 +23,19 @@
  *     the same workspace slug on a DIFFERENT tracker instance mints a new
  *     connection, while the same instance spelled with a trailing slash (or left
  *     on the provider's default origin) revives the retired row.
- *   - connections(): the summary's counts, source label, mapping and
- *     defensively-parsed log.
+ *   - MULTI-PROJECT MAPPING: connect is an idempotent no-op for a mapping that
+ *     already exists (the Map step retries failed connects by re-submitting the
+ *     set), matched on the FULL source scope so two groups differing only in
+ *     their narrow stay two mappings; a different source container mints a
+ *     SIBLING row instead, push_target defaults to 1 and is written 0 for a
+ *     non-pushing sibling. What a re-submit legitimately re-applies is pinned
+ *     too — the push-target choice (either direction, demoting the sibling that
+ *     held it) and the freshly-validated key that resumes a PAUSED mapping —
+ *     as is the mint path's cross-run demotion. And updateCredentials FANS OUT
+ *     across every live row sharing the key, so one paste resumes all the
+ *     mappings without re-arming a retired one.
+ *   - connections(): the summary's counts, source label, mapping, push target
+ *     and defensively-parsed log.
  *   - resolveConflictChoice: all four branches (field remote / field local /
  *     remote_deleted remote / remote_deleted local), plus the description
  *     branch's provenance-footer preservation.
@@ -97,6 +108,7 @@ import type {
 import type {
   TrackerConnectPayload,
   TrackerCredentialsInput,
+  TrackerGroupTree,
   TrackerIssue,
   TrackerSourceNarrow,
   TrackerSourceSelection,
@@ -104,7 +116,7 @@ import type {
   TrackerState,
   TrackerWorkspaceIdentity,
 } from '../../../../../shared/types/trackerSync';
-import type { IssueDraft, TrackerAdapter, TrackerAdapterCapabilities } from '../adapterTypes';
+import type { IssueDraft, TrackerAdapter, TrackerAdapterCapabilities, TrackerFieldOptionsRaw} from '../adapterTypes';
 import { TrackerAuthError } from '../errors';
 import { joinBody, splitBody, type EntityWriteRouter } from '../inboundSync';
 import {
@@ -147,6 +159,24 @@ const STATES: TrackerState[] = [
 
 const SOURCE: TrackerSourceSelection = { containerId: 'team-1', narrowId: 'all', narrowKind: 'all' };
 
+const GROUPS: TrackerGroupTree = {
+  sections: [
+    {
+      label: 'Projects',
+      groups: [
+        {
+          id: 'team-1/proj-1',
+          name: 'Platform',
+          key: 'COR',
+          sourceLabel: 'Platform · Core',
+          selection: { containerId: 'team-1', narrowId: 'proj-1', narrowKind: 'project' },
+          stateScopeKey: 'team-1',
+        },
+      ],
+    },
+  ],
+};
+
 const CREDENTIALS: TrackerCredentialsInput = { provider: 'linear', apiKey: API_KEY };
 
 /** Fake adapter recording what the facade asked of it. */
@@ -156,6 +186,8 @@ class FakeAdapter implements TrackerAdapter {
     nativeParentAutoClose: true,
     selfHostedBaseUrl: false,
     idempotentCreate: true,
+    contentWrite: { title: true, description: true, priority: true, category: false },
+    archive: 'trash',
   };
 
   readonly calls: string[] = [];
@@ -167,6 +199,8 @@ class FakeAdapter implements TrackerAdapter {
   }> = [];
   states: TrackerState[] = STATES;
   issues: TrackerIssue[] = [];
+  groups: TrackerGroupTree = GROUPS;
+  fieldOptions: TrackerFieldOptionsRaw = { priorities: ['0', '1', '2', '3', '4'], categories: null };
   /** Scripted failure for validateCredentials (the auth-error path). */
   failValidate: Error | null = null;
   /** The workspace the live probe reports — the reconnect identity key. */
@@ -176,6 +210,10 @@ class FakeAdapter implements TrackerAdapter {
     this.calls.push('validateCredentials');
     if (this.failValidate !== null) throw this.failValidate;
     return { workspaceId: this.workspaceId, workspaceName: 'Acme', actorLabel: 'K. Esteva' };
+  }
+  async listGroups(): Promise<TrackerGroupTree> {
+    this.calls.push('listGroups');
+    return this.groups;
   }
   async listContainers(): Promise<TrackerSourceTree> {
     this.calls.push('listContainers');
@@ -188,6 +226,10 @@ class FakeAdapter implements TrackerAdapter {
   async listStates(): Promise<TrackerState[]> {
     this.calls.push('listStates');
     return this.states;
+  }
+  async listFieldOptions(): Promise<TrackerFieldOptionsRaw> {
+    this.calls.push('listFieldOptions');
+    return this.fieldOptions;
   }
   async listIssues(): Promise<TrackerIssue[]> {
     this.calls.push('listIssues');
@@ -221,6 +263,12 @@ class FakeAdapter implements TrackerAdapter {
   async updateIssueState(): Promise<void> {
     this.calls.push('updateIssueState');
   }
+  async updateIssueContent(): Promise<TrackerIssue | null> {
+    throw new Error('not used');
+  }
+  async archiveIssue(): Promise<void> {
+    throw new Error('not used');
+  }
 }
 
 function makeIssue(overrides: Partial<TrackerIssue> = {}): TrackerIssue {
@@ -236,6 +284,10 @@ function makeIssue(overrides: Partial<TrackerIssue> = {}): TrackerIssue {
     parentExternalId: null,
     updatedAt: '2026-07-30T10:00:00.000Z',
     archivedAt: null,
+    // The default mapping round-trips '3' (Linear Medium) with the P2 every
+    // entity here carries, so an untouched issue never produces a priority diff.
+    priority: '3',
+    category: null,
     recoveryClientKey: null,
     ...overrides,
   };
@@ -312,6 +364,11 @@ function makeConnection(overrides: Partial<NewConnectionRow> = {}): TrackerConne
     status_sync_mode: 'auto',
     pull_mode: 'auto',
     push_mode: 'auto',
+    push_target: 1,
+    content_sync_mode: 'off',
+    archive_sync_mode: 'off',
+    priority_mapping_json: '{}',
+    category_mapping_json: '{}',
     mirror_subissues: 1,
     conflict_mode: 'manual',
     cursor_updated_at: null,
@@ -320,6 +377,15 @@ function makeConnection(overrides: Partial<NewConnectionRow> = {}): TrackerConne
     last_sync_log_json: null,
     ...overrides,
   });
+}
+
+/**
+ * A second cyboflow project, board seeded — `tracker_connections.project_id` is
+ * a real FK, so a cross-project mapping set needs the row to exist.
+ */
+function addProject(id: number): void {
+  raw.prepare('INSERT INTO projects (id, name, path) VALUES (?, ?, ?)').run(id, `Proj ${id}`, `/tmp/p${id}`);
+  svc.seedDefaultBoard(id);
 }
 
 /** Create an entity through the REAL chokepoint and return its id. */
@@ -360,6 +426,17 @@ function readIdea(id: string): EntityRow {
   return raw
     .prepare('SELECT ref, title, body, stage_id, archived_at FROM ideas WHERE id = ?')
     .get(id) as EntityRow;
+}
+
+/** The two MAPPED fields, read straight off the row (readIdea does not select them). */
+function readIdeaPriority(id: string): string {
+  return (raw.prepare('SELECT priority FROM ideas WHERE id = ?').get(id) as { priority: string })
+    .priority;
+}
+
+function readIdeaCategory(id: string): string {
+  return (raw.prepare('SELECT category FROM ideas WHERE id = ?').get(id) as { category: string })
+    .category;
 }
 
 function conflictRow(id: number): TrackerConflictRow {
@@ -452,15 +529,42 @@ describe('TrackerSyncService wizard probes', () => {
       containers: [{ id: 'team-1', name: 'Core', key: 'COR', openIssueCount: 3 }],
     });
     await expect(service.wizardNarrows(CREDENTIALS, 'team-1')).resolves.toHaveLength(1);
-    await expect(service.wizardStates(CREDENTIALS, SOURCE)).resolves.toEqual(STATES);
+    await expect(service.wizardStates({ credentials: CREDENTIALS }, SOURCE)).resolves.toEqual(
+      STATES,
+    );
+    // The Map step's groups, each carrying the selection a connect would persist.
+    await expect(service.wizardGroups({ credentials: CREDENTIALS })).resolves.toEqual(GROUPS);
+
+    // The mapping tables' vocabulary. No selection: none of the three providers
+    // scopes its priority/type lists to a container. The two default* mappings
+    // are computed HERE (seedDefaultPriorityMapping/seedDefaultCategoryMapping
+    // over the adapter's raw options) — never left to the wizard to re-derive.
+    await expect(service.wizardFieldOptions({ credentials: CREDENTIALS })).resolves.toEqual({
+      priorities: ['0', '1', '2', '3', '4'],
+      categories: null,
+      defaultPriorityMapping: {
+        toProvider: { P0: '1', P1: '2', P2: '3', P3: '3', P4: '4', P5: '4', P6: '0' },
+        toLocal: { '0': 'P6', '1': 'P0', '2': 'P1', '3': 'P2', '4': 'P4' },
+      },
+      // Linear has no category concept, so the seed is all-null regardless of
+      // liveOptions — providerSupportsCategorySync short-circuits it.
+      defaultCategoryMapping: {
+        toProvider: { feature: null, bug: null, chore: null },
+        toLocal: {},
+      },
+    });
 
     adapter.issues = [makeIssue()];
-    await expect(service.wizardIssues(CREDENTIALS, SOURCE)).resolves.toHaveLength(1);
+    await expect(service.wizardIssues({ credentials: CREDENTIALS }, SOURCE)).resolves.toHaveLength(
+      1,
+    );
 
     expect(adapter.calls).toEqual([
       'listContainers',
       'listNarrows:team-1',
       'listStates',
+      'listGroups',
+      'listFieldOptions',
       'listIssues',
     ]);
   });
@@ -468,6 +572,90 @@ describe('TrackerSyncService wizard probes', () => {
   it('surfaces the adapter auth error unchanged (the router maps it to UNAUTHORIZED)', async () => {
     adapter.failValidate = new TrackerAuthError('linear', 'invalid API key', 401);
     await expect(service.wizardValidate(CREDENTIALS)).rejects.toBeInstanceOf(TrackerAuthError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wizard probes driven by an EXISTING connection's stored key
+//
+// The mapping-management path: the user is adding a group to a connection they
+// already authorized, so there is no key to paste — main resolves the row's own
+// encrypted one, and nothing key-shaped crosses IPC in either direction.
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService wizard probes — { connectionId } credential source', () => {
+  it('probes on the stored key, addressed by the ROW’s identity, not the renderer’s', async () => {
+    // A Plane row, so the two addressing fields the resolution reads off the row
+    // (base_url, workspace_id -> the slug every REST path is scoped under) are
+    // both non-null and distinguishable from the linear fixture's defaults.
+    makeConnection({
+      provider: 'plane',
+      base_url: 'https://plane.acme.dev',
+      workspace_id: 'acme-slug',
+    });
+
+    await expect(service.wizardGroups({ connectionId: CONN_ID })).resolves.toEqual(GROUPS);
+
+    // The DECRYPTED stored key reached the factory — the whole point of the path.
+    expect(factoryCalls).toHaveLength(1);
+    expect(factoryCalls[0].secret).toBe(API_KEY);
+    // …addressed exactly as the sync loop would address that connection.
+    expect(factoryCalls[0].connection.provider).toBe('plane');
+    expect(factoryCalls[0].connection.base_url).toBe('https://plane.acme.dev');
+    expect(factoryCalls[0].connection.workspace_id).toBe('acme-slug');
+    expect(adapter.calls).toEqual(['listGroups']);
+  });
+
+  it('resolves the stored key for the states + issues probes too', async () => {
+    makeConnection();
+    adapter.issues = [makeIssue()];
+
+    await expect(service.wizardStates({ connectionId: CONN_ID }, SOURCE)).resolves.toEqual(STATES);
+    await expect(service.wizardIssues({ connectionId: CONN_ID }, SOURCE)).resolves.toHaveLength(1);
+    await expect(service.wizardFieldOptions({ connectionId: CONN_ID })).resolves.toMatchObject({
+      categories: null,
+    });
+
+    expect(factoryCalls.map((call) => call.secret)).toEqual([API_KEY, API_KEY, API_KEY]);
+  });
+
+  it('reports a DISCONNECTED connection as not-found — its key was deliberately cleared', async () => {
+    // Not an auth failure: `disconnect` clears the ciphertext on purpose, so
+    // there is no key to reuse and nothing the user could re-authorize here.
+    makeConnection({ status: 'disconnected', secret_ciphertext: null });
+
+    await expect(service.wizardGroups({ connectionId: CONN_ID })).rejects.toMatchObject({
+      name: 'TrackerConnectionNotFoundError',
+    });
+    expect(factoryCalls).toHaveLength(0);
+  });
+
+  it('reports an unknown connection id as not-found', async () => {
+    await expect(service.wizardGroups({ connectionId: 'conn-nope' })).rejects.toMatchObject({
+      name: 'TrackerConnectionNotFoundError',
+    });
+  });
+
+  it('reports a live row with NO stored key as an auth failure (paste a fresh one)', async () => {
+    // UNAUTHORIZED rather than NOT_FOUND: the connection exists and the fix is a
+    // new key, which is exactly what the router's auth mapping tells the user.
+    makeConnection({ secret_ciphertext: null });
+
+    await expect(service.wizardGroups({ connectionId: CONN_ID })).rejects.toBeInstanceOf(
+      TrackerAuthError,
+    );
+  });
+
+  it('refuses a source carrying BOTH keys or NEITHER', async () => {
+    makeConnection();
+
+    await expect(
+      service.wizardGroups({ credentials: CREDENTIALS, connectionId: CONN_ID }),
+    ).rejects.toThrow(/exactly one of credentials \/ connectionId/);
+    await expect(service.wizardGroups({})).rejects.toThrow(
+      /exactly one of credentials \/ connectionId/,
+    );
+    expect(factoryCalls).toHaveLength(0);
   });
 });
 
@@ -503,6 +691,12 @@ describe('TrackerSyncService.connect', () => {
     expect(row?.status_sync_mode).toBe('auto');
     expect(row?.pull_mode).toBe('auto');
     expect(row?.push_mode).toBe('auto');
+    // This payload omits every Phase-6 field — both modes default to 'off'
+    // (the write-back-declined state) and both mappings default to the seed.
+    expect(row?.content_sync_mode).toBe('off');
+    expect(row?.archive_sync_mode).toBe('off');
+    expect(row?.priority_mapping_json).toBe('{}');
+    expect(row?.category_mapping_json).toBe('{}');
     expect(row?.mirror_subissues).toBe(1);
     expect(row?.conflict_mode).toBe('auto');
     expect(JSON.parse(row?.source_json ?? '{}')).toEqual({ ...SOURCE, label: 'Core · Whole team' });
@@ -542,6 +736,32 @@ describe('TrackerSyncService.connect', () => {
     });
     expect(adapter.calls).toContain('listIssues');
     expect(broadcasts.some((e) => e.kind === 'sync')).toBe(true);
+  });
+
+  it('persists a priorityMapping/categoryMapping overlay verbatim, and defaults to the seed without one', async () => {
+    // Dart, not the fixture's default Linear: category sync is Dart-only
+    // (categoryMapping.ts's providerSupportsCategorySync), so only a Dart row's
+    // overlay survives resolveEffectiveCategoryMapping's provider gate.
+    const { connectionId } = await service.connect(
+      connectPayload({
+        credentials: { provider: 'dart', apiKey: API_KEY },
+        priorityMapping: { toProvider: { P0: 'urgent', P6: null } },
+        categoryMapping: { toProvider: { bug: 'Bug' } },
+      }),
+    );
+
+    const row = getConnection(raw, connectionId);
+    expect(JSON.parse(row?.priority_mapping_json ?? '{}')).toEqual({
+      toProvider: { P0: 'urgent', P6: null },
+    });
+    expect(JSON.parse(row?.category_mapping_json ?? '{}')).toEqual({ toProvider: { bug: 'Bug' } });
+
+    // An overlay actually changes what the connection's SUMMARY reports —
+    // proof the persisted JSON round-trips through resolveEffective*Mapping,
+    // not just that the literal bytes match.
+    const [summary] = await service.connections(PROJECT_ID);
+    expect(summary.priorityMapping.toProvider.P0).toBe('urgent');
+    expect(summary.categoryMapping.toProvider.bug).toBe('Bug');
   });
 
   it('writes nothing at all when the live credential probe fails', async () => {
@@ -805,6 +1025,440 @@ describe('TrackerSyncService.connect', () => {
 // updateCredentials — rotating a key in place
 // ---------------------------------------------------------------------------
 
+describe('TrackerSyncService.connect — multi-project mapping', () => {
+  it('is an IDEMPOTENT no-op when this exact mapping is already connected', async () => {
+    // The Map step connects one mapping at a time and offers a retry, so a
+    // partially-failed submit re-runs the mappings that already succeeded.
+    const discardId = await createEntity('idea', { title: 'Discard me' });
+    const first = await service.connect(
+      connectPayload({
+        reconcile: [{ entityType: 'idea', entityId: discardId, action: 'discard' }],
+      }),
+    );
+    // Restoring it proves the second call does not re-apply the decisions.
+    await router.applyChange(PROJECT_ID, {
+      actor: 'user',
+      entityType: 'idea',
+      taskId: discardId,
+      archived: false,
+    });
+
+    const again = await service.connect(
+      connectPayload({
+        reconcile: [{ entityType: 'idea', entityId: discardId, action: 'discard' }],
+      }),
+    );
+
+    expect(again.connectionId).toBe(first.connectionId);
+    const rows = raw.prepare('SELECT COUNT(*) AS n FROM tracker_connections').get() as { n: number };
+    expect(rows.n).toBe(1);
+    expect(readIdea(discardId).archived_at).toBeNull();
+  });
+
+  it('mints a SIBLING row for a different source container in the same project', async () => {
+    const first = await service.connect(connectPayload());
+    const second = await service.connect(
+      connectPayload({
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+        // Only one row per provider may push, or one filed idea becomes two
+        // tracker issues.
+        pushTarget: false,
+      }),
+    );
+
+    expect(second.connectionId).not.toBe(first.connectionId);
+    expect(getConnection(raw, first.connectionId)?.push_target).toBe(1);
+    expect(getConnection(raw, second.connectionId)?.push_target).toBe(0);
+  });
+
+  it('defaults push_target to 1 when the payload omits it (every pre-rev-4 connect)', async () => {
+    const { connectionId } = await service.connect(connectPayload());
+    expect(getConnection(raw, connectionId)?.push_target).toBe(1);
+  });
+
+  it('mints a SECOND row for two groups that differ only in the NARROW under one container', async () => {
+    // The defect: the idempotent no-op matched on `containerId` alone, but every
+    // Linear project group under one team carries the TEAM's container and
+    // differs only in the narrow — so mapping a team's second project group was
+    // swallowed as a re-submit of the first, and the user's second mapping
+    // silently never existed.
+    const first = await service.connect(connectPayload());
+    const second = await service.connect(
+      connectPayload({
+        source: { containerId: 'team-1', narrowId: 'proj-1', narrowKind: 'project' },
+        sourceLabel: 'Platform · Core',
+        pushTarget: false,
+      }),
+    );
+
+    expect(second.connectionId).not.toBe(first.connectionId);
+    const scopes = raw
+      .prepare('SELECT id, source_json FROM tracker_connections ORDER BY rowid ASC')
+      .all() as Array<{ id: string; source_json: string }>;
+    expect(scopes.map((r) => r.id)).toEqual([first.connectionId, second.connectionId]);
+    expect(scopes.map((r) => (JSON.parse(r.source_json) as TrackerSourceSelection).narrowId)).toEqual(
+      ['all', 'proj-1'],
+    );
+  });
+
+  it('a re-submit carrying pushTarget:false DEMOTES the mapping the earlier submit armed', async () => {
+    // The defect: the no-op path returned before applying anything, so a retry
+    // after re-picking the push target in the Map step dropped the new choice.
+    const first = await service.connect(connectPayload());
+    expect(getConnection(raw, first.connectionId)?.push_target).toBe(1);
+
+    await service.connect(connectPayload({ pushTarget: false }));
+
+    expect(getConnection(raw, first.connectionId)?.push_target).toBe(0);
+  });
+
+  it('a re-submit that CLAIMS the push target demotes the armed sibling of the same project', async () => {
+    // Same dropped choice, the other direction: promoting a sibling has to
+    // demote whoever held the flag, or one filed idea becomes two remote issues.
+    const armed = await service.connect(connectPayload());
+    const quiet = await service.connect(
+      connectPayload({
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+        pushTarget: false,
+      }),
+    );
+
+    await service.connect(
+      connectPayload({
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+      }),
+    );
+
+    expect(getConnection(raw, quiet.connectionId)?.push_target).toBe(1);
+    expect(getConnection(raw, armed.connectionId)?.push_target).toBe(0);
+  });
+
+  it('a NEW mapping that claims the push target demotes the row an EARLIER wizard run armed', async () => {
+    // The mint path's half of the same invariant: a later run mapping a second
+    // group into an already-mapped project arrives with its own run's cluster
+    // default (armed) while the earlier row is still armed.
+    const first = await service.connect(connectPayload());
+    const second = await service.connect(
+      connectPayload({
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+      }),
+    );
+
+    expect(getConnection(raw, second.connectionId)?.push_target).toBe(1);
+    expect(getConnection(raw, first.connectionId)?.push_target).toBe(0);
+  });
+
+  it('a re-submit of a PAUSED mapping resumes it on the freshly-validated key', async () => {
+    // The defect: the no-op path returned the id without storing the key or
+    // touching the status, so the one thing a re-connect is FOR — a mapping
+    // paused on a stale key — was the one thing it could not fix.
+    makeConnection({ status: 'paused' });
+
+    const again = await service.connect(
+      connectPayload({ credentials: { provider: 'linear', apiKey: 'lin_rotated_key' } }),
+    );
+
+    expect(again.connectionId).toBe(CONN_ID);
+    const rows = raw.prepare('SELECT COUNT(*) AS n FROM tracker_connections').get() as { n: number };
+    expect(rows.n).toBe(1);
+    expect(getConnection(raw, CONN_ID)?.status).toBe('active');
+    expect((readSecret(raw, CONN_ID) as Buffer).toString('utf-8')).toBe('lin_rotated_key');
+    expect(broadcasts.some((e) => e.kind === 'connection' && e.connectionId === CONN_ID)).toBe(true);
+    // …and the pass the resume kicks actually runs, which is what replays every
+    // write the auth failure held.
+    await vi.waitFor(() => {
+      expect(getConnection(raw, CONN_ID)?.last_sync_at).not.toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// connect on a BORROWED key — mapping management adding a group to a
+// connection the user already authorized.
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService.connect — sourceConnectionId', () => {
+  it('mints a sibling on the stored key, with its own copy of the secret', async () => {
+    makeConnection();
+
+    const { connectionId } = await service.connect(
+      connectPayload({
+        credentials: undefined,
+        sourceConnectionId: CONN_ID,
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+        pushTarget: false,
+      }),
+    );
+
+    expect(connectionId).not.toBe(CONN_ID);
+    const row = getConnection(raw, connectionId);
+    // The SAME tracker identity — that is what makes the two rows siblings, and
+    // what a credential rotation later fans out across.
+    expect(row?.provider).toBe('linear');
+    expect(row?.workspace_id).toBe('ws-1');
+    expect(row?.base_url).toBeNull();
+    expect(row?.status).toBe('active');
+    // Its OWN stored ciphertext, not a pointer at the lender's: each row carries
+    // the key it syncs with, exactly as a pasted-key connect leaves it.
+    expect((readSecret(raw, connectionId) as Buffer).toString('utf-8')).toBe(API_KEY);
+    // The borrowed key was still PROBED live before anything was written.
+    expect(adapter.calls).toContain('validateCredentials');
+    expect(factoryCalls.some((call) => call.secret === API_KEY)).toBe(true);
+  });
+
+  it('leaves claimPushTarget semantics untouched — the new mapping demotes the armed sibling', async () => {
+    // Nothing about the key's PROVENANCE may change what connect does with it:
+    // a borrowed-key mint arrives armed by default like any other, and the
+    // one-pusher-per-(project, provider) invariant still holds across the pair.
+    makeConnection();
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+
+    const { connectionId } = await service.connect(
+      connectPayload({
+        credentials: undefined,
+        sourceConnectionId: CONN_ID,
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+      }),
+    );
+
+    expect(getConnection(raw, connectionId)?.push_target).toBe(1);
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(0);
+  });
+
+  it('maps a group into ANOTHER project on the same authorization', async () => {
+    makeConnection();
+    addProject(2);
+
+    const { connectionId } = await service.connect(
+      connectPayload({
+        projectId: 2,
+        credentials: undefined,
+        sourceConnectionId: CONN_ID,
+        source: { containerId: 'team-2', narrowId: 'all', narrowKind: 'all' },
+        sourceLabel: 'Web · Whole team',
+      }),
+    );
+
+    expect(getConnection(raw, connectionId)?.project_id).toBe(2);
+    // Different project, so the pair's own pusher — the lender keeps its flag.
+    expect(getConnection(raw, connectionId)?.push_target).toBe(1);
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+  });
+
+  it('refuses a payload carrying BOTH a key and a source connection, or NEITHER', async () => {
+    makeConnection();
+
+    await expect(
+      service.connect(connectPayload({ sourceConnectionId: CONN_ID })),
+    ).rejects.toThrow(/exactly one of credentials \/ connectionId/);
+    await expect(service.connect(connectPayload({ credentials: undefined }))).rejects.toThrow(
+      /exactly one of credentials \/ connectionId/,
+    );
+    // Nothing was probed and nothing was written.
+    expect(adapter.calls).toHaveLength(0);
+    const rows = raw.prepare('SELECT COUNT(*) AS n FROM tracker_connections').get() as { n: number };
+    expect(rows.n).toBe(1);
+  });
+
+  it('reports a retired source connection as not-found before probing anything', async () => {
+    makeConnection({ status: 'disconnected', secret_ciphertext: null });
+
+    await expect(
+      service.connect(connectPayload({ credentials: undefined, sourceConnectionId: CONN_ID })),
+    ).rejects.toMatchObject({ name: 'TrackerConnectionNotFoundError' });
+    expect(adapter.calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mappings() — one authorization's sibling rows, ACROSS projects
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService.mappings', () => {
+  it('returns every live sibling of the identity, across projects, and no stranger', async () => {
+    makeConnection();
+    addProject(2);
+    makeConnection({
+      id: 'conn-p2',
+      project_id: 2,
+      source_json: JSON.stringify({
+        containerId: 'team-2',
+        narrowId: 'all',
+        narrowKind: 'all',
+        label: 'Web · Whole team',
+      }),
+      push_target: 1,
+    });
+    // Same workspace string, DIFFERENT provider: not this authorization's row.
+    makeConnection({ id: 'conn-dart', provider: 'dart' });
+
+    const rows = await service.mappings(CONN_ID);
+
+    expect(rows.map((row) => row.id)).toEqual([CONN_ID, 'conn-p2']);
+    expect(rows.map((row) => row.projectId)).toEqual([PROJECT_ID, 2]);
+    // A sibling in another project is exactly what `connections(projectId)`
+    // structurally cannot return — the reason this method exists.
+    expect((await service.connections(PROJECT_ID)).map((row) => row.id)).toEqual([
+      CONN_ID,
+      'conn-dart',
+    ]);
+  });
+
+  it('carries each mapping’s source SCOPE, which is what distinguishes the siblings', async () => {
+    makeConnection();
+    makeConnection({
+      id: 'conn-proj',
+      push_target: 0,
+      source_json: JSON.stringify({
+        containerId: 'team-1',
+        narrowId: 'proj-1',
+        narrowKind: 'project',
+        label: 'Platform · Core',
+      }),
+    });
+    // A legacy row with no recorded source at all.
+    makeConnection({ id: 'conn-legacy', push_target: 0, source_json: null });
+
+    const scopes = new Map(
+      (await service.mappings(CONN_ID)).map((row) => [row.id, row.sourceScope] as const),
+    );
+
+    expect(scopes.get(CONN_ID)).toEqual({
+      containerId: 'team-1',
+      narrowId: 'all',
+      narrowKind: 'all',
+    });
+    // Same container, different narrow — two mappings, not one.
+    expect(scopes.get('conn-proj')).toEqual({
+      containerId: 'team-1',
+      narrowId: 'proj-1',
+      narrowKind: 'project',
+    });
+    expect(scopes.get('conn-legacy')).toBeNull();
+  });
+
+  it('answers for a DISCONNECTED row by leading the list with it', async () => {
+    // listConnectionsByIdentity skips retired rows on purpose (a rotation must
+    // not re-arm one), but a user who navigated to this connection is owed its
+    // own card back.
+    makeConnection();
+    makeConnection({ id: 'conn-retired', status: 'disconnected', secret_ciphertext: null });
+
+    const rows = await service.mappings('conn-retired');
+
+    expect(rows.map((row) => row.id)).toEqual(['conn-retired', CONN_ID]);
+    expect(rows[0].status).toBe('disconnected');
+  });
+
+  it('is a set of exactly itself when the row never recorded a workspace identity', async () => {
+    makeConnection({ workspace_id: null });
+    makeConnection({ id: 'conn-two', workspace_id: null, push_target: 0 });
+
+    // An identity we never learned cannot be claimed BY identity, so these two
+    // rows are not siblings of each other however alike they look.
+    expect((await service.mappings(CONN_ID)).map((row) => row.id)).toEqual([CONN_ID]);
+  });
+
+  it('reports an unknown connection id as a typed not-found', async () => {
+    await expect(service.mappings('conn-nope')).rejects.toMatchObject({
+      name: 'TrackerConnectionNotFoundError',
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setPushTarget() — re-picking which mapping files new ideas
+// ---------------------------------------------------------------------------
+
+describe('TrackerSyncService.setPushTarget', () => {
+  it('arms the named mapping, demotes its same-(project, provider) sibling, and broadcasts', async () => {
+    makeConnection();
+    makeConnection({
+      id: 'conn-two',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+
+    await service.setPushTarget('conn-two');
+
+    expect(getConnection(raw, 'conn-two')?.push_target).toBe(1);
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(0);
+    expect(broadcasts).toContainEqual({
+      projectId: PROJECT_ID,
+      connectionId: 'conn-two',
+      kind: 'connection',
+    });
+  });
+
+  it('leaves another PROJECT’s mapping armed — the invariant is per (project, provider)', async () => {
+    makeConnection();
+    addProject(2);
+    makeConnection({ id: 'conn-p2', project_id: 2, push_target: 1 });
+
+    await service.setPushTarget(CONN_ID);
+
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-p2')?.push_target).toBe(1);
+  });
+
+  it('refuses an unknown or DISCONNECTED connection id', async () => {
+    // Arming a retired row would leave the project with no LIVE pusher at all.
+    makeConnection();
+    makeConnection({ id: 'conn-retired', status: 'disconnected', secret_ciphertext: null });
+
+    await expect(service.setPushTarget('conn-nope')).rejects.toMatchObject({
+      name: 'TrackerConnectionNotFoundError',
+    });
+    await expect(service.setPushTarget('conn-retired')).rejects.toMatchObject({
+      name: 'TrackerConnectionNotFoundError',
+    });
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+  });
+
+  it('refuses to move the role off an ACTIVE pusher onto a PAUSED row', async () => {
+    // A paused row enqueues nothing (write-back skips on status before
+    // push_target) and creates are never back-filled, so accepting the swap
+    // would silently drop every idea filed until the row reconnects.
+    makeConnection();
+    makeConnection({
+      id: 'conn-paused',
+      status: 'paused',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+
+    await expect(service.setPushTarget('conn-paused')).rejects.toMatchObject({
+      name: 'TrackerConnectionPausedError',
+    });
+    // The working pusher kept the role.
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-paused')?.push_target).toBe(0);
+  });
+
+  it('allows PRE-DESIGNATING a paused row when nothing in the pair is active', async () => {
+    // The all-paused-after-key-expiry case: a hard refusal would trap the user.
+    // The arm costs nothing now and takes effect the moment a fresh key lands.
+    makeConnection({ status: 'paused' });
+    makeConnection({
+      id: 'conn-paused-2',
+      status: 'paused',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+
+    await service.setPushTarget('conn-paused-2');
+
+    expect(getConnection(raw, 'conn-paused-2')?.push_target).toBe(1);
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(0);
+  });
+});
+
 describe('TrackerSyncService.updateCredentials', () => {
   it('probes, stores encrypted, RESUMES a paused connection, and kicks a pass', async () => {
     // The reconnect path `connect` cannot serve: against a connection that is
@@ -874,6 +1528,33 @@ describe('TrackerSyncService.updateCredentials', () => {
       name: 'TrackerConnectionNotFoundError',
     });
   });
+
+  it('FANS OUT to every sibling mapping sharing the key, and leaves a retired row alone', async () => {
+    // One wizard run mints N rows, each holding its own copy of the same key —
+    // so rotating only the named one leaves the rest paused on a dead key with
+    // no affordance but re-pasting it per mapping.
+    makeConnection({ status: 'paused' });
+    makeConnection({
+      id: 'conn-sibling',
+      status: 'paused',
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+    // Not a sibling: a DIFFERENT workspace on the same provider.
+    makeConnection({ id: 'conn-other-ws', status: 'paused', workspace_id: 'ws-2' });
+    // Not a sibling either: retired, and its secret was deliberately cleared.
+    makeConnection({ id: 'conn-retired', status: 'disconnected', secret_ciphertext: null });
+
+    await service.updateCredentials(CONN_ID, 'lin_rotated_key');
+
+    for (const id of [CONN_ID, 'conn-sibling']) {
+      expect(getConnection(raw, id)?.status).toBe('active');
+      expect((readSecret(raw, id) as Buffer).toString('utf-8')).toBe('lin_rotated_key');
+    }
+    expect(getConnection(raw, 'conn-other-ws')?.status).toBe('paused');
+    expect((readSecret(raw, 'conn-other-ws') as Buffer).toString('utf-8')).toBe(API_KEY);
+    expect(getConnection(raw, 'conn-retired')?.status).toBe('disconnected');
+    expect(readSecret(raw, 'conn-retired')).toBeNull();
+  });
 });
 
 describe('TrackerSyncService.connections', () => {
@@ -931,8 +1612,17 @@ describe('TrackerSyncService.connections', () => {
     expect(summary.statusSyncMode).toBe('auto');
     expect(summary.pullMode).toBe('auto');
     expect(summary.pushMode).toBe('auto');
+    // Every pre-Phase-6 connection carries the write-back-declined default.
+    expect(summary.contentSyncMode).toBe('off');
+    expect(summary.archiveSyncMode).toBe('off');
+    // No overlay stored yet — the resolved mapping is the linear seed, all
+    // seven levels present (this fixture's live options are null: no probe
+    // ran, matching stateMapping's own no-network-call summary read).
+    expect(Object.keys(summary.priorityMapping.toProvider)).toHaveLength(7);
+    expect(summary.categoryMapping.toProvider).toEqual({ feature: null, bug: null, chore: null });
     expect(summary.mirrorSubissues).toBe(true);
     expect(summary.conflictMode).toBe('manual');
+    expect(summary.pushTarget).toBe(true);
     // The unknown mapping target is dropped, the valid one survives.
     expect(summary.stateMapping).toEqual({ 'state-backlog': 'idea' });
     expect(summary.lastSyncAt).toBe('2026-07-30 11:59:00');
@@ -941,12 +1631,22 @@ describe('TrackerSyncService.connections', () => {
     expect(summary.openConflictCount).toBe(1);
   });
 
+  it('reports a non-pushing sibling mapping as pushTarget false', async () => {
+    makeConnection({ push_target: 0 });
+    const [summary] = await service.connections(PROJECT_ID);
+    expect(summary.pushTarget).toBe(false);
+  });
+
   it('applies a settings patch key-by-key and broadcasts the change', async () => {
     makeConnection();
 
     await service.updateSettings(CONN_ID, {
       statusSyncMode: 'manual',
       pushMode: 'manual',
+      contentSyncMode: 'auto',
+      archiveSyncMode: 'manual',
+      priorityMapping: { toProvider: { P0: 'urgent' } },
+      categoryMapping: { toProvider: { bug: 'Bug' } },
       conflictMode: 'auto',
       selectionMode: 'assignee',
       selectionJson: { assigneeIds: ['user-1'] },
@@ -955,6 +1655,12 @@ describe('TrackerSyncService.connections', () => {
     const row = getConnection(raw, CONN_ID);
     expect(row?.status_sync_mode).toBe('manual');
     expect(row?.push_mode).toBe('manual');
+    expect(row?.content_sync_mode).toBe('auto');
+    expect(row?.archive_sync_mode).toBe('manual');
+    expect(JSON.parse(row?.priority_mapping_json ?? '{}')).toEqual({
+      toProvider: { P0: 'urgent' },
+    });
+    expect(JSON.parse(row?.category_mapping_json ?? '{}')).toEqual({ toProvider: { bug: 'Bug' } });
     // An omitted direction keeps its stored value.
     expect(row?.pull_mode).toBe('auto');
     expect(row?.conflict_mode).toBe('auto');
@@ -1002,6 +1708,57 @@ describe('TrackerSyncService.disconnect', () => {
       kind: 'connection',
     });
   });
+
+  it('promotes the oldest surviving sibling when the ARMED mapping is removed', async () => {
+    // Without the promotion, writeBack.handleIdeaPush (which skips every
+    // push_target = 0 row) would file NO new idea for this (project, provider)
+    // ever again — silently, with the boot repair structurally blind to it
+    // (it only fixes DUPLICATE claims).
+    makeConnection(); // CONN_ID, push_target = 1 — the armed pusher
+    makeConnection({
+      id: 'conn-heir',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+    makeConnection({
+      id: 'conn-younger',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-3', narrowId: 'all', narrowKind: 'all' }),
+    });
+    // NewConnectionRow omits created_at (the store stamps it), so age is forced
+    // directly: conn-younger must genuinely postdate conn-heir for the
+    // oldest-first assertion to test ordering rather than id tie-break alone.
+    raw
+      .prepare(`UPDATE tracker_connections SET created_at = '2030-01-01 00:00:00' WHERE id = ?`)
+      .run('conn-younger');
+
+    await service.disconnect(CONN_ID);
+
+    // The retired row's stale claim is cleared with it…
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(0);
+    // …and the OLDEST survivor inherits the role (same tie-break as boot repair).
+    expect(getConnection(raw, 'conn-heir')?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-younger')?.push_target).toBe(0);
+    expect(broadcasts).toContainEqual({
+      projectId: PROJECT_ID,
+      connectionId: 'conn-heir',
+      kind: 'connection',
+    });
+  });
+
+  it('removing a DEMOTED mapping leaves the armed sibling untouched', async () => {
+    makeConnection(); // armed
+    makeConnection({
+      id: 'conn-demoted',
+      push_target: 0,
+      source_json: JSON.stringify({ containerId: 'team-2', narrowId: 'all', narrowKind: 'all' }),
+    });
+
+    await service.disconnect('conn-demoted');
+
+    expect(getConnection(raw, CONN_ID)?.push_target).toBe(1);
+    expect(getConnection(raw, 'conn-demoted')?.status).toBe('disconnected');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1773,7 @@ describe('TrackerSyncService conflict resolution', () => {
       field?: string | null;
       local_value?: string | null;
       remote_value?: string | null;
+      payload_json?: string | null;
     },
     idea: { title?: string; body?: string | null } = {},
   ): Promise<{ ideaId: string; link: EntityExternalLinkRow; conflictId: number }> {
@@ -1045,6 +1803,7 @@ describe('TrackerSyncService conflict resolution', () => {
       field: conflict.field ?? null,
       local_value: conflict.local_value ?? null,
       remote_value: conflict.remote_value ?? null,
+      payload_json: conflict.payload_json ?? null,
     });
     return { ideaId, link, conflictId: row.id };
   }
@@ -1109,6 +1868,100 @@ describe('TrackerSyncService conflict resolution', () => {
     expect(next).toContain('Fresh remote description');
     expect(next).toContain('<!-- cyboflow:tracker -->');
     expect(next).not.toContain('Old description');
+  });
+
+  it("field conflict + 'remote' on a PRIORITY applies the level the pass recorded", async () => {
+    // The row's `remote_value` is the provider-raw token (invariant 2), so the
+    // local level to write comes off the payload the detecting pass wrote —
+    // rebuilding the mapping here would mean a live provider probe from a UI
+    // click, and one that could answer differently than the pass did.
+    const { ideaId, link, conflictId } = await seedConflict({
+      kind: 'field_conflict',
+      field: 'priority',
+      local_value: '1',
+      remote_value: '2',
+      payload_json: JSON.stringify({ externalId: 'ext-1', mode: 'manual', remoteLocal: 'P1' }),
+    });
+
+    await service.resolveConflictChoice(conflictId, 'remote');
+
+    expect(readIdeaPriority(ideaId)).toBe('P1');
+    const baseline = JSON.parse(linkRow(link.id).baseline_json ?? '{}') as Record<string, unknown>;
+    // The baseline keeps the PROVIDER token, not the local level.
+    expect(baseline.priority).toBe('2');
+    expect(baseline.lastWrittenGroup).toBe('started');
+    expect(conflictRow(conflictId).resolution).toBe('manual-remote');
+  });
+
+  it("field conflict + 'remote' on a CATEGORY applies the Dart type the pass resolved", async () => {
+    const { ideaId, link, conflictId } = await seedConflict({
+      kind: 'field_conflict',
+      field: 'category',
+      local_value: 'Feature',
+      remote_value: 'Bug',
+      payload_json: JSON.stringify({ externalId: 'ext-1', mode: 'manual', remoteLocal: 'bug' }),
+    });
+
+    await service.resolveConflictChoice(conflictId, 'remote');
+
+    expect(readIdeaCategory(ideaId)).toBe('bug');
+    const baseline = JSON.parse(linkRow(link.id).baseline_json ?? '{}') as Record<string, unknown>;
+    expect(baseline.category).toBe('Bug');
+  });
+
+  it("field conflict + 'remote' on a mapped field applies NOTHING without a recorded level", async () => {
+    // A row written before the payload key existed, or hand-edited. Guessing a
+    // level is worse than leaving the entity alone: the conflict still
+    // resolves, and the next pass re-derives from the baseline.
+    const { ideaId, link, conflictId } = await seedConflict({
+      kind: 'field_conflict',
+      field: 'priority',
+      local_value: '1',
+      remote_value: '2',
+    });
+
+    await service.resolveConflictChoice(conflictId, 'remote');
+
+    expect(readIdeaPriority(ideaId)).toBe('P2');
+    const baseline = JSON.parse(linkRow(link.id).baseline_json ?? '{}') as Record<string, unknown>;
+    expect(baseline.priority).toBeUndefined();
+    expect(conflictRow(conflictId).state).toBe('resolved');
+  });
+
+  it("field conflict + 'local' on a mapped field stamps the baseline and writes nothing", async () => {
+    // Keeping the local value only sticks if the baseline moves: otherwise the
+    // next pass reads both-sides-changed and re-opens the settled conflict.
+    const { ideaId, link, conflictId } = await seedConflict({
+      kind: 'field_conflict',
+      field: 'priority',
+      local_value: '1',
+      remote_value: '2',
+      payload_json: JSON.stringify({ externalId: 'ext-1', mode: 'manual', remoteLocal: 'P1' }),
+    });
+
+    await service.resolveConflictChoice(conflictId, 'local');
+
+    // The entity already HOLDS the value being kept.
+    expect(readIdeaPriority(ideaId)).toBe('P2');
+    const baseline = JSON.parse(linkRow(link.id).baseline_json ?? '{}') as Record<string, unknown>;
+    expect(baseline.priority).toBe('2');
+    expect(conflictRow(conflictId).resolution).toBe('manual-local');
+    // No outbound path for content in this phase.
+    expect(outboxRows()).toHaveLength(0);
+  });
+
+  it("field conflict + 'local' stamps a NULL priority as-is (Dart's cleared field)", async () => {
+    const { link, conflictId } = await seedConflict({
+      kind: 'field_conflict',
+      field: 'priority',
+      local_value: 'High',
+      remote_value: null,
+    });
+
+    await service.resolveConflictChoice(conflictId, 'local');
+
+    const baseline = JSON.parse(linkRow(link.id).baseline_json ?? '{}') as Record<string, unknown>;
+    expect(baseline).toHaveProperty('priority', null);
   });
 
   it("field conflict + 'local' on a stage queues the write-back that converges the tracker", async () => {
@@ -1484,7 +2337,7 @@ describe('TrackerSyncService conflict resolution — the pass AFTER the ruling',
 });
 
 // ---------------------------------------------------------------------------
-// reconcilePreview + linkForEntity
+// reconcilePreview + linksForEntity
 // ---------------------------------------------------------------------------
 
 describe('TrackerSyncService.reconcilePreview', () => {
@@ -1535,17 +2388,95 @@ describe('TrackerSyncService.reconcilePreview', () => {
       external_url: 'https://linear.app/acme/issue/CORE-142',
     });
 
-    await expect(service.linkForEntity('idea', ideaId)).resolves.toEqual({
-      provider: 'linear',
-      externalIdentifier: 'CORE-142',
-      externalUrl: 'https://linear.app/acme/issue/CORE-142',
-    });
-    await expect(service.linkForEntity('idea', 'ide_missing')).resolves.toBeNull();
+    await expect(service.linksForEntity('idea', ideaId)).resolves.toEqual([
+      {
+        provider: 'linear',
+        externalIdentifier: 'CORE-142',
+        externalUrl: 'https://linear.app/acme/issue/CORE-142',
+        // makeConnection's default archive_sync_mode is 'off' — a ruling would
+        // fall back to the cancelled-state write, and the ref must say so.
+        removalAction: 'cancel',
+      },
+    ]);
+    await expect(service.linksForEntity('idea', 'ide_missing')).resolves.toEqual([]);
 
     raw.prepare(`UPDATE entity_external_links SET orphaned_at = datetime('now') WHERE id = ?`).run(
       link.id,
     );
-    await expect(service.linkForEntity('idea', ideaId)).resolves.toBeNull();
+    await expect(service.linksForEntity('idea', ideaId)).resolves.toEqual([]);
+  });
+
+  it('returns EVERY live provider link, not just the first — the removal-disclosure fix', async () => {
+    makeConnection();
+    const connDart = makeConnection({ id: 'conn-dart', provider: 'dart' });
+    const ideaId = await createEntity('idea', { title: 'Multi-tracker idea' });
+    upsertLink(raw, {
+      connection_id: CONN_ID,
+      entity_type: 'idea',
+      entity_id: ideaId,
+      provider: 'linear',
+      external_id: 'ext-linear-1',
+      external_identifier: 'CORE-142',
+      external_url: 'https://linear.app/acme/issue/CORE-142',
+    });
+    upsertLink(raw, {
+      connection_id: connDart.id,
+      entity_type: 'idea',
+      entity_id: ideaId,
+      provider: 'dart',
+      external_id: 'ext-dart-1',
+      external_identifier: 'DART-7',
+      external_url: 'https://app.itsdart.com/t/DART-7',
+    });
+
+    const links = await service.linksForEntity('idea', ideaId);
+    expect(links.map((l) => l.provider).sort()).toEqual(['dart', 'linear']);
+    expect(links.find((l) => l.provider === 'dart')?.externalIdentifier).toBe('DART-7');
+    expect(links.find((l) => l.provider === 'linear')?.externalIdentifier).toBe('CORE-142');
+  });
+
+  it('stamps each link with the removal action the ruling would ACTUALLY take', async () => {
+    // Round 3's finding 2: the dialog must promise exactly what
+    // enqueueRemovalWriteBack performs. Three connections, three answers:
+    // Linear with archive sync ON archives; Linear with the default 'off'
+    // falls back to cancel (an archive row could never drain); Plane cancels
+    // regardless because its API has no archive at all.
+    makeConnection({ archive_sync_mode: 'auto' });
+    const connOff = makeConnection({ id: 'conn-off', provider: 'dart', archive_sync_mode: 'off' });
+    const connPlane = makeConnection({
+      id: 'conn-plane',
+      provider: 'plane',
+      archive_sync_mode: 'auto',
+    });
+    const ideaId = await createEntity('idea', { title: 'Everywhere idea' });
+    upsertLink(raw, {
+      connection_id: CONN_ID,
+      entity_type: 'idea',
+      entity_id: ideaId,
+      provider: 'linear',
+      external_id: 'ext-lin',
+    });
+    upsertLink(raw, {
+      connection_id: connOff.id,
+      entity_type: 'idea',
+      entity_id: ideaId,
+      provider: 'dart',
+      external_id: 'ext-dart',
+    });
+    upsertLink(raw, {
+      connection_id: connPlane.id,
+      entity_type: 'idea',
+      entity_id: ideaId,
+      provider: 'plane',
+      external_id: 'ext-plane',
+    });
+
+    const links = await service.linksForEntity('idea', ideaId);
+    const actionOf = (p: string): string | undefined =>
+      links.find((l) => l.provider === p)?.removalAction;
+    expect(actionOf('linear')).toBe('archive');
+    expect(actionOf('dart')).toBe('cancel');
+    expect(actionOf('plane')).toBe('cancel');
   });
 });
 
@@ -1584,7 +2515,7 @@ describe('TrackerSyncService.unlinkEntity', () => {
     expect(linkRow(link.id).orphaned_at).not.toBeNull();
     expect(outboxRows()).toEqual([]);
     // The link is gone as far as every read model is concerned.
-    await expect(service.linkForEntity('idea', ideaId)).resolves.toBeNull();
+    await expect(service.linksForEntity('idea', ideaId)).resolves.toEqual([]);
     expect(broadcasts).toEqual([
       { projectId: PROJECT_ID, connectionId: CONN_ID, kind: 'connection' },
     ]);
@@ -1744,7 +2675,7 @@ describe('TrackerSyncService staged local-removal ruling', () => {
     expect(linkRow(link.id).orphaned_at).toBeNull();
     expect(outboxRows()).toEqual([]);
     expect(broadcasts).toEqual([]);
-    await expect(service.linkForEntity('idea', ideaId)).resolves.not.toBeNull();
+    await expect(service.linksForEntity('idea', ideaId)).resolves.not.toEqual([]);
   });
 
   it('applies the ruling only once the delete actually commits', async () => {
@@ -1916,7 +2847,7 @@ describe('TrackerSyncService staged local-removal ruling', () => {
 
     expect(outboxRows()).toEqual([]);
     expect(linkRow(link.id).orphaned_at).toBeNull();
-    await expect(service.linkForEntity('idea', ideaId)).resolves.not.toBeNull();
+    await expect(service.linksForEntity('idea', ideaId)).resolves.not.toEqual([]);
   });
 
   // -------------------------------------------------------------------------

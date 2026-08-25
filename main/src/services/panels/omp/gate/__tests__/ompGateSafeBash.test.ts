@@ -109,6 +109,13 @@ const FIXTURES: readonly BashFixture[] = [
   { command: 'git commit -m x > /tmp/f', readOnly: false, gitWrite: false },
   { command: 'cat < /etc/passwd', readOnly: false, gitWrite: false },
   { command: 'git add x &', readOnly: false, gitWrite: false },
+  // --- raw newlines ---------------------------------------------------------
+  // Both sides refuse, and must keep refusing: a newline is a shell separator,
+  // so the trailing line is a second command that no table ever read.
+  { command: 'ls\nrm -rf ~', readOnly: false, gitWrite: false },
+  { command: 'git status\nrm -rf ~', readOnly: false, gitWrite: false },
+  { command: 'git commit -m x\nrm -rf ~', readOnly: false, gitWrite: false },
+  { command: 'git status\ngit log', readOnly: false, gitWrite: false },
   // --- degenerate inputs ----------------------------------------------------
   { command: '', readOnly: false, gitWrite: false },
   { command: '   ', readOnly: false, gitWrite: false },
@@ -193,23 +200,27 @@ describe('isGateSafeBashCommand', () => {
   });
 
   /**
-   * The documented divergence from the mirrored classifier.
+   * Formerly the documented divergence from the mirrored classifier, now a
+   * three-way agreement.
    *
-   * `splitShellSegments` treats only `&&`, `||`, `;` and `|` as separators — it
-   * must, to stay byte-identical to cyboflow's Bash(...) rule grammar — so a
-   * newline-separated command arrives as ONE segment that whitespace-tokenizes
-   * to `git status` plus stray positionals. The orchestrator's copy calls that
-   * read-only. This rung auto-allows with NO human anywhere, so it refuses the
-   * character outright and the command reaches a human instead.
+   * `splitShellSegments` used to treat only `&&`, `||`, `;` and `|` as
+   * separators — supposedly forced, to stay byte-identical to cyboflow's
+   * Bash(...) rule grammar — so a newline-separated command arrived as ONE
+   * segment that whitespace-tokenized to `git status` plus stray positionals,
+   * and the orchestrator's copy called that read-only. Only this rung refused
+   * it. The premise was wrong: splitting on the newline makes the rule grammar
+   * MORE conservative (an unmatched segment falls through to the human), so the
+   * splitter learned the separator and the mirrored classifier closed too.
    */
-  it('refuses a raw newline even where the mirrored classifier accepts one', () => {
+  it('refuses a raw newline, and so does the mirrored classifier', () => {
     const smuggled = 'git status\nrm -rf ~';
 
-    // The hole, asserted on both mirrors so the divergence is deliberate and visible.
-    expect(orchestratorIsSafeReadOnly(smuggled)).toBe(true);
-    expect(gateIsSafeReadOnly(smuggled)).toBe(true);
+    // Asserted on both mirrors: this is the shape that used to auto-approve.
+    expect(orchestratorIsSafeReadOnly(smuggled)).toBe(false);
+    expect(gateIsSafeReadOnly(smuggled)).toBe(false);
 
-    // …and closed at the rung.
+    // …and still closed at the rung, which additionally refuses the character
+    // outright so a quoted newline cannot survive the split.
     expect(isGateSafeBashCommand(smuggled)).toBe(false);
     expect(isGateSafeBashCommand('git status\r\ngit push')).toBe(false);
     // Even a wholly benign multi-line command asks — no carve-out to poke at.
