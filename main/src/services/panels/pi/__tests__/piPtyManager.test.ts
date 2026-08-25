@@ -49,6 +49,15 @@ describe('Pi PTY spawn security invariant', () => {
     expect(args).toContain('--continue');
     expect(args[args.length - 1]).toBe('do a thing');
   });
+
+  it('space-prefixes a dash-leading prompt (pi has no -- terminator)', () => {
+    const args = makeExposed().exposeBuildCommandArgs({
+      prompt: '-rm -rf /',
+      isContinue: false,
+    });
+    expect(args[args.length - 1]).toBe(' -rm -rf /');
+    expect(() => assertPiRequiredSpawnFlags(args)).not.toThrow();
+  });
 });
 
 describe('evaluatePiVersionPolicy', () => {

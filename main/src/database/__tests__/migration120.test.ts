@@ -98,6 +98,17 @@ function seedRows(db: BetterSqlite3.Database): void {
   );
   insertRun.run('run-claude', 'claude', 'claude-sdk');
   insertRun.run('run-omp', 'omp', 'omp-sdk');
+
+  // The ONE table 120 recreates via DROP TABLE — seed it so the snapshot
+  // proves row/column/index/FK survival through the recreate.
+  db.prepare(
+    `INSERT INTO agent_invocations (agent_invocation_id, run_id, step_id, agent_provider, agent_runtime)
+     VALUES ('inv-seed-1', 'run-claude', 'step-1', 'codex', 'codex-sdk')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO agent_invocations (agent_invocation_id, run_id, step_id, agent_provider, agent_runtime, panel_id)
+     VALUES ('inv-seed-2', 'run-claude', 'step-2', 'omp', 'omp-pty', 'panel-7')`,
+  ).run();
 }
 
 function allRows(db: BetterSqlite3.Database, table: string): Array<Record<string, unknown>> {
@@ -142,7 +153,7 @@ interface Snapshot {
   fks: Record<string, string[]>;
 }
 
-const TARGET_TABLES = ['sessions', 'workflow_runs'] as const;
+const TARGET_TABLES = ['sessions', 'workflow_runs', 'agent_invocations'] as const;
 
 function snapshot(db: BetterSqlite3.Database): Snapshot {
   const snap: Snapshot = { rows: {}, columns: {}, objects: {}, fks: {} };
@@ -201,12 +212,13 @@ function tryRun(db: BetterSqlite3.Database, id: string, provider: string, runtim
 }
 
 describe('Migration 120: the native pi runtimes admitted on sessions + workflow_runs', () => {
-  it('(a) makes omp-fleet storable on sessions and workflow_runs', () => {
+  it('(a) makes the fleet and pi runtimes storable on sessions and workflow_runs', () => {
     const { db, svc } = upgradeThrough120();
     expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
     expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
     expect(trySession(db, 's-pi-pty', 'pi', 'pi-pty')).toBeNull();
     expect(tryRun(db, 'run-pi', 'pi', 'pi-sdk')).toBeNull();
+    svc.close();
   });
 
   it("(b) preserves 103's widenings — omp-sdk and omp-pty stay storable on sessions", () => {

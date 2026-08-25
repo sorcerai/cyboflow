@@ -9,6 +9,7 @@ import { getShellPath, findExecutableInPath } from '../../../utils/shellPath';
 import { AbstractCliManager } from '../cli/AbstractCliManager';
 import { probeCliVersion, type CliVersionProbeResult } from '../cli/cliVersionProbe';
 import { evaluatePiVersionPolicy, PI_MIN_SUPPORTED_VERSION, PI_TESTED_VERSION } from './piVersions';
+import { assertPiRequiredSpawnFlags } from './piPtyManager';
 
 interface PiSdkSpawnOptions {
   panelId: string;
@@ -185,7 +186,10 @@ export class PiSdkManager extends AbstractCliManager {
     if (state?.child && !state.child.killed) {
       state.child.kill('SIGTERM');
     }
-    this.turns.delete(panelId);
+    if (state) state.child = null;
+    // DELIBERATELY keep the turns entry: the pinned piSessionId IS the
+    // conversation. Deleting it here made the next continuePanel mint a fresh
+    // id and silently reset the conversation after a mere cancel.
   }
 
   async restartPanelWithHistory(
@@ -235,7 +239,15 @@ export class PiSdkManager extends AbstractCliManager {
     if (state.model && state.model.trim().length > 0) {
       args.push('--model', state.model);
     }
-    args.push('--print', prompt);
+    // The PROMPT travels on STDIN, not argv: pi's parser rejects a bare `--`
+    // separator (verified live) and would read a dash-leading prompt as
+    // flags — including ones that re-enable discovery. Stdin is the
+    // non-injectable channel.
+    args.push('--print');
+
+    // Same spawn-time invariant as the PTY lane, asserted on THIS argv too:
+    // the lockdown pair survives every future edit to this builder.
+    assertPiRequiredSpawnFlags(args);
 
     const effRunId = runId ?? panelId;
     await new Promise<void>((resolve) => {
@@ -247,6 +259,8 @@ export class PiSdkManager extends AbstractCliManager {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       state.child = child;
+      child.stdin.write(prompt);
+      child.stdin.end();
 
       let settled = false;
       const finish = (exitCode: number) => {
@@ -302,8 +316,21 @@ export class PiSdkManager extends AbstractCliManager {
         finish(1);
       });
       child.on('close', (code) => {
+        // pi's final line may lack a trailing newline — flush the remainder
+        // through the projector BEFORE deciding how the turn ended.
+        const rest = buffer.trim();
+        buffer = '';
+        if (rest && this.handleEventLine(rest, panelId, sessionId)) sawAgentEnd = true;
         if (code === 0 && !sawAgentEnd) {
-          this.logger?.warn(`[PI] turn for panel ${panelId} exited 0 without agent_end`);
+          // Clean exit without agent_end still has to REST the session.
+          this.logger?.warn(`[PI] turn for panel ${panelId} exited 0 without agent_end; synthesizing result`);
+          this.emit('output', {
+            panelId,
+            sessionId,
+            type: 'json',
+            data: { type: 'system', subtype: 'result', is_error: false },
+            timestamp: new Date(),
+          });
         }
         finish(code ?? 1);
       });

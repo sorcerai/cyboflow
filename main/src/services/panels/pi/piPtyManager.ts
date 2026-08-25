@@ -173,8 +173,13 @@ export class PiPtyManager extends AbstractCliManager {
       args.push('--continue');
     }
 
-    if (options.prompt.trim().length > 0) {
-      args.push('--', options.prompt);
+    // pi's parser has NO `--` terminator (verified live: 'Unknown option:
+    // --'), so a dash-leading prompt would parse as flags. A single leading
+    // space is the parser-safe encoding — content otherwise verbatim.
+    const prompt =
+      options.prompt.startsWith('-') ? ` ${options.prompt}` : options.prompt;
+    if (prompt.trim().length > 0) {
+      args.push(prompt);
     }
 
     assertPiRequiredSpawnFlags(args);
