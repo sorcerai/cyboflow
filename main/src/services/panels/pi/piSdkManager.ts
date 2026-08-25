@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import type { AgentProvider } from '../../../../../shared/types/agentRuntime';
 import type { ConversationMessage } from '../../../database/models';
 import type { PermissionMode } from '../../../../../shared/types/workflows';
+import type { CliSpawnOutcome } from '../../../../../shared/types/cliPanels';
+import type { ClaudeSpawnerOptions } from '../../../orchestrator/runExecutor';
 import { getShellPath, findExecutableInPath } from '../../../utils/shellPath';
 import { AbstractCliManager } from '../cli/AbstractCliManager';
 import { probeCliVersion, type CliVersionProbeResult } from '../cli/cliVersionProbe';
@@ -184,10 +186,18 @@ export class PiSdkManager extends AbstractCliManager {
     initialPrompt: string,
     _conversationHistory: ConversationMessage[],
   ): Promise<void> {
-    // The pinned --session-id survives restarts by design; a fresh panel id
-    // would start a fresh conversation, which is what restart means here.
-    void panelId;
+    // Preserve the PINNED session id across the restart: stopPanel tears the
+    // turn down, but the whole point of --session-id is that the conversation
+    // survives. Recreate the state before spawning so runTurn never sees a
+    // missing record.
+    const prior = this.turns.get(panelId);
     await this.stopPanel(panelId);
+    this.turns.set(panelId, {
+      piSessionId: prior?.piSessionId ?? `cyboflow-${randomUUID()}`,
+      model: prior?.model,
+      cwd: worktreePath,
+      child: null,
+    });
     await this.runTurn(panelId, sessionId, worktreePath, initialPrompt, undefined);
   }
 
@@ -228,8 +238,23 @@ export class PiSdkManager extends AbstractCliManager {
       });
       state.child = child;
 
+      let settled = false;
       const finish = (exitCode: number) => {
+        if (settled) return; // 'error' + 'close' both fire; settle once.
+        settled = true;
         state.child = null;
+        if (exitCode !== 0) {
+          // A failed turn must still REST the session: emit the same
+          // system/result envelope the quick-session rest path listens for,
+          // flagged as an error, so nothing strands in 'running'.
+          this.emit('output', {
+            panelId,
+            sessionId,
+            type: 'json',
+            data: { type: 'system', subtype: 'result', is_error: true },
+            timestamp: new Date(),
+          });
+        }
         this.emit('turn-end', { panelId, sessionId, runId: effRunId });
         this.emit('exit', { panelId, sessionId, exitCode, signal: null });
         resolve();
@@ -299,6 +324,7 @@ export class PiSdkManager extends AbstractCliManager {
         .map((b) => b.text)
         .join('');
       if (text.length === 0) return false;
+      this.lastResultText.set(panelId, text);
       this.emit('output', {
         panelId,
         sessionId,
@@ -331,13 +357,54 @@ export class PiSdkManager extends AbstractCliManager {
     return false;
   }
 
+  /**
+   * The RunExecutor/workflow entry point. Mirrors startPanel but honors the
+   * spawner options' runId/spawnKey and returns the turn's final assistant
+   * text as the step-output channel (null when the turn produced none).
+   */
+  override async spawnCliProcess(options: ClaudeSpawnerOptions): Promise<CliSpawnOutcome> {
+    this.assertProviderEnabled(options);
+    const panelId = options.spawnKey ?? options.panelId;
+    const sessionId = options.sessionId ?? panelId;
+    let state = this.turns.get(panelId);
+    if (!state) {
+      state = {
+        piSessionId: `cyboflow-${randomUUID()}`,
+        model: typeof options.model === 'string' ? options.model : undefined,
+        cwd: options.worktreePath ?? process.cwd(),
+        child: null,
+      };
+      this.turns.set(panelId, state);
+    }
+    if (state.child && !state.child.killed) {
+      throw new Error(`[PI] a turn is already running for panel ${panelId}`);
+    }
+    await this.runTurn(panelId, sessionId, state.cwd, options.prompt ?? '', options.runId);
+    return { resultText: this.lastResultText.get(panelId) ?? null };
+  }
+
+  /** Final assistant text of the most recent turn, for {@link CliSpawnOutcome}. */
+  private readonly lastResultText = new Map<string, string>();
+
+  /** A panel is running while its pinned-session turn child is alive. */
+  override isPanelRunning(panelId: string): boolean {
+    const child = this.turns.get(panelId)?.child;
+    return child !== null && child !== undefined && !child.killed;
+  }
+
   // ── AbstractCliManager abstract members ────────────────────────────────
   // The turn-spawn lane never drives the PTY argv machinery, but the base
   // class declares these abstract. Kept as honest no-ops so a future
   // persistent-rpc upgrade can repurpose them instead of fighting them.
 
   protected buildCommandArgs(_options: { prompt: string; model?: string }): string[] {
-    return [];
+    // FAIL CLOSED: this lane's argv is built inside runTurn (json mode +
+    // pinned session + lockdown pair). Reaching this base-class hook means a
+    // PTY-style caller bypassed spawnCliProcess — refuse rather than launch a
+    // bare interactive pi with extensions enabled.
+    throw new Error(
+      '[PI] sdk lane does not use buildCommandArgs; turns must go through spawnCliProcess/runTurn (which pin --session-id and the discovery-lockdown flags).',
+    );
   }
 
   protected parseCliOutput(data: string, panelId: string, sessionId: string): Array<{ panelId: string; sessionId: string; type: 'json' | 'stdout' | 'stderr'; data: unknown; timestamp: Date }> {

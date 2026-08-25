@@ -206,7 +206,7 @@ describe('Migration 120: the native pi runtimes admitted on sessions + workflow_
     expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
     expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
     expect(trySession(db, 's-pi-pty', 'pi', 'pi-pty')).toBeNull();
-    expect(tryRun(db, 'run-pi', 'omp', 'pi-sdk')).toBeNull();
+    expect(tryRun(db, 'run-pi', 'pi', 'pi-sdk')).toBeNull();
   });
 
   it("(b) preserves 103's widenings — omp-sdk and omp-pty stay storable on sessions", () => {
