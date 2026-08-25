@@ -419,6 +419,11 @@ export class PiSdkManager extends AbstractCliManager {
         child: null,
       };
       this.turns.set(panelId, state);
+    } else {
+      // Workflow re-runs against an existing panel must pick up a CHANGED
+      // model or worktree, not ride the stale first-turn values.
+      if (typeof options.model === 'string') state.model = options.model;
+      if (options.worktreePath) state.cwd = options.worktreePath;
     }
     if (state.child && !state.child.killed) {
       throw new Error(`[PI] a turn is already running for panel ${panelId}`);
