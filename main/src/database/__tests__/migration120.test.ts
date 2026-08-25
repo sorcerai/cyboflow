@@ -203,9 +203,10 @@ function tryRun(db: BetterSqlite3.Database, id: string, provider: string, runtim
 describe('Migration 120: the native pi runtimes admitted on sessions + workflow_runs', () => {
   it('(a) makes omp-fleet storable on sessions and workflow_runs', () => {
     const { db, svc } = upgradeThrough120();
-    expect(trySession(db, 's-fleet', 'omp', 'omp-fleet', 'pi-sdk', 'pi-pty')).toBeNull();
-    expect(tryRun(db, 'run-pi', 'omp', 'pi-sdk', 'pi-sdk', 'pi-pty')).toBeNull();
-    svc.close();
+    expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
+    expect(trySession(db, 's-pi-pty', 'pi', 'pi-pty')).toBeNull();
+    expect(tryRun(db, 'run-pi', 'omp', 'pi-sdk')).toBeNull();
   });
 
   it("(b) preserves 103's widenings — omp-sdk and omp-pty stay storable on sessions", () => {
@@ -249,16 +250,13 @@ describe('Migration 120: the native pi runtimes admitted on sessions + workflow_
     svc.close();
   });
 
-  it('(f) keeps omp-fleet off workflow_variants and agent_invocations, and still rejects bogus runtimes', () => {
+  it('(f) variants admit pi-sdk but reject pi-pty; invocations admit both; bogus rejected', () => {
     const { db, svc } = upgradeThrough120();
-    expect(() =>
-      db
-        .prepare(
-          `INSERT INTO workflow_variants (id, workflow_id, label, agent_provider, agent_runtime)
-           VALUES ('wfv-pi', 'wf-1', 'pi-arm', 'pi', 'pi-sdk')`,
-        )
-        .run(),
-    ).toThrow(/CHECK constraint failed/);
+    // workflow_variants mirrors the LAUNCHABLE list: pi-sdk in, pi-pty out.
+    db.prepare(
+      `INSERT INTO workflow_variants (id, workflow_id, label, agent_provider, agent_runtime)
+       VALUES ('wfv-pi', 'wf-1', 'pi-arm', 'pi', 'pi-sdk')`,
+    ).run();
     expect(() =>
       db
         .prepare(
@@ -267,14 +265,16 @@ describe('Migration 120: the native pi runtimes admitted on sessions + workflow_
         )
         .run(),
     ).toThrow(/CHECK constraint failed/);
-    expect(() =>
-      db
-        .prepare(
-          `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
-           VALUES ('inv-pi', 'run-claude', 'pi', 'pi-sdk')`,
-        )
-        .run(),
-    ).toThrow(/CHECK constraint failed/);
+    // agent_invocations records the transport that actually served a turn;
+    // omp-pty is admitted there historically, so pi-pty matches.
+    db.prepare(
+      `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
+       VALUES ('inv-pi-sdk', 'run-claude', 'pi', 'pi-sdk')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
+       VALUES ('inv-pi-pty', 'run-claude', 'pi', 'pi-pty')`,
+    ).run();
     expect(trySession(db, 's-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
     expect(tryRun(db, 'run-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
     svc.close();
@@ -287,9 +287,10 @@ describe('Migration 120: the native pi runtimes admitted on sessions + workflow_
     db.prepare(
       `INSERT INTO workflows (id, project_id, name, spec_json) VALUES ('wf-1', 1, 'sprint', '{}')`,
     ).run();
-    expect(trySession(db, 's-fleet', 'omp', 'omp-fleet', 'pi-sdk', 'pi-pty')).toBeNull();
+    expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
     expect(trySession(db, 's-sdk', 'omp', 'omp-sdk')).toBeNull();
-    expect(tryRun(db, 'run-pi', 'omp', 'pi-sdk', 'pi-sdk', 'pi-pty')).toBeNull();
+    expect(tryRun(db, 'run-pi', 'pi', 'pi-sdk')).toBeNull();
     expect(trySession(db, 's-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
     svc.close();
   });
@@ -307,7 +308,8 @@ describe('Migration 120: the native pi runtimes admitted on sessions + workflow_
       expect(allRows(db2, t)).toEqual(before.rows[t]);
       expect(columnNames(db2, t)).toEqual(before.columns[t]);
     }
-    expect(trySession(db2, 's-fleet-again', 'omp', 'omp-fleet', 'pi-sdk', 'pi-pty')).toBeNull();
+    expect(trySession(db2, 's-fleet-again', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db2, 's-pi-again', 'pi', 'pi-sdk')).toBeNull();
     again.close();
   });
 

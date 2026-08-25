@@ -24,6 +24,8 @@ export const PI_TESTED_VERSION = '0.84.2';
 export interface PiVersionVerdict {
   ok: boolean;
   aboveTested: boolean;
+  /** Why a binary failed: below the floor, or unparseable `--version` output. */
+  reason?: 'below-floor' | 'unparseable';
 }
 
 /**
@@ -33,7 +35,7 @@ export interface PiVersionVerdict {
  */
 export function evaluatePiVersionPolicy(rawVersion: string): PiVersionVerdict {
   const match = rawVersion.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!match) return { ok: false, aboveTested: false };
+  if (!match) return { ok: false, aboveTested: false, reason: 'unparseable' };
   const toTuple = (v: string): [number, number, number] =>
     v.split('.').map(Number) as [number, number, number];
   const cmp = (a: [number, number, number], b: [number, number, number]): number => {
@@ -43,8 +45,10 @@ export function evaluatePiVersionPolicy(rawVersion: string): PiVersionVerdict {
     return 0;
   };
   const parsed = toTuple(match[0]);
+  const belowFloor = cmp(parsed, toTuple(PI_MIN_SUPPORTED_VERSION)) < 0;
   return {
-    ok: cmp(parsed, toTuple(PI_MIN_SUPPORTED_VERSION)) >= 0,
+    ok: !belowFloor,
     aboveTested: cmp(parsed, toTuple(PI_TESTED_VERSION)) > 0,
+    reason: belowFloor ? 'below-floor' : undefined,
   };
 }
