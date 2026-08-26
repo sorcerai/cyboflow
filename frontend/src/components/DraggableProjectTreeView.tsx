@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, memo } from 'react';
-import { ChevronRight, ChevronDown, Folder as FolderIcon, FolderOpen, Plus, Settings, GripVertical, GitBranch, RefreshCw, Workflow as WorkflowIcon, FlaskConical, Pencil } from 'lucide-react';
+import { ChevronRight, ChevronDown, Folder as FolderIcon, FolderOpen, Plus, Settings, GripVertical, GitBranch, RefreshCw, Workflow as WorkflowIcon, FlaskConical } from 'lucide-react';
 import { useErrorStore } from '../stores/errorStore';
 import { useNavigationStore } from '../stores/navigationStore';
 import { useCyboflowStore } from '../stores/cyboflowStore';
@@ -221,78 +221,6 @@ export const SessionRow = memo(function SessionRow({
   ideaGlyph,
   isDraggable = true,
 }: SessionRowProps) {
-  // Inline rename — SessionRow-local only (no new props, so sessionRowPropsEqual
-  // above needs no changes). Mirrors SessionListItem's handleSaveEdit/
-  // handleCancelEdit/handleKeyDown: trim; empty or unchanged closes without an
-  // API call; failure alerts + reverts. No optimistic local name cache after a
-  // successful save — the store's 'session-updated' replaces `session` and this
-  // memoized row re-renders from that, same as every other prop.
-  const [isEditingName, setIsEditingName] = useState(false);
-  const [editName, setEditName] = useState(session.name);
-  const nameInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (isEditingName) {
-      nameInputRef.current?.focus();
-      nameInputRef.current?.select();
-    }
-  }, [isEditingName]);
-
-  const handleStartRename = () => {
-    setEditName(session.name);
-    setIsEditingName(true);
-  };
-
-  const handleCancelRename = () => {
-    setEditName(session.name);
-    setIsEditingName(false);
-  };
-
-  const handleSaveRename = async () => {
-    const trimmed = editName.trim();
-    if (trimmed === '' || trimmed === session.name) {
-      setEditName(session.name);
-      setIsEditingName(false);
-      return;
-    }
-    try {
-      const response = await API.sessions.rename(session.id, trimmed);
-      if (!response.success) {
-        throw new Error(response.error || 'Failed to rename session');
-      }
-      setIsEditingName(false);
-    } catch (error) {
-      console.error('Error renaming session:', error);
-      alert('Failed to rename session');
-      setEditName(session.name);
-      setIsEditingName(false);
-    }
-  };
-
-  const handleNameInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Isolate from the row's own onKeyDown (Enter/Space -> onSessionClick).
-    e.stopPropagation();
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      void handleSaveRename();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      handleCancelRename();
-    }
-  };
-
-  // A native click-away dismiss dispatches blur BEFORE click. On the
-  // unchanged-name path handleSaveRename flips isEditingName synchronously in
-  // the blur handler, so the row's onClick guard below would already see false
-  // and navigate anyway. Arm suppression on mousedown instead — it fires before
-  // blur, while isEditingName is still true; a later genuine click re-runs
-  // mousedown with isEditingName false and disarms.
-  const suppressClickRef = useRef(false);
-
-  const handleRowMouseDown = () => {
-    suppressClickRef.current = isEditingName;
-  };
-
   return (
     <div className="relative" style={{ marginLeft: '16px' }}>
       <div className="absolute inset-0 pointer-events-none">
@@ -316,30 +244,14 @@ export const SessionRow = memo(function SessionRow({
           sessionDropIndicator === 'after' ? 'border-b-2 border-interactive' : ''
         }`}
         style={{ paddingLeft: '24px' }}
-        draggable={isDraggable && !isEditingName}
+        draggable={isDraggable}
         onDragStart={(e) => onDragStart(e, session, projectId)}
         onDragOver={(e) => onDragOver(e, session)}
         onDrop={(e) => onDrop(e, session, projectId)}
         onDragEnd={onDragEnd}
         onDragEnter={onDragEnter}
         onDragLeave={onDragLeave}
-        onMouseDown={handleRowMouseDown}
-        onClick={(e) => {
-          // Guard against the double-click-to-rename affordance below: a dblclick
-          // sequence dispatches click(detail=1), click(detail=2), dblclick in that
-          // order, so the second click has already reached us by the time dblclick
-          // fires — stopPropagation() there can't retroactively cancel it. Also
-          // guard on isEditingName so clicking a non-input part of the row (e.g.
-          // the relative-time label) while the editor is open doesn't navigate —
-          // suppressClickRef covers the blur-before-click native ordering where
-          // isEditingName has already flipped false (see handleRowMouseDown).
-          if (suppressClickRef.current) {
-            suppressClickRef.current = false;
-            return;
-          }
-          if (isEditingName || e.detail > 1) return;
-          onSessionClick(session);
-        }}
+        onClick={() => onSessionClick(session)}
         role="button"
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSessionClick(session); }}
@@ -354,47 +266,18 @@ export const SessionRow = memo(function SessionRow({
           className={`w-2 h-2 rounded-full flex-shrink-0 ${statusDotClass(session.status)}`}
           title={session.status}
         />
-        {isEditingName ? (
-          <input
-            ref={nameInputRef}
-            type="text"
-            value={editName}
-            onChange={(e) => setEditName(e.target.value)}
-            onKeyDown={handleNameInputKeyDown}
-            onBlur={handleSaveRename}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-            className="flex-1 min-w-0 text-sm bg-surface-primary text-text-primary px-1 py-0 rounded border border-interactive focus:outline-none focus:ring-1 focus:ring-interactive"
-          />
-        ) : (
-          <span
-            className={`text-sm truncate ${isActive ? 'font-semibold text-interactive' : 'text-text-primary'}`}
-            title={session.name}
-            onDoubleClick={(e) => { e.stopPropagation(); handleStartRename(); }}
-          >
-            {/* Idea-session home marker (idea sessions plan, Stage 6). */}
-            {ideaGlyph && (
-              <span aria-hidden className="text-interactive mr-1">
-                ◈
-              </span>
-            )}
-            {session.name || session.id.slice(0, 8)}
-          </span>
-        )}
-        {!isEditingName && (
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); handleStartRename(); }}
-            onDoubleClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => e.stopPropagation()}
-            className="opacity-0 group-hover/session:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring-subtle transition-opacity p-0.5 hover:bg-surface-hover rounded flex-shrink-0"
-            aria-label="Rename session"
-            title="Rename"
-          >
-            <Pencil className="w-3 h-3 text-text-tertiary" />
-          </button>
-        )}
+        <span
+          className={`text-sm truncate ${isActive ? 'font-semibold text-interactive' : 'text-text-primary'}`}
+          title={session.name}
+        >
+          {/* Idea-session home marker (idea sessions plan, Stage 6). */}
+          {ideaGlyph && (
+            <span aria-hidden className="text-interactive mr-1">
+              ◈
+            </span>
+          )}
+          {session.name || session.id.slice(0, 8)}
+        </span>
         <span className="text-xs text-text-tertiary truncate ml-auto">
           {relativeTime}
         </span>
@@ -2096,14 +1979,10 @@ function DraggableProjectTreeViewImpl(_props: DraggableProjectTreeViewProps) {
                         // parentless run rows after the session list.
                         const isLastSession =
                           index === flatSessions.length - 1 && parentlessRunCount === 0;
-                        // Show LAST-ACTIVITY time, not creation time: an actively-used
-                        // session should read "a few minutes ago", not its hours-old
-                        // creation timestamp. lastActivity is
-                        // COALESCE(sessions.idle_since, sessions.updated_at) — the real
-                        // rest boundary once the session is at rest (migration 119), so
-                        // a rename or a folder move no longer makes a long-quiet session
-                        // read as active moments ago. Fall back to createdAt when
-                        // lastActivity is absent (older/unsynced rows).
+                        // Show LAST-ACTIVITY time (DB updated_at → lastActivity), not
+                        // creation time: an actively-used session should read "a few
+                        // minutes ago", not its hours-old creation timestamp. Fall back
+                        // to createdAt when lastActivity is absent (older/unsynced rows).
                         const lastActivityAt = session.lastActivity ?? session.createdAt;
                         const relativeTime = lastActivityAt ? formatDistanceToNow(lastActivityAt) : '';
                         const isActive = selectedSessionId === session.id;

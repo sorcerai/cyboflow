@@ -11,8 +11,8 @@ import type { CreateSessionRequest } from '../types/session';
 import { getCyboflowSubdirectory } from '../utils/cyboflowDirectory';
 import { convertDbFolderToFolder } from './folders';
 import { panelManager } from '../services/panelManager';
-import { trackUsage } from '../services/telemetry';
-import { reportEagerSpawnFailure } from './eagerSpawnFailure';
+import { trackUsage, captureSeamError } from '../services/telemetry';
+import { classifyErrorPattern } from '../orchestrator/programmatic/systemicError';
 import {
   validateSessionExists,
   validatePanelSessionOwnership,
@@ -29,7 +29,6 @@ import {
 } from '../services/streamParser';
 import type { UnifiedMessage } from '../../../shared/types/unifiedMessage';
 import type { SessionSummaryPayload } from '../../../shared/types/sessionSummary';
-import type { QuickSessionRow, QuickSessionGitSnapshot } from '../../../shared/types/quickSessions';
 import type { SessionOutput, Session as SessionType } from '../types/session';
 import type { Logger } from '../utils/logger';
 import { transitionToRunning } from '../services/cyboflow/transitions';
@@ -65,11 +64,12 @@ import {
   QUICK_CODEX_PTY_BRIEFING,
   QUICK_CODEX_SDK_BRIEFING,
   QUICK_OMP_PTY_BRIEFING,
+  QUICK_PI_PTY_BRIEFING,
 } from './quickSessionBriefings';
 import { relayOrSpawnPtyPanel } from './ptyPanelDispatch';
 import { agentProviderDisabledMessage, assertAgentProviderAllowed } from '../services/agentProviderGuard';
 import { resolveSubstrate } from '../orchestrator/substrateResolver';
-import { isPtyLane, nonClaudeLaneOwner, resolvePanelLane, type PanelLane } from '../services/panelLane';
+import { isPtyLane, resolvePanelLane, type PanelLane } from '../services/panelLane';
 import type { AbstractCliManager } from '../services/panels/cli/AbstractCliManager';
 import type { ToolPanel } from '../../../shared/types/panels';
 import { isAgentStreamEvent } from '../../../shared/types/agentStream';
@@ -109,6 +109,23 @@ import { validateInput } from './validateInput';
 // chokepoint, so the A/B quick-arm path resolves against the SAME table.
 
 /**
+ * Report a swallowed EAGER PTY spawn failure (create-quick's fire-and-forget
+ * `startPanel`) to Sentry.
+ *
+ * The eager spawn is deliberately fail-soft — create-quick has already returned
+ * `success` plus a `claudePanelId`, and a later `sessions:input` re-spawns the
+ * REPL — but fail-soft is also INVISIBLE: the renderer mounts a terminal on a
+ * `cyboflow:pty:<id>` channel that will never emit a byte and shows a bare
+ * cursor indefinitely, with no error on any surface. Only `spawnCliProcess`'s
+ * own final failure self-reports (`pty-spawn-failed`); anything `startPanel`
+ * throws before reaching it (worktree checks, settings writes, briefing prep)
+ * previously died in a `console.error` nobody would ever read on a user's
+ * machine. This makes that class of blank terminal diagnosable.
+ *
+ * Fixed message + bounded `errorClass` per captureSeamError's payload rules —
+ * the raw error text stays in the local console.error at the call site.
+ */
+/**
  * Design-session wording for each rung of the SHARED SDK-pinned pre-flight
  * ladder (services/claudeSdkSessionPreflight.ts). The probe is shared; the
  * copy is not — index.ts's design-mode fork and the open-idea-session door
@@ -122,6 +139,15 @@ const DESIGN_PREFLIGHT_MESSAGES: Readonly<Record<ClaudeSdkPreflightFailure, stri
   interactive_pty_only:
     'Design sessions cannot run on the interactive substrate, but this app is locked to interactive-PTY-only mode. Disable that lock in Settings to start a design session.',
 };
+
+function reportEagerSpawnFailure(err: unknown, substrate: string, cliTool: string): void {
+  const errorClass = classifyErrorPattern(err instanceof Error ? err.message : String(err));
+  captureSeamError(
+    'eager-pty-spawn-failed',
+    new Error(`eager ${cliTool} REPL spawn failed (${errorClass})`),
+    { substrate, cliTool, errorClass },
+  );
+}
 
 function interactiveTranscriptExists(
   worktreePath: string | null | undefined,
@@ -301,10 +327,13 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     codexPtyManager, // Codex PTY quick-session runtime
     ompSdkManager, // Structured OMP RPC quick-session runtime
     ompPtyManager, // OMP PTY quick-session runtime
+    piPtyManager, // Pi PTY quick-session runtime
+    piSdkManager, // Pi structured runtime (quick sessions + workflow runs)
     killLiveSession, // hard-kill seam for a dismissed PTY quick session's REPL
     registerLivePanel, // at-spawn runId→panelId seed for the facade's relay translation
     registerCodexPtyPanel, // at-spawn runId→panelId seed for Codex PTY quick sessions
     registerOmpPtyPanel, // the OMP twin of registerCodexPtyPanel
+    registerPiPtyPanel, // the Pi twin of registerOmpPtyPanel
     gitStatusManager,
     gitDiffManager, // git-derived session file stats for sessions:get-statistics
     archiveProgressManager,
@@ -692,6 +721,10 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       // No briefing: OMP's spawn has no `--append-system-prompt` equivalent, so
       // passing one would be silently dropped rather than delivered.
       createStructuredChatLane({ lane: 'omp-sdk', manager: ompSdkManager }),
+      // No briefing: pi's json-mode turn takes the prompt on stdin and has no
+      // system-prompt channel on this spawn shape, so passing one would be
+      // silently dropped rather than delivered.
+      createStructuredChatLane({ lane: 'pi-sdk', manager: piSdkManager }),
     ].map((entry) => [entry.lane, entry]),
   );
 
@@ -768,19 +801,55 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
         briefing: QUICK_OMP_PTY_BRIEFING,
       },
     ],
+    [
+      'pi-pty',
+      {
+        label: AGENT_PROVIDER_LABELS.pi,
+        isPanelRunning: (panelId) => piPtyManager.isPanelRunning(panelId),
+        relayUserTurn: (panelId, input) => piPtyManager.relayUserTurn(panelId, input),
+        registerPanel: registerPiPtyPanel,
+        // pi's TUI takes no per-turn thinking flag on this lane (the level is
+        // spawn-baked via --thinking only), so reasoningEffort is not forwarded.
+        startPanel: (o) =>
+          piPtyManager.startPanel(
+            o.panelId,
+            o.sessionId,
+            o.worktreePath,
+            o.prompt,
+            o.permissionMode,
+            o.model,
+            o.runId,
+          ),
+        briefing: QUICK_PI_PTY_BRIEFING,
+      },
+    ],
   ]);
 
   /**
    * The manager that owns a lane's live process for Stop / Dismiss close-out, or
-   * undefined for the two CLAUDE lanes — see {@link nonClaudeLaneOwner}.
+   * undefined for the two CLAUDE lanes — those keep their own fallbacks (the
+   * interactive one degrades to `killLiveSession` when its manager is absent,
+   * and `claudeCodeManager.stopPanel` is the session-level Stop that predates
+   * the interactive split).
    */
-  const laneStopOwner = (lane: PanelLane): AbstractCliManager | undefined =>
-    nonClaudeLaneOwner<AbstractCliManager | undefined>(lane, {
-      'codex-sdk': codexSdkManager,
-      'codex-pty': codexPtyManager,
-      'omp-sdk': ompSdkManager,
-      'omp-pty': ompPtyManager,
-    });
+  const laneStopOwner = (lane: PanelLane): AbstractCliManager | undefined => {
+    switch (lane) {
+      case 'codex-sdk':
+        return codexSdkManager;
+      case 'codex-pty':
+        return codexPtyManager;
+      case 'omp-sdk':
+        return ompSdkManager;
+      case 'omp-pty':
+        return ompPtyManager;
+      case 'pi-pty':
+        return piPtyManager;
+      case 'pi-sdk':
+        return piSdkManager;
+      default:
+        return undefined;
+    }
+  };
 
   /**
    * Rest the session when a PTY lane's process exits. Lane, not session runtime:
@@ -806,6 +875,7 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
   for (const [ptyLane, manager] of [
     ['codex-pty', codexPtyManager],
     ['omp-pty', ompPtyManager],
+    ['pi-pty', piPtyManager],
   ] as const) {
     manager?.on?.('exit', (payload: { panelId?: string; sessionId?: string; exitCode?: number }) => {
       handlePtyLaneExit(ptyLane, payload);
@@ -1496,9 +1566,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
           console.error(`[IPC] Failed to create OMP panel for quick session ${session.id}:`, error);
         }
       } else if (eagerPtyLane) {
-        // Set by the fire-and-forget spawn's catch; read after the 'running'
-        // write below (see the re-assert there).
-        let eagerSpawnFailed = false;
         try {
           const panel = await panelManager.createPanel({
             sessionId: session.id,
@@ -1525,21 +1592,10 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
               reasoningEffort: requestedReasoningEffort,
             })
             .catch((err: unknown) => {
-              eagerSpawnFailed = true;
               console.error(`[IPC] Eager ${eagerPtyLane.label} PTY spawn failed for session ${session.id}:`, err);
-              reportEagerSpawnFailure(err, 'interactive', quickResolvedProvider, {
-                sessionManager,
-                sessionId: session.id,
-              });
+              reportEagerSpawnFailure(err, 'interactive', quickResolvedProvider);
             });
           await sessionManager.updateSession(session.id, { status: 'running' });
-          // The rejection can land in the microtask window the await above opens
-          // — a CACHED unavailable probe rejects almost immediately — in which
-          // case the error status the catch just wrote was clobbered by the
-          // 'running' write. Re-assert it; the error text itself already stands.
-          if (eagerSpawnFailed) {
-            await sessionManager.updateSession(session.id, { status: 'error' });
-          }
         } catch (error) {
           console.error(`[IPC] Failed to create ${eagerPtyLane.label} panel for quick session ${session.id}:`, error);
         }
@@ -1575,9 +1631,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
           console.error(`[IPC] Failed to create Claude panel for demo interactive quick session ${session.id}:`, error);
         }
       } else if (resolvedSubstrate === 'interactive') {
-        // Set by the fire-and-forget spawn's catch; read after the 'running'
-        // write below (see the re-assert there).
-        let eagerSpawnFailed = false;
         try {
           // NOTE: deliberately NOT registered with ClaudePanelManager (the
           // frontend panels:create handler auto-registers claude panels,
@@ -1622,7 +1675,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
               requestedReasoningEffort,
             )
             .catch((err: unknown) => {
-              eagerSpawnFailed = true;
               // Fail-soft: a spawn failure leaves the session usable — the next
               // sessions:input re-spawns the REPL with the user's prompt.
               console.error(`[IPC] Eager interactive REPL spawn failed for session ${session.id}:`, err);
@@ -1635,20 +1687,10 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
               // died here in a console.error. Report it so a blank terminal is
               // diagnosable instead of silent. Fixed message + bounded
               // errorClass — the raw text stays in the console.error above.
-              reportEagerSpawnFailure(err, 'interactive', 'claude', {
-                sessionManager,
-                sessionId: session.id,
-              });
+              reportEagerSpawnFailure(err, 'interactive', 'claude');
             });
           // Mirror sessions:input — the REPL is live; show the session as running.
           await sessionManager.updateSession(session.id, { status: 'running' });
-          // …unless the spawn already rejected inside the microtask window that
-          // await opened (a cached "not available" probe rejects on the next
-          // tick), in which case this write just clobbered the catch's error
-          // status. Re-assert it.
-          if (eagerSpawnFailed) {
-            await sessionManager.updateSession(session.id, { status: 'error' });
-          }
         } catch (error) {
           console.error(`[IPC] Failed to create Claude panel for interactive quick session ${session.id}:`, error);
           // Continue without the eager spawn — sessions:input bootstraps on demand.
@@ -2487,9 +2529,6 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       console.log(`[IPC] Restarting interactive REPL for session ${sessionId} (panel ${claudePanelId})`);
       // ⚠️ NEVER await startPanel — the interactive spawn promise resolves only
       // when the REPL EXITS (persistent-session contract).
-      // Set by the fire-and-forget spawn's catch; read after the 'running' write
-      // below (see the re-assert there).
-      let restartSpawnFailed = false;
       void interactiveCliManager
         .startPanel(
           claudePanelId,
@@ -2504,17 +2543,10 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
           panelReasoningEffort,
         )
         .catch((err: unknown) => {
-          restartSpawnFailed = true;
           console.error(`[IPC] Interactive restart spawn failed for session ${sessionId}:`, err);
-          reportEagerSpawnFailure(err, 'interactive', 'claude', { sessionManager, sessionId });
+          reportEagerSpawnFailure(err, 'interactive', 'claude');
         });
       await sessionManager.updateSession(sessionId, { status: 'running' });
-      // Same microtask race as the create-quick eager spawns: a rejection inside
-      // the await above already wrote the error status, which this 'running'
-      // write then clobbered. Re-assert it.
-      if (restartSpawnFailed) {
-        await sessionManager.updateSession(sessionId, { status: 'error' });
-      }
       return { success: true };
     } catch (error) {
       console.error('[IPC] Failed to restart interactive session:', error);
@@ -2908,12 +2940,8 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
   // §7). A pure read: it never blocks on or mutates summary state. When it
   // observes content above the summarizer's watermark it fires the §2.7 lazy
   // catch-up kick — fire-and-forget, bounded by the scheduler's own cooldown so
-  // the renderer's 30s poll cannot become a hot retry loop. `opts.catchUp`
-  // (default true, matching every existing caller) can be set to `false` to
-  // skip that kick entirely and make this a pure read with no side effect —
-  // for a caller (e.g. a board-wide batch read) that wants the summary without
-  // risking triggering a summarizer run.
-  ipcMain.handle('sessions:get-summary', async (_event, sessionId: string, opts?: { catchUp?: boolean }) => {
+  // the renderer's 30s poll cannot become a hot retry loop.
+  ipcMain.handle('sessions:get-summary', async (_event, sessionId: string) => {
     try {
       const sessionValidation = validateSessionExists(sessionId);
       if (!sessionValidation.valid) {
@@ -2928,10 +2956,9 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       // Lazy catch-up decision (§2.7): any conversation_messages row above the
       // watermark means unsummarized content — kick the scheduler (which re-runs
       // every other gate). The read itself is not awaited and mutates nothing.
-      const catchUp = opts?.catchUp ?? true;
       const watermark = summaryRow?.last_turn_id ?? 0;
       const hasNewerContent = databaseService.getConversationMessagesAfter(sessionId, watermark).length > 0;
-      if (enabled && hasNewerContent && catchUp) {
+      if (enabled && hasNewerContent) {
         services.sessionSummaryScheduler?.maybeSummarizeNow(sessionId, 'lazy-catchup');
       }
 
@@ -3556,32 +3583,12 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
     }
   });
 
-  // Throttle state for the sessions:list-quick git-cache warm (seam item (3)
-  // below). Handler-scoped: one warm window per registration, i.e. per app run.
-  const QUICK_GIT_WARM_INTERVAL_MS = 60_000;
-  const QUICK_GIT_WARM_MAX_SESSIONS = 20;
-  let lastQuickGitWarmMs = 0;
-
   // Live quick-session status board (replaces the old idle-session review_item
   // mint). Derives each quick session's state on read: `blocked` when its chat
   // run has a pending AskUserQuestion / permission gate (SDK gates via the
   // Question/Approval routers; PTY gates via the interactive manager's
   // awaiting-input flag), else `running`/`idle` from the DB status. `projectId`
-  // scopes to one project; omit for the cross-project review home. Three things
-  // happen ONLY at this seam (never in the pure listing module): (1) a
-  // cache-only git snapshot is attached from GitStatusManager.peekCachedStatus
-  // — never a fresh fetch, so the 3s poll can't spawn git subprocesses; (2)
-  // when the session-summary feature toggle is off, summary/summaryState/
-  // waitingOn are nulled so a toggle-off can't leak a persisted summary onto
-  // the board (mirrors sessions:get-summary's `enabled` contract); (3) at most
-  // once per QUICK_GIT_WARM_INTERVAL_MS, a fire-and-forget cache WARM kicks
-  // getGitStatus (TTL-aware, coalesced, concurrency-bounded) for the resting
-  // rows — the git watcher pipeline (badge auto-refresh) is disabled in
-  // production (GIT_STATUS_BADGE_ENABLED=false), so the cache this seam reads
-  // would otherwise stay cold. Folding the warm into the poll (instead of a
-  // dedicated handler) keeps the legacy ipcMain.handle surface frozen
-  // (noNewIpcHandlers.test.ts) and scopes warming to exactly "while a board
-  // is polling".
+  // scopes to one project; omit for the cross-project review home.
   ipcMain.handle('sessions:list-quick', async (_event, projectId?: number) => {
     try {
       const blockedRunIds = new Set<string>();
@@ -3589,44 +3596,11 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
       for (const a of ApprovalRouter.getInstance().getPending()) blockedRunIds.add(a.runId);
       for (const runId of interactiveCliManager.getAwaitingInputRunIds()) blockedRunIds.add(runId);
 
-      const summaryEnabled = configManager.isSessionSummaryEnabled();
       const rows = listQuickSessions(
         makeDatabaseLike(databaseService),
         blockedRunIds,
         typeof projectId === 'number' ? projectId : undefined,
-      ).map((row): QuickSessionRow => {
-        const cached = gitStatusManager.peekCachedStatus(row.sessionId);
-        const git: QuickSessionGitSnapshot | null = cached
-          ? {
-              isReadyToMerge: cached.status.isReadyToMerge ?? false,
-              hasUncommittedChanges: cached.status.hasUncommittedChanges ?? false,
-              hasUntrackedFiles: cached.status.hasUntrackedFiles ?? false,
-              ahead: cached.status.ahead ?? 0,
-              behind: cached.status.behind ?? 0,
-              lastCheckedIso: new Date(cached.lastChecked).toISOString(),
-            }
-          : null;
-        return {
-          ...row,
-          git,
-          summary: summaryEnabled ? row.summary : null,
-          summaryState: summaryEnabled ? row.summaryState : null,
-          waitingOn: summaryEnabled ? row.waitingOn : null,
-        };
-      });
-
-      // (3) Throttled cache warm — see the seam comment above. Never awaited:
-      // the poll's response must not wait on git subprocesses.
-      const nowMs = Date.now();
-      if (nowMs - lastQuickGitWarmMs >= QUICK_GIT_WARM_INTERVAL_MS) {
-        lastQuickGitWarmMs = nowMs;
-        for (const row of rows.filter((r) => r.state !== 'running').slice(0, QUICK_GIT_WARM_MAX_SESSIONS)) {
-          void gitStatusManager.getGitStatus(row.sessionId).catch((error) => {
-            console.error(`Failed to warm git status for session ${row.sessionId}:`, error);
-          });
-        }
-      }
-
+      );
       return { success: true, data: rows };
     } catch (error) {
       console.error('Failed to list quick sessions:', error);
@@ -3674,26 +3648,11 @@ export function registerSessionHandlers(ipcMain: IpcMain, services: AppServices)
             await ompSessionManager?.stopPanel(claudePanel.id);
             continue;
           }
-          // Per-PANEL lane — mirrors the dismiss teardown above. The
-          // claude-interactive lane runs on its OWN manager (interactiveCliManager
-          // has a completely separate process map from claudeCodeManager's SDK
-          // substrate), so it needs its own branch here too: falling through to
-          // claudeCodeManager.stopPanel for it used to silently no-op (that
-          // manager never had the PTY's panelId registered) and leave the REPL
-          // running after "Stop".
-          const stopLane = resolvePanelLane(dbSession, claudePanel);
-          const stopOwner = laneStopOwner(stopLane);
-          if (stopOwner) {
-            await stopOwner.stopPanel(claudePanel.id);
-          } else if (stopLane === 'claude-interactive') {
-            if (interactiveCliManager) {
-              await interactiveCliManager.stopPanel(claudePanel.id);
-            } else if (gateRunId) {
-              await killLiveSession(gateRunId);
-            }
-          } else {
-            await claudeCodeManager.stopPanel(claudePanel.id);
-          }
+          // Per-PANEL lane — see the dismiss teardown above. claudeCodeManager
+          // covers both Claude lanes here (its stopPanel is the session-level
+          // Stop that predates the interactive split).
+          const stopOwner = laneStopOwner(resolvePanelLane(dbSession, claudePanel));
+          await (stopOwner ?? claudeCodeManager).stopPanel(claudePanel.id);
         }
       } else {
         // Fallback to session-based stop

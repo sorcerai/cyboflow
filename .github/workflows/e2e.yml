@@ -51,26 +51,6 @@ jobs:
       - name: Install Playwright (no browser download needed for Electron)
         run: pnpm exec playwright install-deps || true
 
-      # The afterSign packaging verifier's cases F-K are darwin-only (they shell
-      # out to real codesign/lipo against Mach-O fixtures) and are skipped on the
-      # ubuntu quality runners, which are the only jobs that reach `test:build`
-      # via `test:unit`. This macOS job is therefore their ONLY home in CI — and
-      # they are the checks that caught both packaging defects which blocked
-      # 0.2.6's first build (foreign prebuilds fed to lipo; a stale arm64 ABI
-      # bank leaking into the x64 package).
-      #
-      # HOST ABI on purpose, and BEFORE the Electron flip below. Case G and Case
-      # I resolve a host-loadable better_sqlite3.node and soft-SKIP without one,
-      # so running this after the flip would silently drop the healthy-bundle
-      # case and half of the probe case — passing while proving less. Case I
-      # additionally asserts the mismatch in BOTH directions, which needs the
-      # Electron bank present too; ensure-sqlite-abi maintains both, and each
-      # flip is a cached file copy rather than a recompile.
-      - name: Verify packaging checks (darwin-only afterSign cases)
-        run: |
-          node scripts/ensure-sqlite-abi.mjs host
-          pnpm run test:build
-
       # The launched app needs the ELECTRON ABI. postinstall normally leaves
       # it there, but a restored pnpm store can carry a host-ABI
       # better_sqlite3.node — then _electron.launch throws NMV 127-vs-136 on

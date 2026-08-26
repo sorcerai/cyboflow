@@ -1,15 +1,14 @@
 /**
- * TypeGroupedQueue — quick-session triage integration.
+ * TypeGroupedQueue — quick-session board integration.
  *
- * The old idle-session review_item group, and later the flat compact
- * QuickSessionsTable + "blocked quick session" cards, were replaced by the
- * live SessionTriageGroups (Needs your input / Ready for review / Working).
- * These tests pin the two behaviors that matter at the TypeGroupedQueue seam:
+ * The old idle-session review_item group was replaced by the live
+ * QuickSessionsTable. These tests pin the two behaviors that matter at the
+ * TypeGroupedQueue seam:
  *   1. A LEGACY `idle-session:<id>` human_task row (pending until the startup
  *      drain resolves it) is filtered OUT — it never renders as a stray "Human
  *      task", and there is no "Idle sessions" group any more.
- *   2. The quick-session triage groups render their rows and keep the queue
- *      mounted when a quick session needs attention.
+ *   2. The quick-session board renders its rows and keeps the queue mounted when
+ *      a quick session needs attention.
  */
 import '@testing-library/jest-dom';
 import { render, screen, within } from '@testing-library/react';
@@ -64,19 +63,9 @@ vi.mock('../../stores/quickSessionsStore', () => ({
 }));
 
 // The dynamic-workflow feed drives the idle→running override; no live workflows
-// here, so the triage reflects the mocked quick rows verbatim.
+// here, so the board reflects the mocked quick rows verbatim.
 vi.mock('../../stores/dynamicWorkflowStore', () => ({
   useActiveDynamicWorkflows: () => [],
-}));
-
-// SessionTriageGroups fires a best-effort git-cache warm on mount; stub it so
-// the (unmocked-elsewhere) real API module never has to reach window.electronAPI.
-vi.mock('../../utils/api', () => ({
-  API: {
-    sessions: {
-      getSummary: vi.fn().mockResolvedValue({ success: true, data: { enabled: true, summary: null, updatedAt: null, entries: [] } }),
-    },
-  },
 }));
 
 import { TypeGroupedQueue } from '../landing/TypeGroupedQueue';
@@ -116,15 +105,6 @@ function quickRow(overrides: Partial<QuickSessionRow> = {}): QuickSessionRow {
     state: overrides.state ?? 'idle',
     idleSince: overrides.idleSince ?? '2026-07-06T00:00:00.000Z',
     unviewed: overrides.unviewed ?? true,
-    restedAtIso: overrides.restedAtIso ?? '2026-07-06T00:00:00.000Z',
-    rawStatus: overrides.rawStatus ?? 'completed',
-    exitCode: overrides.exitCode ?? null,
-    summary: overrides.summary ?? null,
-    summaryState: overrides.summaryState ?? null,
-    waitingOn: overrides.waitingOn ?? null,
-    summarySupported: overrides.summarySupported ?? true,
-    worktreeName: overrides.worktreeName ?? null,
-    git: overrides.git ?? null,
   };
 }
 
@@ -133,7 +113,7 @@ beforeEach(() => {
   mockQuickRows = [];
 });
 
-describe('TypeGroupedQueue — quick-session triage', () => {
+describe('TypeGroupedQueue — quick-session board', () => {
   it('filters a legacy idle-session item out (no Idle group, not a Human task)', () => {
     mockReviewItems = [
       makeItem({ id: 'rvw_idle', title: 'Idle session needs your attention', source: `${IDLE_REVIEW_SOURCE_PREFIX}sess-a` }),
@@ -156,80 +136,43 @@ describe('TypeGroupedQueue — quick-session triage', () => {
     expect(within(humanGroup).queryByText(/Idle session needs your attention/)).not.toBeInTheDocument();
   });
 
-  it('surfaces a blocked quick session under Needs your input with the question chip', () => {
+  it('surfaces a blocked quick session as a full-width card (not a board row) and keeps the queue mounted', () => {
     mockQuickRows = [quickRow({ name: 'tidy-valley', state: 'blocked', idleSince: null, unviewed: false })];
     render(<TypeGroupedQueue />);
-    const group = screen.getByTestId('queue-group-session-needs-input');
-    expect(within(group).getByText('tidy-valley')).toBeInTheDocument();
-    expect(within(group).getByText('question')).toBeInTheDocument();
-    // The old dedicated "blocked quick session" card group no longer exists.
-    expect(screen.queryByTestId('queue-group-quick-session-blocked')).not.toBeInTheDocument();
+    // Lifted into a full-width card among the waiting-on-input items...
+    const blockedGroup = screen.getByTestId('queue-group-quick-session-blocked');
+    expect(within(blockedGroup).getByText('tidy-valley')).toBeInTheDocument();
+    expect(within(blockedGroup).getByText('blocked')).toBeInTheDocument();
+    // ...and NOT duplicated as a compact board row — with only a blocked row, the
+    // board filters it out and renders nothing.
     expect(screen.queryByTestId('queue-group-quick-sessions')).not.toBeInTheDocument();
     // A blocked quick session alone keeps the queue up (not the empty state).
     expect(screen.queryByText('No pending reviews')).not.toBeInTheDocument();
   });
 
-  it('surfaces an idle needs_input row under Needs your input with the asked-you chip and waitingOn text', () => {
-    // needsAttention (which gates whether TypeGroupedQueue mounts anything at
-    // all) is deliberately NOT widened for needs_input — see LandingHome's
-    // wiring comment. An unviewed row is the realistic case (you haven't
-    // looked at a session that just asked you something) and keeps this test
-    // inside that gate, matching production.
-    mockQuickRows = [
-      quickRow({
-        name: 'quiet-mesa',
-        state: 'idle',
-        unviewed: true,
-        summaryState: 'needs_input',
-        waitingOn: 'Which branch should I target?',
-      }),
-    ];
-    render(<TypeGroupedQueue />);
-    const group = screen.getByTestId('queue-group-session-needs-input');
-    expect(within(group).getByText('quiet-mesa')).toBeInTheDocument();
-    expect(within(group).getByText('asked you')).toBeInTheDocument();
-    expect(within(group).getByText('Which branch should I target?')).toBeInTheDocument();
-  });
-
-  it('surfaces a clean idle session under Ready for review with its summary', () => {
-    mockQuickRows = [
-      quickRow({
-        sessionId: 's2',
-        name: 'busy-otter',
-        state: 'idle',
-        unviewed: true,
-        summary: 'Fixed the login redirect bug.',
-      }),
-    ];
-    render(<TypeGroupedQueue />);
-    const group = screen.getByTestId('queue-group-session-ready');
-    expect(within(group).getByText('busy-otter')).toBeInTheDocument();
-    expect(within(group).getByText('Fixed the login redirect bug.')).toBeInTheDocument();
-  });
-
-  it('shows running quick sessions under Working', () => {
+  it('shows running quick sessions on the board too (full status board)', () => {
     mockQuickRows = [
       quickRow({ sessionId: 's1', name: 'busy-otter', state: 'running', idleSince: null, unviewed: false }),
       quickRow({ sessionId: 's2', name: 'quiet-mesa', state: 'idle', unviewed: true }),
     ];
     render(<TypeGroupedQueue />);
-    const working = screen.getByTestId('queue-group-session-working');
-    expect(within(working).getByText('busy-otter')).toBeInTheDocument();
-    expect(within(working).getByText('running')).toBeInTheDocument();
-    const ready = screen.getByTestId('queue-group-session-ready');
-    expect(within(ready).getByText('quiet-mesa')).toBeInTheDocument();
+    const board = screen.getByTestId('queue-group-quick-sessions');
+    expect(within(board).getByText('busy-otter')).toBeInTheDocument();
+    expect(within(board).getByText('running')).toBeInTheDocument();
+    expect(within(board).getByText('quiet-mesa')).toBeInTheDocument();
   });
 
-  it('splits a blocked session into Needs your input while other sessions stay in their own groups', () => {
+  it('splits a blocked session into a card while other sessions stay on the board', () => {
     mockQuickRows = [
       quickRow({ sessionId: 's1', name: 'tidy-valley', state: 'blocked', idleSince: null, unviewed: false }),
       quickRow({ sessionId: 's2', name: 'busy-otter', state: 'running', idleSince: null, unviewed: false }),
     ];
     render(<TypeGroupedQueue />);
-    const needsInput = screen.getByTestId('queue-group-session-needs-input');
-    expect(within(needsInput).getByText('tidy-valley')).toBeInTheDocument();
-    const working = screen.getByTestId('queue-group-session-working');
-    expect(within(working).getByText('busy-otter')).toBeInTheDocument();
-    expect(within(working).queryByText('tidy-valley')).not.toBeInTheDocument();
+    const blockedGroup = screen.getByTestId('queue-group-quick-session-blocked');
+    expect(within(blockedGroup).getByText('tidy-valley')).toBeInTheDocument();
+    // The board still renders the non-blocked session, without the blocked one.
+    const board = screen.getByTestId('queue-group-quick-sessions');
+    expect(within(board).getByText('busy-otter')).toBeInTheDocument();
+    expect(within(board).queryByText('tidy-valley')).not.toBeInTheDocument();
   });
 });

@@ -36,79 +36,47 @@ export const ONBOARDING_EVENTS = {
  */
 export const ONBOARDING_ANCHOR_ATTR = 'data-onboarding';
 export const ONBOARDING_ANCHORS = {
-  /** SessionStartWizard step-② Quick Session card (tour step 6). */
+  /** SessionStartWizard step-② Quick Session card (tour step 5). */
   quickSessionCard: 'quick-session-card',
-  /** Wizard Configure — Session permission selector (tour step 8). */
+  /** Wizard Configure — Session permission selector (tour step 7). */
   sessionPermission: 'session-permission',
-  /** Wizard Configure — Model picker (tour step 9). */
+  /** Wizard Configure — Model picker (tour step 8). */
   modelSelect: 'model-select',
-  /** Wizard Configure — agent runtime selector (tour step 7). */
+  /** Wizard Configure — agent runtime selector (tour step 6). */
   substrateSelect: 'substrate-select',
-  /** QuickSessionCanvas "/ship" workflow chip (tour step 10). */
+  /** QuickSessionCanvas "/ship" workflow chip (tour step 9). */
   shipChip: 'ship-chip',
-  /** Sidebar "Human review" rail item (tour step 11). */
+  /** Sidebar "Human review" rail item (tour step 10). */
   humanReview: 'human-review',
 } as const;
 
-export const ONBOARDING_STEP_COUNT = 13;
+export const ONBOARDING_STEP_COUNT = 12;
 
 /** Steps rendered as the centered modal card. */
-export const ONBOARDING_MODAL_STEPS: ReadonlyArray<number> = [0, 1, 2, 3, 4, 5, 12];
+export const ONBOARDING_MODAL_STEPS: ReadonlyArray<number> = [0, 1, 2, 3, 4, 11];
 /** Steps rendered as an anchored coachmark over the live UI. */
-export const ONBOARDING_COACH_STEPS: ReadonlyArray<number> = [6, 7, 8, 9, 10, 11];
+export const ONBOARDING_COACH_STEPS: ReadonlyArray<number> = [5, 6, 7, 8, 9, 10];
 /**
  * The coach steps that are informational POINTERS (the wizard-Configure trio:
- * runtime / permission / model). Unlike the advance-by-doing steps (6, 10, 11)
+ * runtime / permission / model). Unlike the advance-by-doing steps (5, 9, 10)
  * they carry a Next button on the popover and advance via store.next();
  * interacting with the anchored control never advances them.
  */
-export const ONBOARDING_POINTER_STEPS: ReadonlyArray<number> = [7, 8, 9];
-
-/**
- * The one CONDITIONAL step: "which agent should be your default?" only has a
- * question to ask when the Connect step left more than one provider activated.
- * The store decides (onboardingStore.isStepSkipped) — this constant just names
- * the index so the numbering helpers below and the store agree on which one it
- * is.
- */
-export const ONBOARDING_DEFAULT_RUNTIME_STEP = 2;
-
-/**
- * Progress numbering that EXCLUDES the steps this run skips, so a single-
- * provider install reads "STEP 3 / 12" rather than "STEP 4 / 13" with a dot
- * nobody can reach. Both helpers take the live skipped set (the gate derives it
- * from the store) rather than importing the store, keeping this module neutral.
- */
-export function visibleStepTotal(skipped: ReadonlySet<number>): number {
-  return ONBOARDING_STEP_COUNT - skipped.size;
-}
-
-/** 1-based position of `step` among the steps this run actually shows. */
-export function visibleStepNumber(step: number, skipped: ReadonlySet<number>): number {
-  let n = 0;
-  for (let i = 0; i <= step && i < ONBOARDING_STEP_COUNT; i++) {
-    if (!skipped.has(i)) n++;
-  }
-  // A skipped step is never rendered, but Back/goTo race a toggle change; report
-  // the position it would occupy rather than 0.
-  return Math.max(n, 1);
-}
+export const ONBOARDING_POINTER_STEPS: ReadonlyArray<number> = [6, 7, 8];
 
 /**
  * Stable analytics slug per step index (see telemetry `OnboardingStepName`),
  * index-aligned with the tour's step order and ONBOARDING_STEP_COUNT. Used only
  * for the `onboarding_*` usage events — never for control flow.
  *
- * `telemetry` was inserted at index 3 (after Permission, before Add project) and
- * `default_runtime` later at index 2 (after Connect) — each time, every step at
- * or after the insertion point shifted forward by one. Do NOT append new
- * entries at the end without checking whether they belong earlier in the tour's
- * actual order.
+ * `telemetry` was inserted at index 3 (after Permission, before Add project) —
+ * every step at or after the old index 3 shifted forward by one. Do NOT append
+ * new entries at the end without checking whether they belong earlier in the
+ * tour's actual order.
  */
 export const ONBOARDING_STEP_NAMES: readonly OnboardingStepName[] = [
   'welcome',
   'connect',
-  'default_runtime',
   'permission',
   'telemetry',
   'add_project',

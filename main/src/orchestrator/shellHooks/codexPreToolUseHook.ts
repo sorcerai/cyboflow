@@ -89,13 +89,7 @@ export async function main(): Promise<void> {
   }
 
   const payload = await readStdinPayload(process.stdin);
-  const shellResult = await runShellHook({
-    socketPath,
-    runId,
-    token: process.env.CYBOFLOW_ORCH_TOKEN,
-    payload,
-    logger: stderrLogger,
-  });
+  const shellResult = await runShellHook({ socketPath, runId, payload, logger: stderrLogger });
   emitAndExit(codexHookResultFromShellResult(shellResult));
 }
 

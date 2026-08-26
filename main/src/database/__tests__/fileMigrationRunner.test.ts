@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { DatabaseService, MigrationFailedError } from '../database';
+import { DatabaseService } from '../database';
 
 describe('runFileBasedMigrations', () => {
   let dbDir: string;
@@ -78,14 +78,13 @@ describe('runFileBasedMigrations', () => {
     db.close();
   });
 
-  it('fails closed on a broken .sql: rolls back, stamps nothing, and aborts the chain', () => {
+  it('rolls back a broken .sql and continues with the next file', () => {
     // Broken migration references a table that does not exist
     writeFileSync(
       join(migrationsDir, '998_broken.sql'),
       'SELECT * FROM no_such_table_xxx;'
     );
-    // Good migration after the broken one — must NOT run: the runner stops at
-    // the first real failure rather than booting on a half-migrated schema.
+    // Good migration after the broken one
     writeFileSync(
       join(migrationsDir, '999_good.sql'),
       'CREATE TABLE ok_table (id INTEGER);'
@@ -95,39 +94,28 @@ describe('runFileBasedMigrations', () => {
 
     const svc = new DatabaseService(dbPath);
     svc.setMigrationsDirForTesting(migrationsDir);
-
-    // The error propagates out of initialize() — this is the boot-abort path
-    // that main/src/index.ts turns into the blocking "could not update its
-    // database" dialog.
-    let thrown: unknown;
-    try {
-      svc.initialize();
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(MigrationFailedError);
-    expect((thrown as MigrationFailedError).migration).toBe('998_broken.sql');
-    expect((thrown as Error).message).toMatch(/998_broken\.sql/);
+    svc.initialize();
 
     const Database = require('better-sqlite3');
     const db = new Database(dbPath);
 
-    // The later file never ran.
+    // ok_table was created (later file still ran)
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ok_table'")
       .all() as { name: string }[];
-    expect(tables).toHaveLength(0);
+    expect(tables).toHaveLength(1);
 
-    // Neither file is stamped: 998 rolled back, 999 was never attempted.
+    // 998 flag is NOT in user_preferences (rolled back)
     const brokenRow = db
       .prepare("SELECT value FROM user_preferences WHERE key = 'file_migration_applied:998_broken.sql'")
       .get() as { value: string } | undefined;
     expect(brokenRow).toBeUndefined();
 
+    // 999 flag IS recorded
     const goodRow = db
       .prepare("SELECT value FROM user_preferences WHERE key = 'file_migration_applied:999_good.sql'")
       .get() as { value: string } | undefined;
-    expect(goodRow).toBeUndefined();
+    expect(goodRow?.value).toBe('true');
 
     // console.error was called with something mentioning the broken file
     const errorCalls = errorSpy.mock.calls;
@@ -142,126 +130,6 @@ describe('runFileBasedMigrations', () => {
 
     db.close();
     errorSpy.mockRestore();
-  });
-
-  it('fails closed on a syntax error: nothing is stamped and the error names the file', () => {
-    writeFileSync(join(migrationsDir, '997_syntax.sql'), 'CREATE TABLE ( bogus;');
-
-    const errorSpy = vi.spyOn(console, 'error');
-    const svc = new DatabaseService(dbPath);
-    svc.setMigrationsDirForTesting(migrationsDir);
-    expect(() => svc.initialize()).toThrow(/997_syntax\.sql/);
-
-    const Database = require('better-sqlite3');
-    const db = new Database(dbPath);
-    const row = db
-      .prepare("SELECT value FROM user_preferences WHERE key = 'file_migration_applied:997_syntax.sql'")
-      .get() as { value: string } | undefined;
-    expect(row).toBeUndefined();
-    db.close();
-    errorSpy.mockRestore();
-  });
-
-  it('duplicate-column mid-file: the surrounding statements still apply and the file stamps once', () => {
-    // THE regression this suite exists for. The runner used to exec the whole
-    // file as one blob and, on "duplicate column name", stamp the ledger from a
-    // catch — but the throw had already rolled the transaction back, so
-    // statements 1 and 3 were silently discarded FOREVER while the ledger
-    // claimed the migration had applied.
-    writeFileSync(
-      join(migrationsDir, '001_base.sql'),
-      `CREATE TABLE multi (id INTEGER PRIMARY KEY);
-       ALTER TABLE multi ADD COLUMN collide TEXT;`
-    );
-    writeFileSync(
-      join(migrationsDir, '002_multi.sql'),
-      `-- header comment with a semicolon; and prose
-       ALTER TABLE multi ADD COLUMN before_col TEXT;
-       ALTER TABLE multi ADD COLUMN collide TEXT;
-       ALTER TABLE multi ADD COLUMN after_col TEXT;
-       INSERT INTO multi (id, after_col) VALUES (1, 'ran');`
-    );
-
-    const svc1 = new DatabaseService(dbPath);
-    svc1.setMigrationsDirForTesting(migrationsDir);
-    // 001 creates `collide`; 002 then hits it on its middle ALTER.
-    expect(() => svc1.initialize()).not.toThrow();
-
-    const Database = require('better-sqlite3');
-    const db = new Database(dbPath);
-
-    const cols = (db.prepare('PRAGMA table_info(multi)').all() as { name: string }[]).map(
-      (c) => c.name
-    );
-    expect(cols).toContain('before_col'); // statement BEFORE the collision
-    expect(cols).toContain('after_col'); // statement AFTER the collision
-    expect(cols).toContain('collide');
-
-    // The trailing INSERT ran too — the whole file completed.
-    const rows = db.prepare('SELECT after_col FROM multi').all() as { after_col: string }[];
-    expect(rows).toHaveLength(1);
-    expect(rows[0].after_col).toBe('ran');
-
-    // Stamped exactly once.
-    const stamps = db
-      .prepare("SELECT key FROM user_preferences WHERE key = 'file_migration_applied:002_multi.sql'")
-      .all() as { key: string }[];
-    expect(stamps).toHaveLength(1);
-
-    db.close();
-  });
-
-  it('renamed (renumbered) migration re-applies harmlessly end-to-end', () => {
-    // The ledger tracks by FILENAME, so renumbering a migration makes it
-    // re-apply against a DB where its statements already ran (113-118 were
-    // renumbered twice in Aug 2026). Every statement must be a no-op or skipped,
-    // and the new filename must end up stamped.
-    const body = `ALTER TABLE renamed_target ADD COLUMN alpha TEXT;
-      ALTER TABLE renamed_target ADD COLUMN beta TEXT;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_renamed_alpha ON renamed_target(alpha);
-      UPDATE renamed_target SET beta = 'backfilled' WHERE beta IS NULL;`;
-
-    writeFileSync(
-      join(migrationsDir, '900_seed.sql'),
-      "CREATE TABLE renamed_target (id INTEGER PRIMARY KEY);"
-    );
-    writeFileSync(join(migrationsDir, '901_feature.sql'), body);
-
-    const svc1 = new DatabaseService(dbPath);
-    svc1.setMigrationsDirForTesting(migrationsDir);
-    svc1.initialize();
-
-    // Seed a row so the backfill UPDATE has work to do on the re-run too.
-    const Database = require('better-sqlite3');
-    const seedDb = new Database(dbPath);
-    seedDb.prepare("INSERT INTO renamed_target (id, alpha) VALUES (1, 'a')").run();
-    seedDb.close();
-
-    // Renumber: same content, new filename → unknown to the ledger → re-applies.
-    rmSync(join(migrationsDir, '901_feature.sql'));
-    writeFileSync(join(migrationsDir, '903_feature.sql'), body);
-
-    const svc2 = new DatabaseService(dbPath);
-    svc2.setMigrationsDirForTesting(migrationsDir);
-    expect(() => svc2.initialize()).not.toThrow();
-
-    const db = new Database(dbPath);
-
-    // The new filename is stamped, and the old one's stamp is untouched.
-    const newStamp = db
-      .prepare("SELECT value FROM user_preferences WHERE key = 'file_migration_applied:903_feature.sql'")
-      .get() as { value: string } | undefined;
-    expect(newStamp?.value).toBe('true');
-
-    // The whole file ran on the re-application: the backfill UPDATE (which sits
-    // AFTER both colliding ALTERs) took effect. Under the old file-level
-    // stamp-on-error path this row would still be NULL.
-    const row = db.prepare('SELECT beta FROM renamed_target WHERE id = 1').get() as {
-      beta: string | null;
-    };
-    expect(row.beta).toBe('backfilled');
-
-    db.close();
   });
 
   it('backfills 003/004/005 flags when inline markers are present', () => {

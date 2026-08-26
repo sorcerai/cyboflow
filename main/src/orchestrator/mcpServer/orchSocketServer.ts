@@ -16,13 +16,6 @@
  * constructor argument, so this file never imports the electron-backed
  * cyboflow-directory helper.
  *
- * Peer authentication: a connection acquires run-scoped powers by BINDING a
- * runId, and a bind is only granted against that run's bearer token (minted at
- * spawn by orchAuthToken.ts, delivered to the client in CYBOFLOW_ORCH_TOKEN).
- * The socket path itself is chmodded 0600 inside a 0700 directory. Both are
- * needed: the mode keeps other users off the socket, the token keeps a
- * same-user process from claiming a run that is not its own.
- *
  * Transport boundary: this class owns *only* the transport layer — framing,
  * connection lifecycle, and malformed-line handling. `McpQueryHandler` owns the
  * application layer (it never throws and writes its own error responses), so a
@@ -37,12 +30,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { McpQueryHandler, type McpQueryMessage, type McpQueryHandlerDeps } from './mcpQueryHandler';
 import type { DatabaseLike, LoggerLike } from '../types';
-import {
-  isOrchSockAuthDisabled,
-  orchTokenRegistry,
-  ORCH_AUTH_KILL_SWITCH_ENV_VAR,
-  type OrchTokenVerifier,
-} from '../orchAuthToken';
 
 // ---------------------------------------------------------------------------
 // Wire-envelope narrowing
@@ -54,17 +41,11 @@ import {
  * present on every message the subprocess emits (cyboflowMcpServer.ts:126) and,
  * when present, binds the originating socket to that run so `hasClientForRun`
  * can report it.
- *
- * `token` is the run's bearer secret (orchAuthToken.ts), minted by the
- * orchestrator at spawn and handed to the client in `CYBOFLOW_ORCH_TOKEN`. It
- * is required to BIND a runId — see `authorizeBind`. The field is additive and
- * optional on the wire so a parser that predates it is unaffected.
  */
 interface McpQueryEnvelope {
   type: string;
   requestId: string;
   runId?: string;
-  token?: string;
 }
 
 function isMcpQueryEnvelope(v: unknown): v is McpQueryEnvelope {
@@ -73,27 +54,8 @@ function isMcpQueryEnvelope(v: unknown): v is McpQueryEnvelope {
   if (typeof obj.type !== 'string') return false;
   if (typeof obj.requestId !== 'string') return false;
   if (obj.runId !== undefined && typeof obj.runId !== 'string') return false;
-  if (obj.token !== undefined && typeof obj.token !== 'string') return false;
   return true;
 }
-
-/**
- * Per-connection state threaded through the receive loop.
- *
- * `rejected` latches when a bind is refused: the connection is destroyed, but
- * the caller may already hold several complete lines in its rolling buffer, and
- * none of them may be routed after the refusal.
- */
-interface ConnectionState {
-  /** runIds this connection has successfully bound (unregistered on close). */
-  readonly boundRuns: Set<string>;
-  rejected: boolean;
-}
-
-/** Socket-directory mode: owner-only, so no other user can even list it. */
-const SOCKET_DIR_MODE = 0o700;
-/** Socket-file mode: owner read/write, so no other user can connect. */
-const SOCKET_FILE_MODE = 0o600;
 
 // ---------------------------------------------------------------------------
 // OrchSocketServer
@@ -124,23 +86,12 @@ export class OrchSocketServer {
    * unlink is unsafe on a fixed, cross-instance path.
    */
   private boundInode: number | null = null;
-  /**
-   * Latches once the kill switch has been reported, so an accept-all boot logs
-   * the warning once rather than on every bind.
-   */
-  private loggedAuthDisabled = false;
 
   constructor(
     private readonly socketPath: string,
     db: DatabaseLike,
     private readonly logger: LoggerLike,
     deps: McpQueryHandlerDeps = {},
-    /**
-     * Per-run bearer-token verifier. Defaults to the process-wide registry the
-     * spawn seams mint into; tests inject their own so they never depend on
-     * (or pollute) global state.
-     */
-    private readonly tokenVerifier: OrchTokenVerifier = orchTokenRegistry,
   ) {
     this.handler = new McpQueryHandler(db, logger, deps);
   }
@@ -153,12 +104,7 @@ export class OrchSocketServer {
   async start(): Promise<void> {
     // Any inode from a prior bind is stale the moment we re-enter start().
     this.boundInode = null;
-    // Owner-only from the moment it exists. `mode` applies only to directories
-    // this call CREATES (and is masked by umask), so an existing dir from an
-    // older build — created with the default 0755 — is tightened explicitly.
-    const socketDir = path.dirname(this.socketPath);
-    fs.mkdirSync(socketDir, { recursive: true, mode: SOCKET_DIR_MODE });
-    this.tightenMode(socketDir, SOCKET_DIR_MODE, 'sockets directory');
+    fs.mkdirSync(path.dirname(this.socketPath), { recursive: true });
 
     // A unix socket fails to bind onto a leftover file from a prior run, so a
     // stale file must be unlinked first. But unlink-before-bind must NOT clobber
@@ -208,10 +154,6 @@ export class OrchSocketServer {
         // unlinking. A failed stat leaves it null, which makes stop() skip the
         // unlink — strictly the safe direction (a stale file is reclaimed by the
         // next start()'s probe; a clobbered live socket is not recoverable).
-        // Tighten the socket file itself before announcing readiness: between
-        // bind and this chmod the node is world-connectable under a default
-        // umask, and every client we spawn starts only after start() resolves.
-        this.tightenMode(this.socketPath, SOCKET_FILE_MODE, 'socket file');
         try {
           this.boundInode = fs.statSync(this.socketPath).ino;
         } catch (err) {
@@ -350,27 +292,6 @@ export class OrchSocketServer {
   }
 
   /**
-   * chmod a path, downgrading any failure to a warning.
-   *
-   * Best-effort by design: `chmod` on a socket node is a no-op on some
-   * platforms and filesystems (and on Windows the mode bits are meaningless),
-   * and a permissions tweak must never be what stops the orchestrator from
-   * coming up. The bearer-token check is the enforcement that does not depend
-   * on the filesystem honoring this.
-   */
-  private tightenMode(target: string, mode: number, label: string): void {
-    try {
-      fs.chmodSync(target, mode);
-    } catch (err) {
-      this.logger.warn(`[Cyboflow Orch IPC] could not tighten ${label} permissions`, {
-        target,
-        mode: mode.toString(8),
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  /**
    * Probe whether a live server is currently accepting connections on
    * `socketPath`. Resolves `true` iff a client connection succeeds; `false` when
    * the path is absent (ENOENT), refuses (ECONNREFUSED — a stale socket file
@@ -464,37 +385,30 @@ export class OrchSocketServer {
    */
   private onConnection(socket: net.Socket): void {
     let recvBuffer = '';
-    const state: ConnectionState = { boundRuns: new Set<string>(), rejected: false };
+    const boundRuns = new Set<string>();
     this.connections.add(socket);
 
     socket.on('data', (buf: Buffer) => {
-      if (state.rejected) return;
       recvBuffer += buf.toString('utf8');
       let nl: number;
       while ((nl = recvBuffer.indexOf('\n')) !== -1) {
         const line = recvBuffer.slice(0, nl).trim();
         recvBuffer = recvBuffer.slice(nl + 1);
         if (!line) continue;
-        this.routeLine(line, socket, state);
-        // A refused bind destroys the socket, but this buffer may already hold
-        // further complete lines from the same write — drop them unrouted.
-        if (state.rejected) {
-          recvBuffer = '';
-          return;
-        }
+        this.routeLine(line, socket, boundRuns);
       }
     });
 
     socket.on('error', (err: Error) => {
       this.logger.warn('[Cyboflow Orch IPC] client socket error', { error: err.message });
       this.connections.delete(socket);
-      this.unbindSocket(socket, state.boundRuns);
+      this.unbindSocket(socket, boundRuns);
     });
 
     socket.on('close', () => {
       this.logger.debug('[Cyboflow Orch IPC] client disconnected');
       this.connections.delete(socket);
-      this.unbindSocket(socket, state.boundRuns);
+      this.unbindSocket(socket, boundRuns);
     });
   }
 
@@ -502,7 +416,7 @@ export class OrchSocketServer {
    * Parse and route a single complete line. A non-JSON line is logged and
    * dropped — it must never throw out of the 'data' handler.
    */
-  private routeLine(line: string, socket: net.Socket, state: ConnectionState): void {
+  private routeLine(line: string, socket: net.Socket, boundRuns: Set<string>): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -519,58 +433,15 @@ export class OrchSocketServer {
       return;
     }
 
-    if (parsed.runId !== undefined && !state.boundRuns.has(parsed.runId)) {
-      // AUTHENTICATION BOUNDARY. Everything downstream of a successful bind
-      // treats this connection as the run it claims, so this is the one place
-      // the claim is checked. Note the check is per NEW runId, not per
-      // connection: a connection that legitimately bound run A must still
-      // present run B's token before it can also act as run B.
-      if (!this.authorizeBind(parsed.runId, parsed.token, socket, state)) return;
+    if (parsed.runId !== undefined && !boundRuns.has(parsed.runId)) {
       this.bindSocket(parsed.runId, socket);
-      state.boundRuns.add(parsed.runId);
+      boundRuns.add(parsed.runId);
     }
 
     // The envelope is validated; the handler's exhaustive-default fallback
     // covers any type not in the current union, so the cast is safe.
     const msg = parsed as McpQueryMessage;
     void this.handler.handleMessage(msg, socket);
-  }
-
-  /**
-   * Decide whether this connection may bind `runId`, closing it if not.
-   *
-   * A refusal destroys the connection rather than merely dropping the message:
-   * a client that cannot prove its identity has nothing legitimate to say on
-   * this socket, and leaving it open would let it keep guessing.
-   *
-   * The token is never echoed into the log — only whether one was presented.
-   */
-  private authorizeBind(
-    runId: string,
-    token: string | undefined,
-    socket: net.Socket,
-    state: ConnectionState,
-  ): boolean {
-    if (isOrchSockAuthDisabled()) {
-      if (!this.loggedAuthDisabled) {
-        this.loggedAuthDisabled = true;
-        this.logger.warn(
-          `[Cyboflow Orch IPC] ${ORCH_AUTH_KILL_SWITCH_ENV_VAR}=1 — orch.sock peer authentication is DISABLED; ` +
-            'any local process can claim any run. Unset it as soon as the emergency is over.',
-        );
-      }
-      return true;
-    }
-
-    if (this.tokenVerifier.verify(runId, token)) return true;
-
-    this.logger.warn('[Cyboflow Orch IPC] refused a run binding without a valid token — closing connection', {
-      runId,
-      presentedToken: token !== undefined,
-    });
-    state.rejected = true;
-    socket.destroy();
-    return false;
   }
 
   private bindSocket(runId: string, socket: net.Socket): void {

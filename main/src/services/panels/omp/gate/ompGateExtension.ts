@@ -105,8 +105,6 @@ import type {
 export const ENV_RUN_ID = 'CYBOFLOW_RUN_ID';
 /** Env var carrying the orchestrator's Unix socket path. */
 export const ENV_ORCH_SOCKET = 'CYBOFLOW_ORCH_SOCKET';
-/** Env var carrying this run's orch.sock bearer token (orchAuthToken.ts). */
-export const ENV_ORCH_TOKEN = 'CYBOFLOW_ORCH_TOKEN';
 /** Env var carrying the JSON gate config (see {@link OmpGateConfig}). */
 export const ENV_GATE_CONFIG = 'CYBOFLOW_OMP_GATE_CONFIG';
 /** Env var carrying the load-sentinel file path. */
@@ -1873,13 +1871,6 @@ export type OmpGateConnect = (socketPath: string) => net.Socket;
 export interface OmpGateSocketOptions {
   socketPath: string;
   runId: string;
-  /**
-   * This run's bearer token ({@link ENV_ORCH_TOKEN}). The orchestrator refuses
-   * to bind `runId` without it and closes the socket, which this gate reports
-   * as a liveness failure — i.e. it fails CLOSED, like every other
-   * orchestrator-unreachable path here.
-   */
-  token?: string;
   toolName: string;
   toolInput: Record<string, unknown>;
   logger: OmpGateLogger;
@@ -1913,7 +1904,7 @@ export interface OmpGateSocketOptions {
  * handler at 30s (see this file's header).
  */
 export function requestSocketDecision(opts: OmpGateSocketOptions): Promise<OmpGateSocketVerdict> {
-  const { socketPath, runId, token, toolName, toolInput, logger } = opts;
+  const { socketPath, runId, toolName, toolInput, logger } = opts;
   const connect = opts.connect ?? ((p: string) => net.createConnection(p));
 
   const requestId = `omp-gate-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
@@ -1959,7 +1950,6 @@ export function requestSocketDecision(opts: OmpGateSocketOptions): Promise<OmpGa
           type: 'shell-approval-request',
           requestId,
           runId,
-          ...(token !== undefined ? { token } : {}),
           // Tells the server this is the OMP lane, where a socket that dies
           // before a verdict is a BUDGET EXPIRY, not a dead requester — see
           // `OmpGateApprovalRequest.substrate`.
@@ -2073,8 +2063,6 @@ export interface OmpGateRuntime {
   config: OmpGateConfig;
   runId: string;
   socketPath: string | undefined;
-  /** This run's orch.sock bearer token; undefined when the spawn carried none. */
-  token?: string;
   logger: OmpGateLogger;
   connect?: OmpGateConnect;
   inFlight: Set<net.Socket>;
@@ -2119,7 +2107,6 @@ export function createToolCallHandler(
     const verdict = await requestSocketDecision({
       socketPath: runtime.socketPath,
       runId: runtime.runId,
-      ...(runtime.token !== undefined ? { token: runtime.token } : {}),
       toolName: event.toolName,
       toolInput: event.input,
       logger,
@@ -2169,7 +2156,6 @@ export function resolveGateRuntime(
     config: parseGateConfig(env[ENV_GATE_CONFIG], logger),
     runId: env[ENV_RUN_ID] ?? '',
     socketPath: env[ENV_ORCH_SOCKET],
-    ...(env[ENV_ORCH_TOKEN] ? { token: env[ENV_ORCH_TOKEN] } : {}),
     logger,
     inFlight: new Set<net.Socket>(),
   };

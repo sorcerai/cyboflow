@@ -11,10 +11,6 @@
  *     New card into `children` AFTER passing `entries.length`).
  *   - The Workflows section is never truly empty — a builtin-only project still
  *     shows its flow cards plus the New card.
- *   - The Plugins section renders ONE card per plugin ID, not per install
- *     record: `cyboflow.plugins.list` returns the catalogue verbatim and Claude
- *     Code writes a record per project path, so a plugin used across worktrees
- *     would otherwise render dozens of identical cards ({@link foldPluginEntries}).
  *   - The Agents section FEATURE-GATES: when agents are unavailable (the store
  *     flags it) or the list is empty, we render an empty-state row INSTEAD of a
  *     broken grid (the New-agent card is still offered so the section is usable).
@@ -22,7 +18,6 @@
  * Action props are forwarded verbatim to the cards; their handler bodies are
  * TODO no-ops wired in P4 / the editor integration.
  */
-import { useMemo } from 'react';
 import { GallerySection } from './GallerySection';
 import { WorkflowCard } from './WorkflowCard';
 import { AgentCard } from './AgentCard';
@@ -30,7 +25,6 @@ import { NewWorkflowCard } from './NewWorkflowCard';
 import { NewAgentCard } from './NewAgentCard';
 import type { WorkflowGalleryEntry, AgentGalleryEntry } from '../../stores/workflowsStore';
 import type { McpEntry, PluginEntry } from '../../../../shared/types/integrations';
-import { foldPluginEntries } from './pluginGallery';
 
 export interface GalleryStackedProps {
   /** Workflow cards across the resolved project set. */
@@ -49,10 +43,7 @@ export interface GalleryStackedProps {
   agentsUnavailable: boolean;
   /** CLI-configured MCP servers (machine-global, read-only). */
   mcps: McpEntry[];
-  /**
-   * Installed Claude Code plugins (machine-global, read-only) as RAW install
-   * records — one per scope/project path. Folded to one card per id for display.
-   */
+  /** Installed Claude Code plugins (machine-global, read-only). */
   plugins: PluginEntry[];
 
   // Thin action props — wired in P4 / the editor integration.
@@ -88,9 +79,6 @@ export function GalleryStacked({
   onNewAgent,
 }: GalleryStackedProps): React.JSX.Element {
   const showAgentsGrid = !agentsUnavailable && agents.length > 0;
-  // ONE card per plugin id: `plugins` is the raw per-install-record catalogue,
-  // which fans out per project path for project/local scope (see pluginGallery).
-  const pluginCards = useMemo(() => foldPluginEntries(plugins), [plugins]);
 
   return (
     <div className="pb-11" data-testid="gallery-stacked">
@@ -193,15 +181,15 @@ export function GalleryStacked({
 
       <GallerySection
         title="Plugins"
-        count={pluginCards.length}
+        count={plugins.length}
         subtitle="Installed Claude Code plugins"
         gridClassName="grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
         data-testid="gallery-section-plugins"
       >
-        {pluginCards.length > 0 ? (
-          pluginCards.map((entry) => (
+        {plugins.length > 0 ? (
+          plugins.map((entry) => (
             <div
-              key={entry.id}
+              key={`${entry.id}:${entry.scope}:${entry.projectPath ?? ''}`}
               data-testid={`plugin-card-${entry.name}`}
               className="flex flex-col gap-2.5 border border-border-primary bg-surface-primary p-4 transition-[border-color,box-shadow] duration-150 hover:border-text-primary"
               onMouseEnter={(e) => {
@@ -216,36 +204,16 @@ export function GalleryStacked({
                   {entry.name}
                 </span>
                 <span className="shrink-0 rounded-badge border border-border-primary bg-bg-secondary px-1.5 py-px text-[8.5px] font-bold uppercase tracking-[0.08em] text-text-tertiary">
-                  {entry.scopes[0]}
-                  {entry.scopes.length > 1 ? ` +${entry.scopes.length - 1}` : ''}
+                  {entry.scope}
                 </span>
               </div>
               <p className="flex-1 truncate text-[11px] leading-relaxed text-text-secondary">
                 {entry.marketplace}
               </p>
-              {entry.projectInstallCount > 1 ? (
-                <p
-                  data-testid={`plugin-card-${entry.name}-scope-hint`}
-                  className="text-[10px] leading-relaxed text-text-tertiary"
-                >
-                  {entry.projectInstallCount} project installs — install at user scope to avoid one
-                  record per worktree.
-                </p>
-              ) : null}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-dashed border-border-primary pt-2.5 text-[9.5px] tracking-[0.04em] text-text-tertiary">
-                <span className="whitespace-nowrap">
+              <div className="flex items-center gap-2 border-t border-dashed border-border-primary pt-2.5 text-[9.5px] tracking-[0.04em] text-text-tertiary">
+                <span>
                   <b className="font-bold tabular-nums text-text-primary">{entry.version}</b>
-                  {entry.versionCount > 1 ? ` +${entry.versionCount - 1}` : ''}
                 </span>
-                {entry.installCount > 1 ? (
-                  <span
-                    className="whitespace-nowrap"
-                    data-testid={`plugin-card-${entry.name}-installs`}
-                  >
-                    <b className="font-bold tabular-nums text-text-primary">{entry.installCount}</b>{' '}
-                    installs
-                  </span>
-                ) : null}
               </div>
             </div>
           ))

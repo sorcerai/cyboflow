@@ -87,6 +87,10 @@ const CATALOG_BRIDGE_FALLBACKS: {
   // discovered list — no pinned aliases to fall back on — so an empty catalog
   // would be a silently broken control rather than a degraded one.
   omp: null,
+  // OMP's answer for Pi's reason too: a Pi picker has nothing but the
+  // discovered `${provider}/${model}` list — no pinned aliases — so an empty
+  // catalog would be a silently broken control rather than a degraded one.
+  pi: null,
 };
 
 // Wrapper class for API calls that provides error handling and consistent interface
@@ -187,14 +191,14 @@ export class API {
       return window.electronAPI.sessions.markViewed(sessionId);
     },
 
-    async getSummary(sessionId: string, opts?: { catchUp?: boolean }): Promise<IPCResponse<SessionSummaryPayload>> {
+    async getSummary(sessionId: string): Promise<IPCResponse<SessionSummaryPayload>> {
       if (!isElectron()) throw new Error('Electron API not available');
-      return window.electronAPI.sessions.getSummary(sessionId, opts);
+      return window.electronAPI.sessions.getSummary(sessionId);
     },
 
     async listQuick(projectId?: number): Promise<IPCResponse<QuickSessionRow[]>> {
       if (!isElectron()) throw new Error('Electron API not available');
-      return window.electronAPI.sessions.listQuick(projectId);
+      return window.electronAPI.sessions.listQuick(projectId) as Promise<IPCResponse<QuickSessionRow[]>>;
     },
 
     async stop(sessionId: string) {

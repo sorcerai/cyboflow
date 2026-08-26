@@ -271,7 +271,7 @@ export class DemoCliManager extends AbstractCliManager {
     return {};
   }
 
-  protected async cleanupCliResources(_panelId: string, _sessionId: string): Promise<void> {
+  protected async cleanupCliResources(_sessionId: string): Promise<void> {
     // Nothing to clean — scripts hold no external resources.
   }
 

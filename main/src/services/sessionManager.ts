@@ -6,7 +6,6 @@ import type { Session, SessionUpdate, SessionOutput } from '../types/session';
 import type { DatabaseService } from '../database/database';
 import type { Session as DbSession, CreateSessionData, UpdateSessionData, ConversationMessage, PromptMarker, ExecutionDiff, CreateExecutionDiffData, Project } from '../database/models';
 import { getShellPath } from '../utils/shellPath';
-import { parseTimestamp } from '../utils/timestampUtils';
 import { TerminalSessionManager } from './terminalSessionManager';
 import type { BaseAIPanelState, ToolPanelState, ToolPanel } from '../../../shared/types/panels';
 import type { AgentProvider, SessionAgentRuntime } from '../../../shared/types/agentRuntime';
@@ -182,21 +181,8 @@ export class SessionManager extends EventEmitter {
       status: this.mapDbStatusToSessionStatus(dbSession.status, dbSession.last_viewed_at, dbSession.updated_at),
       statusMessage: dbSession.status_message,
       pid: dbSession.pid,
-      createdAt: parseTimestamp(dbSession.created_at),
-      // The session's real last-ACTIVITY clock: idle_since (stamped at the
-      // busy→resting transition, migration 119) when the session is at rest,
-      // updated_at while it is still busy — a running session has no rest
-      // boundary, and its row IS being written as it works. This is the same
-      // COALESCE the quick-session board applies; deriving lastActivity from
-      // updated_at alone had the bug 119 exists to fix, since a rename, a
-      // folder move or the boot sweep would make a long-quiet session read as
-      // active moments ago in the sidebar.
-      //
-      // parseTimestamp, not `new Date`: both columns are space-separated UTC
-      // (SQLite CURRENT_TIMESTAMP / datetime('now')), which JS reads as LOCAL —
-      // a shift that pushed every recent row into the future and made the
-      // sidebar's "time ago" formatter collapse them all to "just now".
-      lastActivity: parseTimestamp(dbSession.idle_since ?? dbSession.updated_at),
+      createdAt: new Date(dbSession.created_at),
+      lastActivity: new Date(dbSession.updated_at),
       output: [], // Will be loaded separately by frontend when needed
       jsonMessages: [], // Will be loaded separately by frontend when needed
       error: dbSession.exit_code && dbSession.exit_code !== 0 ? `Exit code: ${dbSession.exit_code}` : undefined,

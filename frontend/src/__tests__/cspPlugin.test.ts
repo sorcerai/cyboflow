@@ -114,11 +114,10 @@ describe('script-src', () => {
     }
   });
 
-  it('allows the app bundle and nothing else — Monaco is self-hosted, not CDN-loaded', () => {
+  it('allows the app bundle and the Monaco CDN the editor panels load from', () => {
     const scriptSrc = parseDirectives(policy).get('script-src') ?? [];
     expect(scriptSrc).toContain(`'self'`);
-    expect(scriptSrc).not.toContain('https://cdn.jsdelivr.net');
-    expect(policy).not.toContain('jsdelivr');
+    expect(scriptSrc).toContain('https://cdn.jsdelivr.net');
   });
 });
 

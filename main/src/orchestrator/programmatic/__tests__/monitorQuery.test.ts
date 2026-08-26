@@ -18,9 +18,9 @@ const queryMock = vi.fn();
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: (...args: unknown[]) => queryMock(...args),
 }));
-
-/** Stand-in for the boot-resolved path the wiring site now injects as the factory's first argument. */
-const FAKE_CLAUDE_EXECUTABLE_PATH = '/fake/claude';
+vi.mock('../../../services/panels/claude/claudeExecutablePath', () => ({
+  resolveClaudeExecutablePath: () => '/fake/claude',
+}));
 
 import {
   makeSdkStructuredQuery,
@@ -54,7 +54,7 @@ describe('makeSdkStructuredQuery', () => {
       sdkAssistantText('thinking'),
       sdkResultSuccess({ structuredOutput: { decision: 'retry', rationale: 'flaky' } }),
     ]);
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkStructuredQuery();
 
     const out = await fn({ prompt: 'p', schema: { type: 'object' }, cwd: '/wt' });
 
@@ -63,7 +63,7 @@ describe('makeSdkStructuredQuery', () => {
 
   it('passes read-only tools, json_schema outputFormat, cwd, model, and a small maxTurns', async () => {
     yieldsMessages([sdkResultSuccess({ structuredOutput: {} })]);
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkStructuredQuery();
 
     await fn({ prompt: 'p', schema: { type: 'object' }, cwd: '/wt', model: 'opus' });
 
@@ -71,36 +71,27 @@ describe('makeSdkStructuredQuery', () => {
     expect(opts.cwd).toBe('/wt');
     expect(opts.model).toBe('opus');
     expect(opts.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
-    // Regression guard (`allowedTools` is AUTO-APPROVAL ONLY): `tools` is what
-    // removes Write/Edit/Bash and the user's MCP servers from the model's
-    // context. Without it a speculative tool_use spends a turn this query
-    // cannot spare. See the option block's comment for the measured numbers.
-    expect(opts.tools).toEqual(['Read', 'Grep', 'Glob']);
-    expect(opts.disallowedTools).toEqual(['mcp__*']);
-    expect(opts.settingSources).toEqual([]);
-    expect(opts.strictMcpConfig).toBe(true);
-    expect(opts.mcpServers).toEqual({});
     expect(opts.outputFormat).toEqual({ type: 'json_schema', schema: { type: 'object' } });
-    expect(opts.pathToClaudeCodeExecutable).toBe(FAKE_CLAUDE_EXECUTABLE_PATH);
+    expect(opts.pathToClaudeCodeExecutable).toBe('/fake/claude');
     expect(typeof opts.maxTurns).toBe('number');
     expect((opts.maxTurns as number) > 1).toBe(true);
   });
 
   it('returns null when no successful result is drained', async () => {
     yieldsMessages([sdkAssistantText([])]);
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkStructuredQuery();
     expect(await fn({ prompt: 'p', schema: {}, cwd: '/wt' })).toBeNull();
   });
 
   it('throws when the SDK iterator throws', async () => {
     install(makeRejectingQuery(new Error('sdk boom')));
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkStructuredQuery();
     await expect(fn({ prompt: 'p', schema: {}, cwd: '/wt' })).rejects.toThrow('sdk boom');
   });
 
   it('aborts and throws on timeout', async () => {
     install(makeBlockUntilAbortQuery());
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5);
+    const fn = makeSdkStructuredQuery(undefined, 5);
     await expect(fn({ prompt: 'p', schema: {}, cwd: '/wt' })).rejects.toThrow(/timed out/);
   });
 
@@ -110,7 +101,7 @@ describe('makeSdkStructuredQuery', () => {
       observedAbort = true;
     }));
     const controller = new AbortController();
-    const fn = makeSdkStructuredQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkStructuredQuery();
     const p = fn({ prompt: 'p', schema: {}, cwd: '/wt', signal: controller.signal });
     controller.abort();
     // The caller's abort must be bridged to the SDK's abortController (which ends the
@@ -132,40 +123,31 @@ describe('makeSdkTextQuery', () => {
       sdkAssistantText(['final ', 'answer']),
       sdkResultSuccess(),
     ]);
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkTextQuery();
 
     expect(await fn({ prompt: 'p', cwd: '/wt' })).toBe('final answer');
   });
 
   it("returns '' when there is no assistant message", async () => {
     yieldsMessages([sdkResultSuccess()]);
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkTextQuery();
     expect(await fn({ prompt: 'p', cwd: '/wt' })).toBe('');
   });
 
   it('uses NO outputFormat and read-only tools', async () => {
     yieldsMessages([sdkAssistantText('hi')]);
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkTextQuery();
 
     await fn({ prompt: 'p', cwd: '/wt' });
 
     const opts = lastOptions as Record<string, unknown>;
     expect(opts.outputFormat).toBeUndefined();
     expect(opts.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
-    // Regression guard (`allowedTools` is AUTO-APPROVAL ONLY): `tools` is what
-    // removes Write/Edit/Bash and the user's MCP servers from the model's
-    // context. Without it a speculative tool_use spends a turn this query
-    // cannot spare. See the option block's comment for the measured numbers.
-    expect(opts.tools).toEqual(['Read', 'Grep', 'Glob']);
-    expect(opts.disallowedTools).toEqual(['mcp__*']);
-    expect(opts.settingSources).toEqual([]);
-    expect(opts.strictMcpConfig).toBe(true);
-    expect(opts.mcpServers).toEqual({});
   });
 
   it('throws when the SDK iterator throws BEFORE the monitor speaks (no partial to show)', async () => {
     install(makeRejectingQuery(new Error('text boom')));
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkTextQuery();
     await expect(fn({ prompt: 'p', cwd: '/wt' })).rejects.toThrow('text boom');
   });
 
@@ -180,13 +162,13 @@ describe('makeSdkTextQuery', () => {
         new Error('Claude Code returned an error result: Reached maximum number of turns (24)'),
       ),
     );
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeSdkTextQuery();
     expect(await fn({ prompt: 'p', cwd: '/wt' })).toBe('partial state summary');
   });
 
   it('aborts and throws on timeout', async () => {
     install(makeBlockUntilAbortQuery());
-    const fn = makeSdkTextQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5);
+    const fn = makeSdkTextQuery(undefined, 5);
     await expect(fn({ prompt: 'p', cwd: '/wt' })).rejects.toThrow(/timed out/);
   });
 });

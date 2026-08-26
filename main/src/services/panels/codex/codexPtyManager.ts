@@ -229,15 +229,14 @@ export class CodexPtyManager extends AbstractCliManager {
     return {};
   }
 
-  // Keyed by panelId, not by scanning `this.processes` for `sessionId` matches
-  // — a session can host several Codex PTY panels (Add-chat), and the scan
-  // form deleted panelRunIds/ptyBacklog for EVERY panel in the session,
-  // including a still-live sibling whose process had not exited.
-  protected async cleanupCliResources(panelId: string, _sessionId: string): Promise<void> {
-    const runId = this.panelRunIds.get(panelId);
-    this.panelRunIds.delete(panelId);
-    if (runId) {
-      this.ptyBacklog.delete(runId);
+  protected async cleanupCliResources(sessionId: string): Promise<void> {
+    for (const [panelId, process] of this.processes.entries()) {
+      if (process.sessionId !== sessionId) continue;
+      const runId = this.panelRunIds.get(panelId);
+      this.panelRunIds.delete(panelId);
+      if (runId) {
+        this.ptyBacklog.delete(runId);
+      }
     }
   }
 

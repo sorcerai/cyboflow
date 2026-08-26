@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { flushSync } from 'react-dom';
-import '../../../utils/monacoLoader';
 import Editor from '@monaco-editor/react';
 import type * as monaco from 'monaco-editor';
 import { ChevronRight, ChevronDown, File, Folder, RefreshCw, Plus, Trash2, FolderPlus, Search, X, Eye, Code } from 'lucide-react';

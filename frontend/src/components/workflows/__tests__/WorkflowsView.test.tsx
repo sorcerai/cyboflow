@@ -16,8 +16,6 @@
  *      model-picker control.
  *   5. The Agents section feature-gates to an empty-state when no agents.
  *   6. The no-projects probe drives the create-project CTA.
- *   7. The Plugins section folds a plugin's per-project install records into
- *      one card, with an install count + user-scope hint on the fan-out.
  */
 import '@testing-library/jest-dom';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
@@ -353,55 +351,6 @@ describe('GalleryStacked', () => {
     expect(screen.getByTestId('plugin-card-frontend-design')).toBeInTheDocument();
     // Read-only — no Edit/New affordance in either section.
     expect(screen.queryByTestId('mcp-card-edit-peekaboo')).not.toBeInTheDocument();
-  });
-
-  it('folds a plugin\'s per-worktree install records into ONE card with a scope hint', () => {
-    // Mirrors the real catalogue: one id installed at local scope in each
-    // worktree of a repo, which previously rendered one identical card each.
-    const worktreeInstalls = ['a', 'b', 'c', 'd'].map((wt) =>
-      buildPluginEntry({
-        id: 'soloflow-dev@soloflow',
-        name: 'soloflow-dev',
-        marketplace: 'soloflow',
-        scope: 'local',
-        version: '0.11.0',
-        projectPath: `/repo/worktrees/${wt}`,
-      }),
-    );
-    render(
-      <GalleryStacked
-        workflows={[buildWorkflowEntry()]}
-        agents={[]}
-        mcps={[]}
-        plugins={[buildPluginEntry(), ...worktreeInstalls]}
-        showProjectChip={false}
-        agentsUnavailable={true}
-      />,
-    );
-    // Two ids -> two cards, not five.
-    expect(screen.getByTestId('gallery-section-plugins-count')).toHaveTextContent('2');
-    expect(screen.getAllByTestId('plugin-card-soloflow-dev')).toHaveLength(1);
-    expect(screen.getByTestId('plugin-card-soloflow-dev-installs')).toHaveTextContent('4');
-    expect(screen.getByTestId('plugin-card-soloflow-dev-scope-hint')).toHaveTextContent(
-      /4 project installs/,
-    );
-  });
-
-  it('shows no install count or scope hint for a single user-scope install', () => {
-    render(
-      <GalleryStacked
-        workflows={[buildWorkflowEntry()]}
-        agents={[]}
-        mcps={[]}
-        plugins={[buildPluginEntry()]}
-        showProjectChip={false}
-        agentsUnavailable={true}
-      />,
-    );
-    expect(screen.queryByTestId('plugin-card-frontend-design-installs')).not.toBeInTheDocument();
-    expect(
-      screen.queryByTestId('plugin-card-frontend-design-scope-hint'),
-    ).not.toBeInTheDocument();
   });
 
   it('shows empty-states for the MCPs + Plugins sections when both are empty', () => {

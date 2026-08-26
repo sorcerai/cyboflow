@@ -3,7 +3,7 @@
  *
  * The two invariants that make the wrapper safe to ship live here, not in the
  * render path: the peel order really is a clockwise-from-top-left spiral (the
- * whole metaphor rests on it), and the reveal is complete at step 6 — the first
+ * whole metaphor rests on it), and the reveal is complete at step 5 — the first
  * coachmark step, which anchors to live UI and so cannot tolerate a surviving
  * tile or any residual blur. The component's DOM is deliberately not asserted;
  * it is presentational and its motion is CSS-transition-driven.
@@ -44,31 +44,30 @@ describe('spiralRanks', () => {
 describe('revealFraction', () => {
   it('is fully wrapped at the welcome step and fully open at the first coach step', () => {
     expect(revealFraction(0)).toBe(0);
-    expect(revealFraction(6)).toBe(1);
+    expect(revealFraction(5)).toBe(1);
   });
 
   it('opens one even band per modal-step advance', () => {
-    expect(revealFraction(1)).toBeCloseTo(1 / 6);
-    expect(revealFraction(2)).toBeCloseTo(2 / 6);
-    expect(revealFraction(3)).toBeCloseTo(3 / 6);
-    expect(revealFraction(4)).toBeCloseTo(4 / 6);
-    expect(revealFraction(5)).toBeCloseTo(5 / 6);
+    expect(revealFraction(1)).toBeCloseTo(0.2);
+    expect(revealFraction(2)).toBeCloseTo(0.4);
+    expect(revealFraction(3)).toBeCloseTo(0.6);
+    expect(revealFraction(4)).toBeCloseTo(0.8);
   });
 
   it('stays clamped past the coach steps and the closing rail-map card', () => {
-    for (const step of [7, 10, 11, 12, 99]) expect(revealFraction(step)).toBe(1);
+    for (const step of [6, 9, 10, 11, 99]) expect(revealFraction(step)).toBe(1);
     expect(revealFraction(-3)).toBe(0);
   });
 });
 
 describe('hiddenTileCount', () => {
-  it('leaves the wrapper intact at step 0 and fully gone by step 6', () => {
+  it('leaves the wrapper intact at step 0 and fully gone by step 5', () => {
     expect(hiddenTileCount(0)).toBe(0);
-    expect(hiddenTileCount(6)).toBe(36);
+    expect(hiddenTileCount(5)).toBe(36);
   });
 
   it('never regresses as the tour advances', () => {
-    const counts = [0, 1, 2, 3, 4, 5, 6].map((s) => hiddenTileCount(s));
+    const counts = [0, 1, 2, 3, 4, 5].map((s) => hiddenTileCount(s));
     for (let i = 1; i < counts.length; i++) expect(counts[i]).toBeGreaterThan(counts[i - 1]);
   });
 

@@ -7,22 +7,18 @@
  * OnboardingGate also reads revealFraction from here to drive the modal scrim.
  */
 
-/** Tiles per side. 6×6 = 36 tiles ≈ 6 per band across the 6 transitions. */
+/** Tiles per side. 6×6 = 36 tiles ≈ 7 per band across the 5 transitions. */
 export const SPIRAL_GRID = 6;
 export const SPIRAL_TILE_COUNT = SPIRAL_GRID * SPIRAL_GRID;
 
 /**
  * The step at which the app is fully exposed — NOT the end of the tour.
- * Transitions 0→1→…→6 each peel ~1/6 of the sheet, landing at 100% exactly
- * as the first coachmark mounts. Steps 6–11 anchor to real UI (quick-session
+ * Transitions 0→1→2→3→4→5 each peel ~1/5 of the sheet, landing at 100% exactly
+ * as the first coachmark mounts. Steps 5–10 anchor to real UI (quick-session
  * card, model picker, ship chip) and cannot point into a covered or blurred
- * app, so the last tile must be gone the moment step 6 renders.
- *
- * A run that SKIPS the conditional Default-agent step (2) peels two bands in one
- * transition; the wrapper is a progress flourish, not a step counter, so landing
- * fully open on the same step is what matters.
+ * app, so the last tile must be gone the moment step 5 renders.
  */
-export const REVEAL_COMPLETE_STEP = 6;
+export const REVEAL_COMPLETE_STEP = 5;
 
 /**
  * Spiral rank per tile: `ranks[flatIndex]` = that tile's position in a clockwise

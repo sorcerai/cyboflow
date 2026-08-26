@@ -19,7 +19,7 @@ import type { CliSubstrate } from './substrate';
  * because `z.enum` needs a non-empty readonly tuple of string literals; the
  * `AgentProvider` union is derived FROM it so the two cannot drift.
  */
-export const AGENT_PROVIDERS = ['claude', 'codex', 'omp'] as const;
+export const AGENT_PROVIDERS = ['claude', 'codex', 'omp', 'pi'] as const;
 
 export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
 
@@ -43,6 +43,8 @@ export const ALL_AGENT_RUNTIMES = [
   'omp-sdk',
   'omp-pty',
   'omp-fleet',
+  'pi-sdk',
+  'pi-pty',
 ] as const;
 
 export type AgentRuntime = (typeof ALL_AGENT_RUNTIMES)[number];
@@ -79,6 +81,7 @@ export const WORKFLOW_RUN_STORABLE_RUNTIMES = [
   'codex-sdk',
   'omp-sdk',
   'omp-fleet',
+  'pi-sdk',
 ] as const;
 
 export type WorkflowRunStorableRuntime = (typeof WORKFLOW_RUN_STORABLE_RUNTIMES)[number];
@@ -96,6 +99,17 @@ export const WORKFLOW_LAUNCHABLE_RUNTIMES = [
   'claude-interactive',
   'codex-sdk',
   'omp-sdk',
+  // Structured JSON-events lane (pi --mode json): per-step events, usage and
+  // tool results reach Cyboflow the same way the SDK lanes of claude/codex/omp
+  // do, so workflows may deploy on it. pi-pty stays excluded for the same
+  // keystroke-TUI reason as codex-pty/omp-pty.
+  //
+  // Gating note: an embedded tool_call extension enforces the session's
+  // permission mode inside the child (read-only passes under default/
+  // acceptEdits/auto; write-tier blocks with an actionable reason). What is
+  // NOT built yet is an interactive approval prompt — dontAsk remains the
+  // only way to run write-tier steps unattended.
+  'pi-sdk',
 ] as const;
 
 export type WorkflowLaunchableRuntime = (typeof WORKFLOW_LAUNCHABLE_RUNTIMES)[number];
@@ -116,22 +130,6 @@ export const WORKFLOW_AGENT_RUNTIMES = WORKFLOW_LAUNCHABLE_RUNTIMES;
 export type WorkflowAgentRuntime = WorkflowLaunchableRuntime;
 
 export const DEFAULT_AGENT_PROVIDER: AgentProvider = 'claude';
-
-/**
- * The runtime a PROVIDER-level choice resolves to — the structured (SDK) lane
- * of each provider, which is the one every launch surface can honour (workflow
- * runs included; the CLI runtimes are quick-session-only).
- *
- * Exists for surfaces that ask "which agent?" rather than "which transport?" —
- * today the onboarding Default-agent step, which writes the answer into
- * `AppConfig.defaultAgentRuntime`. `providerForRuntime` is the inverse and is
- * what seeds such a surface back off a persisted runtime.
- */
-export const PROVIDER_DEFAULT_RUNTIME: Readonly<Record<AgentProvider, WorkflowLaunchableRuntime>> = {
-  claude: 'claude-sdk',
-  codex: 'codex-sdk',
-  omp: 'omp-sdk',
-};
 export const DEFAULT_SESSION_AGENT_RUNTIME: SessionAgentRuntime = 'claude-sdk';
 export const DEFAULT_WORKFLOW_AGENT_RUNTIME: WorkflowLaunchableRuntime = 'claude-sdk';
 
@@ -143,6 +141,8 @@ export const SESSION_AGENT_RUNTIMES = [
   'omp-sdk',
   'omp-pty',
   'omp-fleet',
+  'pi-sdk',
+  'pi-pty',
 ] as const;
 
 /** Human labels for the workflow-scoped runtime picker. Single source shared by
@@ -152,6 +152,7 @@ export const WORKFLOW_AGENT_RUNTIME_LABELS: Record<WorkflowLaunchableRuntime, st
   'claude-interactive': 'Claude Interactive (CLI)',
   'codex-sdk': 'Codex SDK',
   'omp-sdk': 'OMP',
+  'pi-sdk': 'Pi',
 };
 
 /**
@@ -180,6 +181,8 @@ export const AGENT_RUNTIME_LABELS: Record<SessionAgentRuntime, string> = {
   'omp-sdk': 'OMP',
   'omp-pty': 'OMP (CLI)',
   'omp-fleet': 'OMP fleet',
+  'pi-sdk': 'Pi',
+  'pi-pty': 'Pi (CLI)',
 };
 
 // ---------------------------------------------------------------------------
@@ -232,6 +235,11 @@ export const AGENT_PROVIDER_REGISTRY: Readonly<Record<AgentProvider, AgentProvid
   // fleet-session launch both respect the same toggle. See
   // `AgentProviderDefinition.defaultEnabled`.
   omp: { runtimePrefix: 'omp-', defaultEnabled: false },
+  // Pi — the terminal coding agent OMP forked from, integrated natively
+  // (spawned binary, no bridge). Post-toggle provider like omp: an absent
+  // access key defaults DISABLED so installs that never touched Settings →
+  // Integrations keep every `pi-` runtime off until an explicit opt-in.
+  pi: { runtimePrefix: 'pi-', defaultEnabled: false },
 };
 
 /**
@@ -245,6 +253,7 @@ export const AGENT_PROVIDER_LABELS: Record<AgentProvider, string> = {
   claude: 'Claude',
   codex: 'Codex',
   omp: 'OMP',
+  pi: 'Pi',
 };
 
 export const AGENT_PROVIDER_TABLE: AgentProviderTable<AgentProvider> = {

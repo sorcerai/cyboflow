@@ -1,6 +1,6 @@
 /**
- * LandingHome — the quick-session triage board is mounted in EVERY non-empty
- * home state, not only `reviews`.
+ * LandingHome — the quick-session board is mounted in EVERY non-empty home
+ * state, not only `reviews`.
  *
  * Regression for the "board vanishes on open" bug: opening an idle quick session
  * from the queue marks it viewed, which drops it out of the attention count. If
@@ -8,7 +8,7 @@
  * `reviews` to `caught-up` / `some-idle` / `all-active`. The board used to live
  * ONLY inside TypeGroupedQueue (rendered only in `reviews`), so it disappeared
  * across that transition. These tests pin that the board is present in the other
- * non-empty states too. SessionTriageGroups is stubbed to a sentinel — this is a
+ * non-empty states too. QuickSessionsTable is stubbed to a sentinel — this is a
  * wiring test for LandingHome's layout branches, not the board's internals.
  */
 import '@testing-library/jest-dom';
@@ -54,8 +54,8 @@ vi.mock('../landing/ActiveAgents', () => ({ ActiveAgents: () => <div data-testid
 vi.mock('../landing/IdleStartList', () => ({ IdleStartList: () => <div data-testid="idle-start-list" /> }));
 vi.mock('../landing/CaughtUpHero', () => ({ CaughtUpHero: () => <div data-testid="caught-up-hero" /> }));
 vi.mock('../landing/EndCta', () => ({ EndCta: () => <div data-testid="end-cta" /> }));
-vi.mock('../landing/SessionTriageGroups', () => ({
-  SessionTriageGroups: () => <div data-testid="quick-sessions-board" />,
+vi.mock('../landing/QuickSessionsTable', () => ({
+  QuickSessionsTable: () => <div data-testid="quick-sessions-board" />,
 }));
 
 import LandingHome from '../landing/LandingHome';
@@ -69,15 +69,6 @@ function quickRow(overrides: Partial<QuickSessionRow> = {}): QuickSessionRow {
     state: overrides.state ?? 'idle',
     idleSince: overrides.idleSince ?? '2026-07-06T00:00:00.000Z',
     unviewed: overrides.unviewed ?? false,
-    restedAtIso: overrides.restedAtIso ?? '2026-07-06T00:00:00.000Z',
-    rawStatus: overrides.rawStatus ?? 'completed',
-    exitCode: overrides.exitCode ?? null,
-    summary: overrides.summary ?? null,
-    summaryState: overrides.summaryState ?? null,
-    waitingOn: overrides.waitingOn ?? null,
-    summarySupported: overrides.summarySupported ?? true,
-    worktreeName: overrides.worktreeName ?? null,
-    git: overrides.git ?? null,
   };
 }
 

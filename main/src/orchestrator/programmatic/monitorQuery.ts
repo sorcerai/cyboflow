@@ -29,8 +29,9 @@
  */
 import { loadSdkQuery } from '../../utils/lazyAgentSdk';
 import type { LoggerLike } from '../types';
+import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
 import { emitSeamError } from '../telemetrySink';
-import { classifyErrorPattern, unclassifiedErrorTags } from './systemicError';
+import { classifyErrorPattern } from './systemicError';
 
 /**
  * Default deadline for a single monitor query (triage OR answer). A hung claude
@@ -131,13 +132,8 @@ function makeDeadline(timeoutMs: number, signal?: AbortSignal): {
  * emitting the structured verdict enforced by `schema`. Returns the structured
  * output (or null on drain-without-result; the brain falls back to 'escalate').
  * On timeout/error: aborts and THROWS (the brain escalates).
- *
- * @param claudeExecutablePath The packaged-build native-binary path resolved once
- * at boot by `resolveClaudeExecutablePath()` (services layer) and threaded in by
- * the wiring site — `undefined` in dev, which lets the SDK resolve it itself.
  */
 export function makeSdkStructuredQuery(
-  claudeExecutablePath: string | undefined,
   logger?: LoggerLike,
   timeoutMs: number = SUPERVISOR_QUERY_TIMEOUT_MS,
 ): StructuredQueryFn {
@@ -156,19 +152,8 @@ export function makeSdkStructuredQuery(
           cwd,
           ...(model ? { model } : {}),
           maxTurns: MONITOR_MAX_TURNS,
-          // HARD availability ceiling. `allowedTools` governs AUTO-APPROVAL ONLY
-          // (SDK contract: "To restrict which tools are available, use the
-          // `tools` option instead"), so listing the read-only set there alone
-          // left Write/Edit/Bash — and every user-configured MCP server — in
-          // this query's context. `tools` is what makes the restriction real.
-          // Same hermetic set as `orchestrator/verify/verificationAgentQuery.ts`.
-          tools: [...MONITOR_ALLOWED_TOOLS],
           allowedTools: [...MONITOR_ALLOWED_TOOLS],
-          disallowedTools: ['mcp__*'],
-          settingSources: [],
-          strictMcpConfig: true,
-          mcpServers: {},
-          pathToClaudeCodeExecutable: claudeExecutablePath,
+          pathToClaudeCodeExecutable: resolveClaudeExecutablePath(),
           outputFormat: { type: 'json_schema', schema },
           abortController: controller,
         },
@@ -195,7 +180,6 @@ export function makeSdkStructuredQuery(
         queryKind: 'triage',
         timedOut: String(didTimeOut()),
         errorClass: triageErrorClass,
-        ...unclassifiedErrorTags(triageErrorClass, message),
       });
       throw new Error(message);
     } finally {
@@ -209,13 +193,8 @@ export function makeSdkStructuredQuery(
  * monitor may inspect the worktree (read-only tools, up to `MONITOR_MAX_TURNS`) and
  * returns the concatenated text of the LAST assistant message ('' if none). On
  * timeout/error: aborts and THROWS (the brain returns an apologetic answer).
- *
- * @param claudeExecutablePath The packaged-build native-binary path resolved once
- * at boot by `resolveClaudeExecutablePath()` (services layer) and threaded in by
- * the wiring site — `undefined` in dev, which lets the SDK resolve it itself.
  */
 export function makeSdkTextQuery(
-  claudeExecutablePath: string | undefined,
   logger?: LoggerLike,
   timeoutMs: number = SUPERVISOR_QUERY_TIMEOUT_MS,
 ): TextQueryFn {
@@ -237,19 +216,8 @@ export function makeSdkTextQuery(
           cwd,
           ...(model ? { model } : {}),
           maxTurns: MONITOR_MAX_TURNS,
-          // HARD availability ceiling. `allowedTools` governs AUTO-APPROVAL ONLY
-          // (SDK contract: "To restrict which tools are available, use the
-          // `tools` option instead"), so listing the read-only set there alone
-          // left Write/Edit/Bash — and every user-configured MCP server — in
-          // this query's context. `tools` is what makes the restriction real.
-          // Same hermetic set as `orchestrator/verify/verificationAgentQuery.ts`.
-          tools: [...MONITOR_ALLOWED_TOOLS],
           allowedTools: [...MONITOR_ALLOWED_TOOLS],
-          disallowedTools: ['mcp__*'],
-          settingSources: [],
-          strictMcpConfig: true,
-          mcpServers: {},
-          pathToClaudeCodeExecutable: claudeExecutablePath,
+          pathToClaudeCodeExecutable: resolveClaudeExecutablePath(),
           abortController: controller,
         },
       });
@@ -275,7 +243,6 @@ export function makeSdkTextQuery(
         queryKind: 'answer',
         timedOut: String(didTimeOut()),
         errorClass: answerErrorClass,
-        ...unclassifiedErrorTags(answerErrorClass, message),
       });
       // Graceful degradation: if the monitor produced a partial answer before the
       // error (a turn-cap hit mid-investigation, a timeout after it spoke), surface

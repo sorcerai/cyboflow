@@ -10,14 +10,9 @@ import { Modal, ModalHeader, ModalBody } from './ui/Modal';
 import { useConfigStore } from '../stores/configStore';
 import { useUpdater } from '../hooks/useUpdater';
 import { trackEvent } from '../utils/telemetry';
-import { skippedStepSet, useOnboardingStore } from '../stores/onboardingStore';
+import { useOnboardingStore } from '../stores/onboardingStore';
 import { useNavigationStore } from '../stores/navigationStore';
-import {
-  ONBOARDING_ANCHOR_ATTR,
-  ONBOARDING_ANCHORS,
-  visibleStepNumber,
-  visibleStepTotal,
-} from '../utils/onboarding';
+import { ONBOARDING_ANCHOR_ATTR, ONBOARDING_ANCHORS, ONBOARDING_STEP_COUNT } from '../utils/onboarding';
 
 interface SidebarProps {
   onAboutClick: () => void;
@@ -101,9 +96,6 @@ export const Sidebar = memo(function Sidebar({
   const onboardingHydrated = useOnboardingStore((state) => state.hydrated);
   const onboardingStatus = useOnboardingStore((state) => state.status);
   const onboardingStep = useOnboardingStore((state) => state.step);
-  // The tour may skip its one conditional step, so "Step n of N" has to count
-  // what this run actually shows (skippedStepSet returns stable identities).
-  const onboardingSkipped = useOnboardingStore((state) => skippedStepSet(state));
   const showResumeSetup =
     onboardingHydrated && (onboardingStatus === 'skipped' || onboardingStatus === 'pending');
   const demoModeEnabled = useConfigStore((state) => state.config?.demoMode ?? false);
@@ -270,8 +262,7 @@ export const Sidebar = memo(function Sidebar({
               <span className="min-w-0 flex-1">
                 <span className="block text-[11.5px] font-bold leading-tight text-text-primary">Resume setup</span>
                 <span className="block text-[10px] text-text-secondary">
-                  Step {visibleStepNumber(onboardingStep, onboardingSkipped)} of{' '}
-                  {visibleStepTotal(onboardingSkipped)}
+                  Step {onboardingStep + 1} of {ONBOARDING_STEP_COUNT}
                 </span>
               </span>
               <span className="flex-shrink-0 text-interactive" aria-hidden="true">

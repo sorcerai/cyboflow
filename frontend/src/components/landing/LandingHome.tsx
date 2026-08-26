@@ -13,14 +13,14 @@
  *   - `empty`      → {@link EmptyState} (self-centering).
  *   - `reviews`    → scroll column: {@link SubHeader} (reviews) +
  *                    {@link TypeGroupedQueue} + {@link ActiveAgents} + {@link EndCta}.
- *   - `caught-up`  → centered {@link CaughtUpHero} (scroll column with the triage
- *                    groups beneath it when any quick session exists).
+ *   - `caught-up`  → centered {@link CaughtUpHero} (scroll column with the board
+ *                    beneath it when any quick session exists).
  *   - `some-idle`  → {@link SubHeader} (none, not-all-active) + {@link ActiveAgents}
- *                    + {@link SessionTriageGroups} + {@link IdleStartList} + {@link EndCta}.
+ *                    + {@link QuickSessionsTable} + {@link IdleStartList} + {@link EndCta}.
  *   - `all-active` → {@link SubHeader} (none, all-active) + {@link ActiveAgents}
- *                    + {@link SessionTriageGroups} + {@link EndCta}.
+ *                    + {@link QuickSessionsTable} + {@link EndCta}.
  *
- * The live {@link SessionTriageGroups} board renders in EVERY non-empty state
+ * The live {@link QuickSessionsTable} board renders in EVERY non-empty state
  * (inside {@link TypeGroupedQueue} for `reviews`, standalone otherwise), so it
  * never disappears just because nothing needs attention. Opening an idle session
  * marks it viewed, which can drop `waitingCount` to 0 and flip the home out of
@@ -42,7 +42,7 @@ import type { QueueItem } from '../../utils/reviewQueueSelectors';
 import { EmptyState } from './EmptyState';
 import { SubHeader } from './SubHeader';
 import { TypeGroupedQueue } from './TypeGroupedQueue';
-import { SessionTriageGroups } from './SessionTriageGroups';
+import { QuickSessionsTable } from './QuickSessionsTable';
 import { ActiveAgents } from './ActiveAgents';
 import { IdleStartList } from './IdleStartList';
 import { CaughtUpHero } from './CaughtUpHero';
@@ -99,7 +99,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
   }, []);
   const activeDynamicWorkflows = useActiveDynamicWorkflows();
 
-  // Live quick-session board feed. Init here (not only in SessionTriageGroups) so
+  // Live quick-session board feed. Init here (not only in QuickSessionsTable) so
   // the attention count is available to decide whether the review queue mounts
   // at all — otherwise a blocked/idle quick session could never surface the
   // queue that would show it (chicken-and-egg). Ref-counted, so the table's own
@@ -184,7 +184,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
             <CaughtUpHero />
             <div className="mt-8">
               <ProviderUsageCards />
-              <SessionTriageGroups />
+              <QuickSessionsTable />
             </div>
           </div>
         </div>
@@ -238,7 +238,7 @@ export default function LandingHome({ focusQueue = false }: LandingHomeProps): R
         />
         <ProviderUsageCards />
         <ActiveAgents />
-        <SessionTriageGroups />
+        <QuickSessionsTable />
         {!allActive && <IdleStartList />}
         <EndCta />
       </div>

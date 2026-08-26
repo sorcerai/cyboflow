@@ -1,7 +1,7 @@
 import type { DatabaseService } from '../database/database';
 import type { Session, ConversationMessage, PromptMarker, ExecutionDiff } from '../database/models';
 import type { SessionOutput } from '../types/session';
-import { formatDuration, getTimeDifference } from './timestampUtils';
+import { formatDuration, getTimeDifference, parseTimestamp } from './timestampUtils';
 
 interface CompactionData {
   session: Session;

@@ -87,6 +87,24 @@ export const OMP_PTY_CAVEATS: readonly string[] = [
   'Approvals stay in the OMP CLI — no Cyboflow review-queue integration.',
 ];
 
+/**
+ * The v1 limits of the Pi structured (pi-sdk) lane. A tool_call gate enforces
+ * the session's permission mode inside the spawned process (read-only tools
+ * pass under default/acceptEdits/auto; everything passes only in dontAsk),
+ * but there is no interactive approval prompt yet — gated writes are BLOCKED,
+ * not queued for review.
+ */
+export const PI_SDK_CAVEATS: readonly string[] = [
+  'Write-tier tools are blocked unless the session permission mode is dontAsk — no interactive approval prompt yet.',
+  'No mid-turn steering: the next message queues until the current turn finishes.',
+  'Tool activity is not shown in the transcript; only final text per turn.',
+];
+
+/** The v1 limits of the Pi CLI (pi-pty) lane. */
+export const PI_PTY_CAVEATS: readonly string[] = [
+  'Approvals stay inside the pi TUI — no Cyboflow review-queue integration.',
+];
+
 interface SubstrateSelectorProps {
   value: LaunchAgentRuntime;
   onChange: (runtime: LaunchAgentRuntime) => void;
@@ -111,10 +129,21 @@ const RUNTIME_SCOPE_SUFFIXES: Partial<Record<LaunchAgentRuntime, string>> = {
   'claude-sdk': ' (default)',
   'codex-pty': ' — quick sessions only',
   'omp-fleet': ' — quick sessions only',
+  'pi-pty': ' — quick sessions only',
 };
 
 const RUNTIME_OPTIONS: readonly { runtime: LaunchAgentRuntime; label: string }[] = (
-  ['claude-sdk', 'claude-interactive', 'codex-sdk', 'codex-pty', 'omp-sdk', 'omp-pty', 'omp-fleet'] as const
+  [
+    'claude-sdk',
+    'claude-interactive',
+    'codex-sdk',
+    'codex-pty',
+    'omp-sdk',
+    'omp-pty',
+    'omp-fleet',
+    'pi-sdk',
+    'pi-pty',
+  ] as const
 ).map((runtime) => ({
   runtime,
   label: `${AGENT_RUNTIME_LABELS[runtime]}${RUNTIME_SCOPE_SUFFIXES[runtime] ?? ''}`,
@@ -379,6 +408,12 @@ export function SubstrateSelector({
       )}
       {value === 'omp-pty' && (
         <CaveatsPanel testId={caveatsTestId} title="OMP (CLI) — v1 limits" items={OMP_PTY_CAVEATS} />
+      )}
+      {value === 'pi-sdk' && (
+        <CaveatsPanel testId={caveatsTestId} title="Pi — v1 limits" items={PI_SDK_CAVEATS} />
+      )}
+      {value === 'pi-pty' && (
+        <CaveatsPanel testId={caveatsTestId} title="Pi (CLI) — v1 limits" items={PI_PTY_CAVEATS} />
       )}
     </div>
   );

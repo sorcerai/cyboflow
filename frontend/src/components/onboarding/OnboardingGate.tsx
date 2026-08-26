@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { PROVIDER_DEFAULT_RUNTIME, providerForRuntime } from '../../../../shared/types/agentRuntime';
 import type { ProviderDetectionResult } from '../../../../shared/types/onboarding';
 import { PROVIDERS_DETECT_CHANNEL } from '../../../../shared/types/onboarding';
 import type { Project } from '../../types/project';
@@ -8,13 +7,11 @@ import { API } from '../../utils/api';
 import { useConfigStore } from '../../stores/configStore';
 import { useNavigationStore } from '../../stores/navigationStore';
 import {
-  activatedProviders,
   isNextGateBlocked,
-  skippedStepSet,
   useOnboardingStore,
   type OnboardingRealEvent,
   type PersistedOnboarding,
-  type PersistedOnboardingV3,
+  type PersistedOnboardingV2,
 } from '../../stores/onboardingStore';
 import { onboardingTelemetryEvents } from '../../stores/onboardingTelemetry';
 import { ONBOARDING_EVENTS, ONBOARDING_MODAL_STEPS, ONBOARDING_PREF_KEY } from '../../utils/onboarding';
@@ -29,17 +26,16 @@ import { ConnectStep } from './steps/ConnectStep';
 import { PermissionStep } from './steps/PermissionStep';
 import { TelemetryStep, type TelemetryDraft } from './steps/TelemetryStep';
 import { AddProjectStep } from './steps/AddProjectStep';
-import { DefaultRuntimeStep } from './steps/DefaultRuntimeStep';
 import { RailMapStep } from './steps/RailMapStep';
 
 /**
  * OnboardingGate — the single side-effect host around the pure onboardingStore.
  * Owns boot hydration (pref snapshot + project count, gated so nothing renders
  * until resolved — the no-flash rule), snapshot persistence, real-action event
- * forwarding, arrow-key navigation, the step-1 credential probe, the step-6
- * wizard precondition, and the step-2/step-3/step-4/step-5 config/project side
- * effects (default agent runtime, permission mode, telemetry consent,
- * add-project). The store stays synchronously testable; every async lives here.
+ * forwarding, arrow-key navigation, the step-1 credential probe, the step-5
+ * wizard precondition, and the step-2/step-3/step-4 config/project side effects
+ * (permission mode, telemetry consent, add-project). The store stays
+ * synchronously testable; every async lives here.
  *
  * Mounted once, app-wide, from App.tsx. Renders the overlay only while the tour
  * is 'active' (skipped/pending/completed render nothing — the Sidebar owns the
@@ -83,8 +79,6 @@ export function OnboardingGate(): React.JSX.Element | null {
   const ompDetection = useOnboardingStore((s) => s.ompDetection);
   const ompConnected = useOnboardingStore((s) => s.ompConnected);
   const permMode = useOnboardingStore((s) => s.permMode);
-  const defaultProvider = useOnboardingStore((s) => s.defaultProvider);
-  const multiRuntime = useOnboardingStore((s) => s.multiRuntime);
 
   const hydrate = useOnboardingStore((s) => s.hydrate);
   const next = useOnboardingStore((s) => s.next);
@@ -99,7 +93,6 @@ export function OnboardingGate(): React.JSX.Element | null {
   const setOmpDetection = useOnboardingStore((s) => s.setOmpDetection);
   const setOmpConnected = useOnboardingStore((s) => s.setOmpConnected);
   const setPermMode = useOnboardingStore((s) => s.setPermMode);
-  const setDefaultProvider = useOnboardingStore((s) => s.setDefaultProvider);
   const anchorActioned = useOnboardingStore((s) => s.anchorActioned);
   const realEvent = useOnboardingStore((s) => s.realEvent);
 
@@ -107,13 +100,13 @@ export function OnboardingGate(): React.JSX.Element | null {
   const [checking, setChecking] = useState(false);
   const [pickedPath, setPickedPath] = useState<string | null>(null);
   const [busyCreate, setBusyCreate] = useState(false);
-  // Step-4 (telemetry) draft, resolved fresh from AppConfig.telemetry every
-  // time step 4 is (re-)entered — see the resolve effect below. null = not yet
+  // Step-3 (telemetry) draft, resolved fresh from AppConfig.telemetry every
+  // time step 3 is (re-)entered — see the resolve effect below. null = not yet
   // resolved (config not loaded, or step just entered before config's around).
   const [telemetryDraft, setTelemetryDraft] = useState<TelemetryDraft | null>(null);
   const [telemetrySubmitting, setTelemetrySubmitting] = useState(false);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
-  // Snapshot of the resolved config at step-4 entry — the diff base for which
+  // Snapshot of the resolved config at step-3 entry — the diff base for which
   // channel(s) actually changed (telemetry_opt_out_changed fires per-changed-
   // channel only, never for an unchanged one).
   const telemetryBaselineRef = useRef<TelemetryDraft | null>(null);
@@ -124,7 +117,7 @@ export function OnboardingGate(): React.JSX.Element | null {
     return useOnboardingStore.subscribe((state, prev) => {
       if (!state.hydrated || state.status === 'idle') return;
       if (state.status === prev.status && state.step === prev.step) return;
-      const snapshot: PersistedOnboardingV3 = { version: 3, status: state.status, step: state.step };
+      const snapshot: PersistedOnboardingV2 = { version: 2, status: state.status, step: state.step };
       void window.electron?.invoke('preferences:set', ONBOARDING_PREF_KEY, JSON.stringify(snapshot));
     });
   }, []);
@@ -191,14 +184,6 @@ export function OnboardingGate(): React.JSX.Element | null {
       cancelled = true;
     };
   }, [hydrate]);
-
-  // E2E boot marker: the tour scrim hydrates asynchronously, so a fixed-timeout
-  // probe in the test helpers races it under machine load. 'active' = the scrim
-  // is (or is about to be) up; 'resolved' = this boot will not show it.
-  useEffect(() => {
-    if (!hydrated) return;
-    document.body.dataset.onboarding = status === 'active' ? 'active' : 'resolved';
-  }, [hydrated, status]);
 
   // Forward the three real-action window events into the store's coach machine.
   useEffect(() => {
@@ -286,24 +271,24 @@ export function OnboardingGate(): React.JSX.Element | null {
     setOmpConnected(persistedProviderAccess.omp ?? false);
   }, [status, step, persistedProviderAccess, setConnected, setCodexConnected, setOmpConnected]);
 
-  // Step-6 precondition: the Quick Session card lives in the wizard, so ensure it
+  // Step-5 precondition: the Quick Session card lives in the wizard, so ensure it
   // is the center surface before the coachmark tries to anchor.
   useEffect(() => {
-    if (status !== 'active' || step !== 6) return;
+    if (status !== 'active' || step !== 5) return;
     const nav = useNavigationStore.getState();
     if (nav.view !== 'wizard') {
       nav.goToWizard({ lockProjectId: projects[0]?.id, allowQuick: true });
     }
   }, [status, step, projects]);
 
-  // Step-4 (telemetry) draft resolution. Resolved ONLY from the live
-  // AppConfig.telemetry (never a hardcoded true/true guess) every time step 4
+  // Step-3 (telemetry) draft resolution. Resolved ONLY from the live
+  // AppConfig.telemetry (never a hardcoded true/true guess) every time step 3
   // is (re-)entered — including replay (Settings → Replay walkthrough calls
-  // restart(), which re-enters at step 0 and walks back through step 4 fresh).
+  // restart(), which re-enters at step 0 and walks back through step 3 fresh).
   // If config hasn't loaded yet, the step stays in its loading state and a
   // config-store subscription resolves the draft the moment it arrives.
   useEffect(() => {
-    if (status !== 'active' || step !== 4) return;
+    if (status !== 'active' || step !== 3) return;
     setTelemetryError(null);
     const resolveFromConfig = (): boolean => {
       const cfgTelemetry = useConfigStore.getState().config?.telemetry;
@@ -325,36 +310,6 @@ export function OnboardingGate(): React.JSX.Element | null {
       }
     });
   }, [status, step]);
-
-  // Which providers the Connect step left ACTIVATED — the rows step 2 offers and
-  // the set its selection must stay inside.
-  const activated = activatedProviders({
-    detection,
-    connected,
-    codexDetection,
-    codexConnected,
-    ompDetection,
-    ompConnected,
-  });
-  // Recomputed each render, so the JSON key (not the array identity) is what the
-  // seed effect below depends on.
-  const activatedKey = activated.join(',');
-
-  // Step-2 seed: open on the user's SAVED default where there is one (so replay
-  // on a configured install shows their current answer rather than a blank
-  // slate), else the first activated provider — the step's Next always has
-  // something valid to persist, and no row is silently preselected that the
-  // Connect step did not activate.
-  const persistedDefaultRuntime = useConfigStore((s) => s.config?.defaultAgentRuntime);
-  useEffect(() => {
-    if (status !== 'active' || step !== 2) return;
-    const saved =
-      persistedDefaultRuntime === undefined ? null : providerForRuntime(persistedDefaultRuntime);
-    const seed = saved !== null && activated.includes(saved) ? saved : (activated[0] ?? null);
-    setDefaultProvider(seed);
-    // `activated` is rebuilt every render; `activatedKey` is its stable summary.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on activatedKey, see above
-  }, [status, step, activatedKey, persistedDefaultRuntime, setDefaultProvider]);
 
   const handleInstall = useCallback(() => {
     if (window.electronAPI) void window.electronAPI.openExternal('https://claude.ai/code');
@@ -418,28 +373,6 @@ export function OnboardingGate(): React.JSX.Element | null {
     }
     next();
   }, [connected, codexConnected, ompConnected, next]);
-
-  // Step-2 (default agent) Next: persists the chosen PROVIDER's structured
-  // runtime into `AppConfig.defaultAgentRuntime` — the middle rung of
-  // resolveRunTypeLaunchDefaults, so it seeds quick sessions and flow runs
-  // alike. Via the config STORE so the renderer's cached config refreshes and
-  // the wizard's seeded pickers inherit the choice without a restart. Same
-  // re-entry guard and non-fatal posture as the handlers around it.
-  const defaultRuntimeNextInFlight = useRef(false);
-  const handleDefaultRuntimeNext = useCallback(async () => {
-    if (defaultRuntimeNextInFlight.current || defaultProvider === null) return;
-    defaultRuntimeNextInFlight.current = true;
-    try {
-      await useConfigStore.getState().updateConfig({
-        defaultAgentRuntime: PROVIDER_DEFAULT_RUNTIME[defaultProvider],
-      });
-    } catch {
-      /* non-fatal — advance regardless; the default lives on in Settings → Session settings */
-    } finally {
-      defaultRuntimeNextInFlight.current = false;
-    }
-    next();
-  }, [defaultProvider, next]);
 
   // Re-entry guard: the config write is async, so a second activation (held
   // ArrowRight auto-repeat, double-click) while the await is in flight would
@@ -518,29 +451,21 @@ export function OnboardingGate(): React.JSX.Element | null {
       };
       break;
     case 2:
-      primary = {
-        label: 'Next →',
-        disabled: defaultProvider === null,
-        title: 'Pick the agent new sessions should use',
-        onClick: () => void handleDefaultRuntimeNext(),
-      };
-      break;
-    case 3:
       primary = { label: 'Next →', disabled: false, onClick: () => void handlePermNext() };
       break;
-    case 4:
+    case 3:
       primary = {
         label: 'Next →',
         disabled: telemetryDraft === null || telemetrySubmitting,
         onClick: () => void handleTelemetryNext(),
       };
       break;
-    case 5:
+    case 4:
       primary = hasProject
         ? { label: 'Next →', disabled: false, onClick: next }
         : { label: 'Add project →', disabled: !pickedPath || busyCreate, onClick: () => void handleAddProject() };
       break;
-    case 12:
+    case 11:
       primary = { label: 'Finish →', disabled: false, onClick: next };
       break;
     default:
@@ -570,9 +495,6 @@ export function OnboardingGate(): React.JSX.Element | null {
   if (!hydrated || status !== 'active') return null;
 
   const isModal = ONBOARDING_MODAL_STEPS.includes(step);
-  // The steps this run does NOT show, so the dots and "STEP n / N" counters
-  // describe the tour the user actually walks.
-  const skippedSteps = skippedStepSet({ multiRuntime });
 
   const body = ((): React.ReactNode => {
     switch (step) {
@@ -597,16 +519,8 @@ export function OnboardingGate(): React.JSX.Element | null {
           />
         );
       case 2:
-        return (
-          <DefaultRuntimeStep
-            providers={activated}
-            value={defaultProvider}
-            onChange={setDefaultProvider}
-          />
-        );
-      case 3:
         return <PermissionStep value={permMode} onChange={setPermMode} />;
-      case 4:
+      case 3:
         return (
           <TelemetryStep
             value={telemetryDraft}
@@ -615,7 +529,7 @@ export function OnboardingGate(): React.JSX.Element | null {
             error={telemetryError}
           />
         );
-      case 5:
+      case 4:
         return (
           <AddProjectStep
             hasExistingProject={hasProject}
@@ -625,7 +539,7 @@ export function OnboardingGate(): React.JSX.Element | null {
             onBrowse={() => void handleBrowse()}
           />
         );
-      case 12:
+      case 11:
         return <RailMapStep />;
       default:
         return null;
@@ -641,7 +555,6 @@ export function OnboardingGate(): React.JSX.Element | null {
         <OnboardingModalCard
           step={step}
           maxVisitedStep={maxVisitedStep}
-          skippedSteps={skippedSteps}
           hero={step === 0}
           primary={primary}
           onBack={back}
@@ -655,7 +568,6 @@ export function OnboardingGate(): React.JSX.Element | null {
         <Coachmark
           step={step}
           maxVisitedStep={maxVisitedStep}
-          skippedSteps={skippedSteps}
           onBack={back}
           onSkip={skip}
           onGoTo={goTo}

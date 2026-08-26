@@ -33,7 +33,6 @@ import BetterSqlite3 from 'better-sqlite3';
 import type Database from 'better-sqlite3';
 import { McpQueryHandler, type McpQueryResponse } from '../mcpQueryHandler';
 import { OrchSocketServer } from '../orchSocketServer';
-import { OrchTokenRegistry } from '../../orchAuthToken';
 import { ApprovalRouter } from '../../approvalRouter';
 import { dbAdapter } from '../../__test_fixtures__/dbAdapter';
 import { createTestDb, seedRun } from '../../__test_fixtures__/orchestratorTestDb';
@@ -718,7 +717,6 @@ describe('shell-approval-request over a live OrchSocketServer (held-open socket)
   let db: Database.Database;
   let server: OrchSocketServer;
   let socketPath: string;
-  let tokens: OrchTokenRegistry;
   const openClients: net.Socket[] = [];
   const worktrees: string[] = [];
   let realHome: string | undefined;
@@ -735,11 +733,7 @@ describe('shell-approval-request over a live OrchSocketServer (held-open socket)
     fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), `cyboflow-home-${process.pid}-`));
     process.env.HOME = fakeHome;
     socketPath = path.join(os.tmpdir(), `shell-appr-${process.pid}-${Math.random().toString(36).slice(2, 8)}.sock`);
-    // A suite-local token registry: the server now refuses to bind a
-    // self-declared runId without that run's bearer token, and this keeps the
-    // check real here (rather than stubbed) without touching global state.
-    tokens = new OrchTokenRegistry();
-    server = new OrchSocketServer(socketPath, dbAdapter(db), makeSpyLogger(), {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), makeSpyLogger());
     await server.start();
   });
 
@@ -794,7 +788,6 @@ describe('shell-approval-request over a live OrchSocketServer (held-open socket)
         type: 'shell-approval-request',
         requestId: 'srv-req-1',
         runId: 'run-srv-allow',
-        token: tokens.mint('run-srv-allow'),
         toolName: 'Bash',
         toolInput: { command: 'rm -rf x' },
       }) + '\n',

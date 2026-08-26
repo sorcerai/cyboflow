@@ -26,6 +26,7 @@
  */
 import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk';
 import { loadSdkQuery } from '../../utils/lazyAgentSdk';
+import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
 import type { LoggerLike } from '../types';
 import { readOnlyCommandDenyMessage, readOnlyCommandRejection } from './readOnlyCommandGuard';
 import { RUNG1_OPERATION_KINDS } from './runbookDraft';
@@ -155,13 +156,8 @@ export function makeRunbookDraftCanUseTool(logger?: LoggerLike): CanUseTool {
  * an unusable draft as a decline, and there is nothing a throw would let it do
  * that a null does not — while a throw crossing the enqueue seam is exactly what
  * that seam's never-throws contract forbids.
- *
- * @param claudeExecutablePath The packaged-build native-binary path resolved once
- * at boot by `resolveClaudeExecutablePath()` (services layer) and threaded in by
- * the wiring site — `undefined` in dev, which lets the SDK resolve it itself.
  */
 export function makeRunbookDraftQuery(
-  claudeExecutablePath: string | undefined,
   logger?: LoggerLike,
   timeoutMs: number = RUNBOOK_DRAFT_TIMEOUT_MS,
 ): RunbookDraftQueryFn {
@@ -201,7 +197,7 @@ export function makeRunbookDraftQuery(
           strictMcpConfig: true,
           mcpServers: {},
           canUseTool: makeRunbookDraftCanUseTool(logger),
-          pathToClaudeCodeExecutable: claudeExecutablePath,
+          pathToClaudeCodeExecutable: resolveClaudeExecutablePath(),
           outputFormat: { type: 'json_schema', schema: RUNBOOK_DRAFT_JSON_SCHEMA },
           abortController: controller,
         },

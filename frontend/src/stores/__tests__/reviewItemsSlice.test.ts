@@ -174,7 +174,7 @@ describe('pendingReviewItemsForRun', () => {
     expect(result).toEqual([]);
   });
 
-  it('drops NON-BLOCKING findings (silent) but keeps the attention kinds', () => {
+  it('drops findings (silent) but keeps the attention kinds', () => {
     const items = [
       makeItem('a', { run_id: 'run-1', kind: 'finding' }),
       makeItem('b', { run_id: 'run-1', kind: 'permission' }),
@@ -185,29 +185,6 @@ describe('pendingReviewItemsForRun', () => {
     ];
     const result = pendingReviewItemsForRun(items, 'run-1');
     expect(result.map((i) => i.id)).toEqual(['b', 'c', 'd', 'e']);
-  });
-
-  // A blocking finding parks the run exactly like a decision gate
-  // (countPendingBlockingReviewItems is kind-agnostic), so hiding it from the
-  // strip wedges the run with no in-session exit: the gate it blocks is the only
-  // visible card, and its answer path refuses with noOp:'blocked'.
-  it('KEEPS a blocking finding — it gates the run and needs an in-session exit', () => {
-    const items = [
-      makeItem('quiet', { run_id: 'run-1', kind: 'finding', blocking: false }),
-      makeItem('eval', { run_id: 'run-1', kind: 'finding', blocking: true }),
-      makeItem('gate', { run_id: 'run-1', kind: 'decision', blocking: true }),
-    ];
-    const result = pendingReviewItemsForRun(items, 'run-1');
-    expect(result.map((i) => i.id)).toEqual(['eval', 'gate']);
-  });
-
-  it('sorts a blocking finding ahead of a non-blocking attention kind', () => {
-    const items = [
-      makeItem('note', { run_id: 'run-1', kind: 'notification', blocking: false }),
-      makeItem('eval', { run_id: 'run-1', kind: 'finding', blocking: true }),
-    ];
-    const result = pendingReviewItemsForRun(items, 'run-1');
-    expect(result.map((i) => i.id)).toEqual(['eval', 'note']);
   });
 });
 

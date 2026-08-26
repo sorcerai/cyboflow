@@ -9,11 +9,11 @@
  *   2. DECISION      (rust swatch)    — approve-idea / approve-design /
  *      approve-plan gates from the review_items inbox (kind === 'decision'),
  *      rendered via ReviewItemCard.
- *   3. QUICK-SESSION TRIAGE — {@link SessionTriageGroups}'s three groups (Needs
- *      your input / Ready for review / Working), mounted right after Decision so
- *      needs-input sits high in the queue.
- *   4. HUMAN TASK    (blue swatch)    — free-form action items (kind === 'human_task'),
+ *   3. HUMAN TASK    (blue swatch)    — free-form action items (kind === 'human_task'),
  *      EXCLUDING idle-session items, rendered via ReviewItemCard.
+ *   4. IDLE SESSIONS (rust swatch)    — idle-quick-session items (kind === 'human_task'
+ *      with source `idle-session:*`), split out of Human task and sorted oldest-idle
+ *      first so the longest-quiet sessions sit at the top.
  *   5. BLOCKING FINDING (red swatch)  — defects that parked a programmatic run;
  *      rendered with the existing resolve-and-resume controls.
  *   6. READY TO REVIEW (green swatch) — clean-drained runs awaiting_review with
@@ -35,6 +35,7 @@ import { PendingApprovalCard } from '../ReviewQueue/PendingApprovalCard';
 import { ReviewItemCard } from '../ReviewQueue/ReviewItemCard';
 import type { QueueItem } from '../../utils/reviewQueueSelectors';
 import { IDLE_REVIEW_SOURCE_PREFIX, type ReviewItem } from '../../../../shared/types/reviews';
+import type { QuickSessionRow } from '../../../../shared/types/quickSessions';
 import type { WorkflowRunStatus } from '../../../../shared/types/cyboflow';
 import type { ActiveRunRow } from '../../stores/activeRunsStore';
 import {
@@ -47,8 +48,7 @@ import {
 import { useCyboflowStore } from '../../stores/cyboflowStore';
 import { useNavigationStore } from '../../stores/navigationStore';
 import { formatElapsed } from '../../utils/homeClassify';
-import { GroupHeader } from './GroupHeader';
-import { SessionTriageGroups } from './SessionTriageGroups';
+import { QuickSessionsTable } from './QuickSessionsTable';
 import { useQuickSessionRows, needsAttention } from '../../stores/quickSessionsStore';
 
 // ---------------------------------------------------------------------------
@@ -144,6 +144,34 @@ function OpenSessionLink({
       >
         Open session →
       </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Group header — sticky, with a color swatch + name + count + descriptor.
+// ---------------------------------------------------------------------------
+
+function GroupHeader({
+  swatchClass,
+  name,
+  count,
+  descriptor,
+}: {
+  swatchClass: string;
+  name: string;
+  count: number;
+  descriptor: string;
+}): React.JSX.Element {
+  return (
+    <div className="sticky top-0 z-10 flex items-center gap-2.5 bg-bg-primary px-4 py-2 border-b border-border-primary">
+      <span
+        aria-hidden="true"
+        className={`inline-block h-[14px] w-[8px] flex-shrink-0 ${swatchClass}`}
+      />
+      <span className="text-[12px] font-bold text-text-primary">{name}</span>
+      <span className="eyebrow text-text-tertiary">{count} pending</span>
+      <span className="ml-auto text-[11px] text-text-muted">{descriptor}</span>
     </div>
   );
 }
@@ -246,6 +274,41 @@ function ReadyToReviewRow({ run }: { run: ActiveRunRow }): React.JSX.Element {
   );
 }
 
+/**
+ * A single BLOCKED quick session, surfaced as a full-width card among the other
+ * waiting-on-input items rather than as a compact board row. The session parked
+ * on an AskUserQuestion / permission gate in its PTY, so there is no structured
+ * question to render here (unlike a PendingApprovalCard) — the card is an
+ * attention prompt whose "Open session →" jumps into the session to answer.
+ * Opening routes through the quick-session host (setActiveQuickSession), never
+ * the flow-run host, since a quick session has no resolvable workflow definition.
+ */
+function BlockedQuickSessionRow({ row }: { row: QuickSessionRow }): React.JSX.Element {
+  return (
+    <div>
+      <div className="border border-status-error/40 bg-surface-primary p-3 transition-colors hover:border-status-error">
+        <div className="flex items-center gap-2">
+          <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-status-error" />
+          <span
+            className="truncate font-bold text-text-primary"
+            style={{ fontSize: '13px' }}
+            title={row.name}
+          >
+            {row.name}
+          </span>
+          <span className="eyebrow ml-auto shrink-0 border border-status-error px-1.5 py-0.5 text-status-error">
+            blocked
+          </span>
+        </div>
+        <div className="mt-2 text-text-tertiary" style={{ fontSize: '11px' }}>
+          Waiting on your answer — open the session to respond.
+        </div>
+      </div>
+      <OpenSessionLink runId={row.runId} projectId={row.projectId} quickSessionId={row.sessionId} />
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Public component
 // ---------------------------------------------------------------------------
@@ -277,7 +340,7 @@ export function TypeGroupedQueue(): React.JSX.Element {
     () => reviewItems.filter((it) => it.kind === 'decision'),
     [reviewItems],
   );
-  // Idle quick sessions no longer mint review_items — the live SessionTriageGroups
+  // Idle quick sessions no longer mint review_items — the live QuickSessionsTable
   // (below) is the source of truth for quick-session state. Any LEGACY
   // `idle-session:<id>` human_task rows (from before the switch, pending until the
   // one-time startup drain resolves them) are still filtered OUT of the generic
@@ -306,6 +369,13 @@ export function TypeGroupedQueue(): React.JSX.Element {
   // idle-session review items that used to hold this slot.
   const quickRows = useQuickSessionRows();
   const hasAttentionQuick = React.useMemo(() => quickRows.some(needsAttention), [quickRows]);
+  // Blocked quick sessions are lifted OUT of the compact board and rendered as
+  // full-width cards up here with the other waiting-on-input items (the board
+  // filters them out to avoid a duplicate row).
+  const blockedQuickRows = React.useMemo(
+    () => quickRows.filter((row) => row.state === 'blocked'),
+    [quickRows],
+  );
 
   const hasAny =
     permissionItems.length > 0 ||
@@ -361,8 +431,19 @@ export function TypeGroupedQueue(): React.JSX.Element {
         </section>
       )}
 
-      {/* Live quick-session triage — Needs your input / Ready for review / Working. */}
-      <SessionTriageGroups />
+      {blockedQuickRows.length > 0 && (
+        <section data-testid="queue-group-quick-session-blocked">
+          <GroupHeader
+            swatchClass="bg-status-error"
+            name="Quick session"
+            count={blockedQuickRows.length}
+            descriptor="Blocked on your answer — open to respond"
+          />
+          {blockedQuickRows.map((row) => (
+            <BlockedQuickSessionRow key={row.sessionId} row={row} />
+          ))}
+        </section>
+      )}
 
       {humanTaskItems.length > 0 && (
         <section data-testid="queue-group-human-task">
@@ -377,6 +458,9 @@ export function TypeGroupedQueue(): React.JSX.Element {
           ))}
         </section>
       )}
+
+      {/* Live quick-session status board — replaces the old idle-session group. */}
+      <QuickSessionsTable />
 
       {blockingFindingItems.length > 0 && (
         <section data-testid="queue-group-blocking-finding">

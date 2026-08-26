@@ -30,10 +30,6 @@ describe('buildOmpCyboflowMcpServerEntry', () => {
       env: {
         CYBOFLOW_RUN_ID: 'CYBOFLOW_RUN_ID',
         CYBOFLOW_ORCH_SOCKET: 'CYBOFLOW_ORCH_SOCKET',
-        // The bearer token is named, never valued: this file is shared by every
-        // lane in the worktree and lives on disk, so the secret must resolve
-        // from the omp process's own env at spawn instead.
-        CYBOFLOW_ORCH_TOKEN: 'CYBOFLOW_ORCH_TOKEN',
       },
       timeout: 0,
     });
@@ -42,26 +38,12 @@ describe('buildOmpCyboflowMcpServerEntry', () => {
   it('bakes in the literal ELECTRON_RUN_AS_NODE guard when node resolves to the Electron binary', () => {
     const entry = buildOmpCyboflowMcpServerEntry(process.execPath, BRIDGE_PATH);
     expect(entry.env.ELECTRON_RUN_AS_NODE).toBe('1');
-    // The run-id/socket/token entries stay bare-name even when the guard fires.
+    // The run-id/socket entries stay bare-name even when the guard fires.
     expect(entry.env.CYBOFLOW_RUN_ID).toBe('CYBOFLOW_RUN_ID');
-    expect(entry.env.CYBOFLOW_ORCH_TOKEN).toBe('CYBOFLOW_ORCH_TOKEN');
   });
 });
 
 describe('writeOmpMcpConfig', () => {
-  it('writes NO bearer-token secret to disk — only the env var NAME', () => {
-    const result = writeOmpMcpConfig({
-      worktreeRoot: worktree,
-      nodeExecutablePath: NODE_PATH,
-      bridgeScriptPath: BRIDGE_PATH,
-    });
-    const raw = fs.readFileSync(result.configPath, 'utf-8');
-
-    expect(raw).toContain('CYBOFLOW_ORCH_TOKEN');
-    // A minted token is 64 hex chars; nothing of that shape may appear here.
-    expect(raw).not.toMatch(/[0-9a-f]{64}/);
-  });
-
   it('creates .omp/mcp.json with exactly the cyboflow server on a fresh worktree', () => {
     const result = writeOmpMcpConfig({
       worktreeRoot: worktree,

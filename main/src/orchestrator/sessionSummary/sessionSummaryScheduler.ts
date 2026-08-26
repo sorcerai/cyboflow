@@ -89,8 +89,6 @@ export interface SessionSummaryDb {
     lastTurnId: number;
     costUsdDelta: number;
     entries: string[];
-    state?: string | null;
-    waitingOn?: string | null;
   }): boolean;
 }
 
@@ -338,8 +336,6 @@ export function makeSessionSummaryScheduler(
         lastTurnId: newWatermark,
         costUsdDelta: result.costUsd,
         entries: result.historySentences,
-        state: result.state,
-        waitingOn: result.waitingOn,
       });
       // Success (or a benign "session gone" false): clear the failure record so
       // the next delta is not gated by a stale cooldown.

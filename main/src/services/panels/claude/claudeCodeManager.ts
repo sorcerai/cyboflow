@@ -6,7 +6,6 @@ import { app } from 'electron';
 import { loadSdkQuery } from '../../../utils/lazyAgentSdk';
 import type { AgentProvider } from '../../../../../shared/types/agentRuntime';
 import { resolveMcpServerScriptPath } from '../../../orchestrator/mcpServer/scriptPath';
-import { orchTokenEnv } from '../../../orchestrator/orchAuthToken';
 import { readInstalledPluginIds, buildExclusiveEnabledPluginsMap } from '../../../orchestrator/integrations/installedPlugins';
 import { resolveClaudeExecutablePath } from './claudeExecutablePath';
 import { findNodeExecutable } from '../../../utils/nodeFinder';
@@ -14,7 +13,7 @@ import { electronRunAsNodeGuardEnv } from '../../../utils/electronNodeGuard';
 import { getCyboflowSubdirectory } from '../../../utils/cyboflowDirectory';
 import { getShellPath } from '../../../utils/shellPath';
 import { captureSeamError } from '../../telemetry';
-import { classifyErrorPattern, unclassifiedErrorTags } from '../../../orchestrator/programmatic/systemicError';
+import { classifyErrorPattern } from '../../../orchestrator/programmatic/systemicError';
 import {
   resolveModelAlias,
   sdkModelAndBetas,
@@ -1303,19 +1302,13 @@ export class ClaudeCodeManager extends AbstractCliManager {
     return {};
   }
 
-  protected async cleanupCliResources(_panelId: string, sessionId: string): Promise<void> {
+  protected async cleanupCliResources(sessionId: string): Promise<void> {
     // Approval cleanup is done in runSdkQuery's finally block via
     // ApprovalRouter.getInstance().clearPendingForRun(panelId) — using panelId
     // (the id under which requestApproval() was called) rather than sessionId.
     // cleanupCliResources fires on the ABORT path (killProcess); normal completion
     // tears down via runSdkQuery's finally. Bundle removal is routed through the
     // shared helper from BOTH so it never depends on which path ended the run.
-    //
-    // Session-scoped (not panel-scoped) DELIBERATELY: the bundle lives in the
-    // shared worktree and a fan-out can run several lanes under one sessionId,
-    // all sharing it — removeBundleForSession's own refcount (see below) is
-    // what keeps a finishing lane from deleting it out from under a still-live
-    // sibling, so panelId is unused here.
     this.removeBundleForSession(sessionId);
   }
 
@@ -2157,10 +2150,6 @@ export class ClaudeCodeManager extends AbstractCliManager {
               captureSeamError('sdk-session-terminal-result', new Error(`sdk terminal result (${resultErrorClass})`), {
                 substrate: 'sdk',
                 errorClass: resultErrorClass,
-                // An UNCLASSIFIED result is the common case here and says nothing
-                // on its own; the shape + digest split that bucket into distinct
-                // failures without shipping resultErr itself.
-                ...unclassifiedErrorTags(resultErrorClass, resultErr),
               });
             }
 
@@ -2309,7 +2298,6 @@ export class ClaudeCodeManager extends AbstractCliManager {
             substrate: 'sdk',
             packaged: String(Boolean(app.isPackaged)),
             errorClass: sdkErrorClass,
-            ...unclassifiedErrorTags(sdkErrorClass, errMsg),
           });
         }
         // A thrown SDK error (auth / network / spawn failure) is terminal too.
@@ -3242,15 +3230,6 @@ export class ClaudeCodeManager extends AbstractCliManager {
           return mcpServers as Record<string, McpServerConfig>;
         }
 
-        // The run identity this MCP subprocess speaks for, resolved ONCE so the
-        // env var and the token minted for it cannot drift apart. For workflow
-        // runs this is the real workflow_runs.id; legacy quick sessions (no run)
-        // fall back to sessionId; the global agent's synthetic
-        // `agent:<threadId>` identity arrives as sessionId, which is what scopes
-        // its cross-project read family to its own thread.
-        const mcpRunId =
-          options.runId && options.runId.length > 0 ? options.runId : options.sessionId;
-
         const cyboflowEntry: McpServerConfig = {
           command: nodeCmd,
           args: [cyboflowMcpScriptPath],
@@ -3261,14 +3240,8 @@ export class ClaudeCodeManager extends AbstractCliManager {
             // undefined/empty and we fall back to sessionId so the value is
             // always populated. Empty string is treated as absent. The global
             // agent's synthetic `agent:<threadId>` identity arrives as sessionId.
-            CYBOFLOW_RUN_ID: mcpRunId,
+            CYBOFLOW_RUN_ID: (options.runId && options.runId.length > 0) ? options.runId : options.sessionId,
             CYBOFLOW_ORCH_SOCKET: this.orchSocketPath,
-            // Bearer token proving this subprocess belongs to `mcpRunId`
-            // (orchAuthToken.ts). The socket server refuses to bind a
-            // self-declared runId without it. This entry is held in memory and
-            // handed to the SDK — unlike the interactive substrate, nothing
-            // here is written to disk, so the secret never lands in a file.
-            ...orchTokenEnv(mcpRunId),
             // S0.2(d) / Design Mode v0: tag the server's advertised tool scope so
             // cyboflowMcpServer surfaces the matching scoped family (and gates out
             // the run-scoped tools): 'global-agent' → the global-agent read/propose

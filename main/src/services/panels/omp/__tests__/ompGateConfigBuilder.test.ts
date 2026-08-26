@@ -9,6 +9,8 @@
  * up as our own flow tools suddenly prompting a human). So the MCP list is
  * re-derived from `cyboflowMcpServer.ts` here rather than restated.
  */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ACCEPT_EDITS_AUTO_APPROVE_TOOLS } from '../../../../orchestrator/permissionModeMapper';
 import { ACCEPT_EDITS_SAFE_READONLY_TOOLS } from '../../../../orchestrator/safeCommandClassifier';
@@ -27,11 +29,10 @@ import {
   toOmpToolName,
 } from '../ompGateConfigBuilder';
 
-import {
-  DESIGN_SCOPE_TOOLS,
-  GLOBAL_AGENT_SCOPE_TOOLS,
-  RUN_SCOPE_TOOLS,
-} from '../../../../orchestrator/mcpServer/toolRegistry';
+const MCP_SERVER_SOURCE = path.resolve(
+  __dirname,
+  '../../../../orchestrator/mcpServer/cyboflowMcpServer.ts',
+);
 
 describe('toOmpToolName', () => {
   it("maps Claude's mcp__server__tool form onto OMP's single-underscore form", () => {
@@ -58,14 +59,10 @@ describe('toOmpToolName', () => {
 });
 
 describe('the cyboflow MCP tool list', () => {
-  it('matches every tool the MCP tool registry declares (tripwire on drift)', () => {
-    // The registry is the single source cyboflowMcpServer derives its
-    // declarations from, so comparing against it (not a source-text grep of the
-    // server) is exact across all three scopes.
+  it('matches every tool cyboflowMcpServer declares (tripwire on drift)', () => {
+    const source = fs.readFileSync(MCP_SERVER_SOURCE, 'utf8');
     const declared = new Set(
-      [...RUN_SCOPE_TOOLS, ...GLOBAL_AGENT_SCOPE_TOOLS, ...DESIGN_SCOPE_TOOLS].map(
-        (tool) => tool.name,
-      ),
+      [...source.matchAll(/name: '(cyboflow_[a-z_]+)'/g)].map((match) => match[1]),
     );
     expect(declared.size).toBeGreaterThan(40);
     expect([...declared].sort()).toEqual([...CYBOFLOW_MCP_TOOL_NAMES].sort());

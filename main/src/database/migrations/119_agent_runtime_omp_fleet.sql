@@ -1,13 +1,12 @@
--- Migration 122: admit 'omp-fleet' on sessions.agent_runtime and
+-- Migration 119: admit 'omp-fleet' on sessions.agent_runtime and
 -- workflow_runs.agent_runtime (OMP Phase 4, the fleet-supervisor runtime).
 --
--- NUMBERED 122. Authored as 105, renumbered to 107 when main shipped its own
--- 105/106, to 119 on the 0.2.6 rebase, and to 122 on the rebase onto local
--- main — which had by then taken 119_session_idle_since and its 120 backfill,
--- with 121 reserved by the in-flight session-summary branch.
--- The ledger is keyed by FILENAME: a dev install that applied the old 105,
--- 107 or 119 name applies this one again, which is harmless — the sequence
--- is idempotent, and test (h) pins that.
+-- NUMBERED 119. Authored as 105, renumbered to 107 when main shipped its own
+-- 105/106 — and renumbered AGAIN to 119 on the 0.2.6 rebase because main had
+-- by then taken 107_bootstrap_proof through 118_tracker_content_archive_modes.
+-- The ledger is keyed by FILENAME: a dev install that applied the old 105 or
+-- 107 name applies this one again, which is harmless — the sequence is
+-- idempotent, and test (h) pins that.
 --
 -- WHY A NEW FILE RATHER THAN AN EDIT TO 103. The migration ledger is keyed by
 -- FILENAME and applies each .sql exactly once, so widening 103's CHECK list in
@@ -65,14 +64,14 @@
 -- sessions.agent_runtime  (103 list + 'omp-fleet')
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE sessions ADD COLUMN agent_runtime_widen_122 TEXT;
-UPDATE sessions SET agent_runtime_widen_122 = agent_runtime;
+ALTER TABLE sessions ADD COLUMN agent_runtime_widen_119 TEXT;
+UPDATE sessions SET agent_runtime_widen_119 = agent_runtime;
 ALTER TABLE sessions DROP COLUMN agent_runtime;
 ALTER TABLE sessions
   ADD COLUMN agent_runtime TEXT NOT NULL DEFAULT 'claude-sdk'
     CHECK (agent_runtime IN ('claude-sdk','claude-interactive','codex-sdk','codex-pty','omp-sdk','omp-pty','omp-fleet'));
-UPDATE sessions SET agent_runtime = COALESCE(agent_runtime_widen_122, 'claude-sdk');
-ALTER TABLE sessions DROP COLUMN agent_runtime_widen_122;
+UPDATE sessions SET agent_runtime = COALESCE(agent_runtime_widen_119, 'claude-sdk');
+ALTER TABLE sessions DROP COLUMN agent_runtime_widen_119;
 
 -- ---------------------------------------------------------------------------
 -- workflow_runs.agent_runtime  (103 list + 'omp-fleet')
@@ -81,11 +80,11 @@ ALTER TABLE sessions DROP COLUMN agent_runtime_widen_122;
 -- structured events, usage, MCP progress and review-queue integration.
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE workflow_runs ADD COLUMN agent_runtime_widen_122 TEXT;
-UPDATE workflow_runs SET agent_runtime_widen_122 = agent_runtime;
+ALTER TABLE workflow_runs ADD COLUMN agent_runtime_widen_119 TEXT;
+UPDATE workflow_runs SET agent_runtime_widen_119 = agent_runtime;
 ALTER TABLE workflow_runs DROP COLUMN agent_runtime;
 ALTER TABLE workflow_runs
   ADD COLUMN agent_runtime TEXT NOT NULL DEFAULT 'claude-sdk'
     CHECK (agent_runtime IN ('claude-sdk','claude-interactive','codex-sdk','omp-sdk','omp-fleet'));
-UPDATE workflow_runs SET agent_runtime = COALESCE(agent_runtime_widen_122, 'claude-sdk');
-ALTER TABLE workflow_runs DROP COLUMN agent_runtime_widen_122;
+UPDATE workflow_runs SET agent_runtime = COALESCE(agent_runtime_widen_119, 'claude-sdk');
+ALTER TABLE workflow_runs DROP COLUMN agent_runtime_widen_119;

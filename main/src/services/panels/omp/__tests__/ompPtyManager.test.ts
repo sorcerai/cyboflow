@@ -22,30 +22,6 @@ class TestableOmpPtyManager extends OmpPtyManager {
       return this.getActivePtySpawnContext();
     });
   }
-
-  // Test accessors for the private per-panel bookkeeping cleanupCliResources
-  // touches, so its panel-scoping can be verified without a real PTY spawn.
-  private maps(): { panelRunIds: Map<string, string>; ptyBacklog: Map<string, string> } {
-    return this as unknown as { panelRunIds: Map<string, string>; ptyBacklog: Map<string, string> };
-  }
-  seedPanelRunId(panelId: string, runId: string): void {
-    this.maps().panelRunIds.set(panelId, runId);
-  }
-  seedPtyBacklog(runId: string, data: string): void {
-    this.maps().ptyBacklog.set(runId, data);
-  }
-  hasPanelRunId(panelId: string): boolean {
-    return this.maps().panelRunIds.has(panelId);
-  }
-  hasPtyBacklog(runId: string): boolean {
-    return this.maps().ptyBacklog.has(runId);
-  }
-  callCleanupCliResources(panelId: string, sessionId: string): Promise<void> {
-    return (this as unknown as { cleanupCliResources(p: string, s: string): Promise<void> }).cleanupCliResources(
-      panelId,
-      sessionId,
-    );
-  }
 }
 
 function makeSessionManager(mode?: string): SessionManager {
@@ -242,29 +218,5 @@ describe('OmpPtyManager concurrent spawn context', () => {
 
     expect(capturedFirst).toEqual(first);
     expect(capturedSecond).toEqual(second);
-  });
-});
-
-describe('OmpPtyManager.cleanupCliResources', () => {
-  it('scopes cleanup to the exiting panel only — a sibling panel sharing the same session keeps its bookkeeping', async () => {
-    // Regression: cleanupCliResources used to scan `this.processes` for every
-    // panel matching the SESSION id and delete each one's panelRunIds/
-    // ptyBacklog entry, so one panel's exit tore down a still-live sibling
-    // panel's bookkeeping too (both panels in one session share the id).
-    const manager = new TestableOmpPtyManager(makeSessionManager());
-    const sharedSessionId = 'session-shared';
-    manager.seedPanelRunId('panel-A', 'run-A');
-    manager.seedPtyBacklog('run-A', 'A output');
-    manager.seedPanelRunId('panel-B', 'run-B');
-    manager.seedPtyBacklog('run-B', 'B output');
-
-    await manager.callCleanupCliResources('panel-A', sharedSessionId);
-
-    // Only panel-A's bookkeeping is gone.
-    expect(manager.hasPanelRunId('panel-A')).toBe(false);
-    expect(manager.hasPtyBacklog('run-A')).toBe(false);
-    // panel-B (still live, same session) is untouched.
-    expect(manager.hasPanelRunId('panel-B')).toBe(true);
-    expect(manager.hasPtyBacklog('run-B')).toBe(true);
   });
 });

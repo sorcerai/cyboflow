@@ -26,7 +26,6 @@ import { ApprovalRouter } from '../../../../orchestrator/approvalRouter';
 import { createTestDb } from '../../../../orchestrator/__test_fixtures__/orchestratorTestDb';
 import { dbAdapter } from '../../../../orchestrator/__test_fixtures__/dbAdapter';
 import { ClaudeCodeManager, mcpDenyListSdkGuards } from '../claudeCodeManager';
-import { orchTokenRegistry } from '../../../../orchestrator/orchAuthToken';
 import type { SessionManager } from '../../../sessionManager';
 import type { Logger } from '../../../../utils/logger';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
@@ -248,52 +247,6 @@ describe('ClaudeCodeManager.composeMcpServers — eager node path resolution', (
     const cyboflow = result['cyboflow'] as { env: Record<string, string> };
     // No runId supplied → legacy fallback to the session id.
     expect(cyboflow.env.CYBOFLOW_RUN_ID).toBe('sess-uuid');
-  });
-
-  // ---------------------------------------------------------------------------
-  // Bearer token: the MCP subprocess must be able to PROVE the runId it
-  // declares, or OrchSocketServer refuses to bind it (orchAuthToken.ts).
-  // ---------------------------------------------------------------------------
-  it('stamps a CYBOFLOW_ORCH_TOKEN that verifies against the run it declares', async () => {
-    mgr.setOrchSocketPath('/tmp/test.sock');
-    await Promise.resolve();
-
-    const result = await mgr.publicComposeMcpServers('sess-uuid', 'run-token-id');
-    const cyboflow = result['cyboflow'] as { env: Record<string, string> };
-
-    expect(cyboflow.env.CYBOFLOW_ORCH_TOKEN).toMatch(/^[0-9a-f]{64}$/);
-    expect(
-      orchTokenRegistry.verify('run-token-id', cyboflow.env.CYBOFLOW_ORCH_TOKEN),
-    ).toBe(true);
-    // Scoped to THIS run only — it must not open any other.
-    expect(orchTokenRegistry.verify('sess-uuid', cyboflow.env.CYBOFLOW_ORCH_TOKEN)).toBe(false);
-  });
-
-  it('keeps the token stable across spawns of the same run (warm-session fingerprint)', async () => {
-    mgr.setOrchSocketPath('/tmp/test.sock');
-    await Promise.resolve();
-
-    const first = (await mgr.publicComposeMcpServers('s', 'run-stable'))[
-      'cyboflow'
-    ] as { env: Record<string, string> };
-    const second = (await mgr.publicComposeMcpServers('s', 'run-stable'))[
-      'cyboflow'
-    ] as { env: Record<string, string> };
-    expect(second.env.CYBOFLOW_ORCH_TOKEN).toBe(first.env.CYBOFLOW_ORCH_TOKEN);
-  });
-
-  it("tokens the global agent's synthetic agent:<threadId> identity, scoped to that thread", async () => {
-    mgr.setOrchSocketPath('/tmp/test.sock');
-    await Promise.resolve();
-
-    // The agent identity arrives as sessionId with no runId — the same path
-    // that unlocks the cross-project fs/SQL read family.
-    const result = await mgr.publicComposeMcpServers('agent:thread-1');
-    const cyboflow = result['cyboflow'] as { env: Record<string, string> };
-
-    expect(cyboflow.env.CYBOFLOW_RUN_ID).toBe('agent:thread-1');
-    expect(orchTokenRegistry.verify('agent:thread-1', cyboflow.env.CYBOFLOW_ORCH_TOKEN)).toBe(true);
-    expect(orchTokenRegistry.verify('agent:thread-2', cyboflow.env.CYBOFLOW_ORCH_TOKEN)).toBe(false);
   });
 
   // ---------------------------------------------------------------------------

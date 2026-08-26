@@ -37,12 +37,10 @@ function claudeState(
   return {
     claude: {
       provider: 'claude',
-      spend: null,
       planType: null,
       observedAtMs: NOW,
       windows: [{
         kind: 'claude_five_hour',
-        scopeLabel: null,
         label: '5-hour session',
         status: usedPercent === null ? 'ok' : 'critical',
         usedPercent,
@@ -87,13 +85,11 @@ describe('ProviderUsageCards', () => {
     mockUsage.current = {
       claude: {
         provider: 'claude',
-        spend: null,
         planType: 'max',
         observedAtMs: NOW,
         windows: [
           {
             kind: 'claude_seven_day',
-            scopeLabel: null,
             label: 'Weekly',
             status: 'ok',
             usedPercent: 13,
@@ -105,7 +101,6 @@ describe('ProviderUsageCards', () => {
           },
           {
             kind: 'claude_five_hour',
-            scopeLabel: null,
             label: '5-hour session',
             status: 'ok',
             usedPercent: 7,
@@ -127,13 +122,11 @@ describe('ProviderUsageCards', () => {
     mockUsage.current = {
       claude: {
         provider: 'claude',
-        spend: null,
         planType: null,
         observedAtMs: NOW,
         windows: [
           {
             kind: 'claude_five_hour',
-            scopeLabel: null,
             label: '5-hour session',
             status: 'ok',
             usedPercent: 7,
@@ -145,7 +138,6 @@ describe('ProviderUsageCards', () => {
           },
           {
             kind: 'claude_overage',
-            scopeLabel: null,
             label: 'Extra usage',
             status: 'ok',
             usedPercent: 2,
@@ -187,19 +179,16 @@ describe('ProviderUsageCards', () => {
     mockUsage.current = {
       claude: {
         provider: 'claude',
-        spend: null,
         planType: 'max',
         observedAtMs: NOW,
         windows: [
           {
-            kind: 'claude_seven_day',
-            scopeLabel: null, label: 'Weekly', status: 'ok', usedPercent: 13,
+            kind: 'claude_seven_day', label: 'Weekly', status: 'ok', usedPercent: 13,
             percentSource: 'poll', percentObservedAtMs: NOW,
             resetsAtMs: NOW + 5 * 24 * 60 * 60 * 1_000, windowMinutes: null, observedAtMs: NOW,
           },
           {
-            kind: 'claude_five_hour',
-            scopeLabel: null, label: '5-hour session', status: 'ok', usedPercent: 3,
+            kind: 'claude_five_hour', label: '5-hour session', status: 'ok', usedPercent: 3,
             percentSource: 'poll', percentObservedAtMs: NOW,
             resetsAtMs: IN_AN_HOUR, windowMinutes: null, observedAtMs: NOW,
           },
@@ -215,11 +204,9 @@ describe('ProviderUsageCards', () => {
     const resetsAtMs = NOW + 5 * 24 * 60 * 60 * 1_000;
     mockUsage.current = {
       claude: {
-        provider: 'claude',
-        spend: null, planType: 'max', observedAtMs: NOW,
+        provider: 'claude', planType: 'max', observedAtMs: NOW,
         windows: [{
-          kind: 'claude_seven_day',
-          scopeLabel: null, label: 'Weekly', status: 'ok', usedPercent: 13,
+          kind: 'claude_seven_day', label: 'Weekly', status: 'ok', usedPercent: 13,
           percentSource: 'poll', percentObservedAtMs: NOW,
           resetsAtMs, windowMinutes: null, observedAtMs: NOW,
         }],
@@ -290,12 +277,10 @@ describe('ProviderUsageCards', () => {
       ...claudeState(20),
       codex: {
         provider: 'codex',
-        spend: null,
         planType: 'prolite',
         observedAtMs: NOW,
         windows: [{
           kind: 'codex_primary',
-          scopeLabel: null,
           label: 'Weekly',
           status: 'warning',
           usedPercent: 59,
@@ -311,104 +296,5 @@ describe('ProviderUsageCards', () => {
     expect(screen.getByTestId('usage-card-claude')).toBeInTheDocument();
     expect(screen.getByTestId('usage-card-codex')).toHaveTextContent('prolite');
     expect(screen.getByText('59%')).toBeInTheDocument();
-  });
-
-  it('renders a per-model weekly bucket as its own row', () => {
-    mockUsage.current = {
-      claude: {
-        provider: 'claude',
-        spend: null,
-        planType: 'max',
-        observedAtMs: NOW,
-        windows: [{
-          kind: 'claude_model_scoped',
-          scopeLabel: 'Fable',
-          label: 'Weekly (Fable)',
-          status: 'ok',
-          usedPercent: 24,
-          percentSource: 'poll',
-          percentObservedAtMs: NOW,
-          resetsAtMs: IN_AN_HOUR,
-          windowMinutes: null,
-          observedAtMs: NOW,
-        }],
-      },
-    };
-    render(<ProviderUsageCards />);
-    // Keyed by bucket, not by kind — two model rows must not share a testid.
-    expect(screen.getByTestId('usage-window-claude_model_scoped:Fable')).toHaveTextContent('Weekly (Fable)');
-    expect(screen.getByText('24%')).toBeInTheDocument();
-  });
-
-  it('renders extra-usage credits with their amounts and switched-off state', () => {
-    mockUsage.current = {
-      claude: {
-        provider: 'claude',
-        planType: 'max',
-        observedAtMs: NOW,
-        spend: {
-          usedMinor: 1393,
-          limitMinor: 1000,
-          currency: 'USD',
-          exponent: 2,
-          percent: 100,
-          enabled: false,
-          disabledReason: 'org_level_disabled_until',
-        },
-        windows: [{
-          kind: 'claude_five_hour',
-          scopeLabel: null,
-          label: '5-hour session',
-          status: 'ok',
-          usedPercent: 24,
-          percentSource: 'poll',
-          percentObservedAtMs: NOW,
-          resetsAtMs: IN_AN_HOUR,
-          windowMinutes: null,
-          observedAtMs: NOW,
-        }],
-      },
-    };
-    render(<ProviderUsageCards />);
-    const spendRow = screen.getByTestId('usage-spend');
-    // The spend can EXCEED its own cap, so both amounts are shown rather than a
-    // bar alone; "off" is the part that changes what you do about it.
-    expect(spendRow).toHaveTextContent('$13.93 of $10.00');
-    expect(screen.getByTestId('usage-spend-off')).toHaveTextContent('off');
-  });
-
-  it('draws NO credits row for an account that has never switched extra usage on', () => {
-    mockUsage.current = {
-      claude: {
-        provider: 'claude',
-        planType: 'max',
-        observedAtMs: NOW,
-        // Verbatim from a live poll on an account with no credits: the provider
-        // reports the line in full, and it says nothing.
-        spend: {
-          usedMinor: 0,
-          limitMinor: null,
-          currency: 'USD',
-          exponent: 2,
-          percent: 0,
-          enabled: false,
-          disabledReason: null,
-        },
-        windows: [{
-          kind: 'claude_five_hour',
-          scopeLabel: null,
-          label: '5-hour session',
-          status: 'ok',
-          usedPercent: 24,
-          percentSource: 'poll',
-          percentObservedAtMs: NOW,
-          resetsAtMs: IN_AN_HOUR,
-          windowMinutes: null,
-          observedAtMs: NOW,
-        }],
-      },
-    };
-    render(<ProviderUsageCards />);
-    expect(screen.queryByTestId('usage-spend')).not.toBeInTheDocument();
   });
 });

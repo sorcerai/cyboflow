@@ -76,8 +76,6 @@ const INITIAL_ONBOARDING_STATE = {
   ompDetection: null,
   ompConnected: false,
   permMode: 'auto' as const,
-  defaultProvider: null,
-  multiRuntime: true,
   hydrated: false,
 };
 
@@ -165,10 +163,7 @@ describe('OnboardingGate — Connect step (1) provider access', () => {
         agentProviderAccess: { claude: true, codex: false, omp: false },
       }),
     );
-    // ONE activated provider, so the conditional Default-agent step (2) has no
-    // question to ask and Continue lands straight on Permission (3).
-    await waitFor(() => expect(useOnboardingStore.getState().step).toBe(3));
-    expect(useOnboardingStore.getState().multiRuntime).toBe(false);
+    await waitFor(() => expect(useOnboardingStore.getState().step).toBe(2));
   });
 
   it('writes both providers on when the user enables both', async () => {
@@ -183,9 +178,6 @@ describe('OnboardingGate — Connect step (1) provider access', () => {
         agentProviderAccess: { claude: true, codex: true, omp: false },
       }),
     );
-    // TWO activated providers ⇒ the Default-agent step is part of this run.
-    await waitFor(() => expect(useOnboardingStore.getState().step).toBe(2));
-    expect(useOnboardingStore.getState().multiRuntime).toBe(true);
   });
 
   it('leaves OMP off by default even when Continue is clicked without touching its toggle', async () => {
@@ -216,8 +208,6 @@ describe('OnboardingGate — Connect step (1) provider access', () => {
         agentProviderAccess: { claude: true, codex: false, omp: true },
       }),
     );
-    // Claude + OMP both activated — OMP counts toward the Default-agent step
-    // even though it never counts toward the Continue gate.
     await waitFor(() => expect(useOnboardingStore.getState().step).toBe(2));
   });
 
@@ -248,6 +238,6 @@ describe('OnboardingGate — Connect step (1) provider access', () => {
     fireEvent.click(screen.getByRole('switch', { name: 'Use Codex in Cyboflow' }));
     fireEvent.click(screen.getByRole('button', { name: /Continue/ }));
 
-    await waitFor(() => expect(useOnboardingStore.getState().step).toBe(3));
+    await waitFor(() => expect(useOnboardingStore.getState().step).toBe(2));
   });
 });

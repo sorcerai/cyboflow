@@ -88,12 +88,6 @@ export interface ShellHookOptions {
   socketPath: string;
   /** Resolved CYBOFLOW_RUN_ID (workflow_runs.id; TASK-800). */
   runId: string;
-  /**
-   * Resolved CYBOFLOW_ORCH_TOKEN — this run's bearer token (orchAuthToken.ts).
-   * The orchestrator refuses to bind `runId` without it and closes the socket,
-   * which this hook reports as a liveness failure (fail closed).
-   */
-  token?: string;
   /** The parsed PreToolUse payload from stdin. */
   payload: PreToolUsePayload;
   /** Logger for connect/disconnect/skip diagnostics (stderr-backed in prod). */
@@ -147,7 +141,7 @@ function denyResult(reason?: string): ShellHookResult {
  * timer test advances minutes of idle and still gets the real verdict.
  */
 export function runShellHook(opts: ShellHookOptions): Promise<ShellHookResult> {
-  const { socketPath, runId, token, payload, logger } = opts;
+  const { socketPath, runId, payload, logger } = opts;
   const connect = opts.connect ?? ((p: string) => net.createConnection(p));
 
   const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : '';
@@ -182,14 +176,7 @@ export function runShellHook(opts: ShellHookOptions): Promise<ShellHookResult> {
     socket.on('connect', () => {
       logger.debug(`[Cyboflow PreToolUse hook] connected to orchestrator (run ${runId})`);
       const line =
-        JSON.stringify({
-          type: 'shell-approval-request',
-          requestId,
-          runId,
-          toolName,
-          toolInput,
-          ...(token !== undefined ? { token } : {}),
-        }) + '\n';
+        JSON.stringify({ type: 'shell-approval-request', requestId, runId, toolName, toolInput }) + '\n';
       socket.write(line);
     });
 
@@ -316,13 +303,7 @@ export async function main(): Promise<void> {
   }
 
   const payload = await readStdinPayload(process.stdin);
-  const result = await runShellHook({
-    socketPath,
-    runId,
-    token: process.env.CYBOFLOW_ORCH_TOKEN,
-    payload,
-    logger: stderrLogger,
-  });
+  const result = await runShellHook({ socketPath, runId, payload, logger: stderrLogger });
   emitAndExit(result);
 }
 

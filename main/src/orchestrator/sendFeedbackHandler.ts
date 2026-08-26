@@ -83,11 +83,10 @@ export interface SendFeedbackInput {
 // Revision-launcher registry
 // ---------------------------------------------------------------------------
 //
-// The production `launchRevision` closure binds runRevisionBatch to a
-// makeRevisionQuery instance (which needs the boot-resolved claudeExecutablePath)
-// + TaskChangeRouter, so it CANNOT be built inside the
-// standalone-typecheck-invariant tRPC router. index.ts wires it here at boot; the
-// feedback router reads it via getRevisionLauncher() to assemble deps.
+// The production `launchRevision` closure binds runRevisionBatch to
+// makeRevisionQuery (a service import) + TaskChangeRouter, so it CANNOT be built
+// inside the standalone-typecheck-invariant tRPC router. index.ts wires it here at
+// boot; the feedback router reads it via getRevisionLauncher() to assemble deps.
 
 let launchRevisionImpl: ((info: RevisionBatchInfo) => Promise<void>) | null = null;
 

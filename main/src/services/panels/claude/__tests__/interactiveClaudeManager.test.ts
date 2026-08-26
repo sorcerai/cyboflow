@@ -27,7 +27,6 @@ import * as path from 'path';
 import type Database from 'better-sqlite3';
 import { makeRawEventsDb, countRawEvents } from '../../../../orchestrator/__test_fixtures__/rawEvents';
 import { ApprovalRouter } from '../../../../orchestrator/approvalRouter';
-import { orchTokenRegistry } from '../../../../orchestrator/orchAuthToken';
 import { QuestionRouter } from '../../../../orchestrator/questionRouter';
 import { dbAdapter } from '../../../../orchestrator/__test_fixtures__/dbAdapter';
 import { createTestDb } from '../../../../orchestrator/__test_fixtures__/orchestratorTestDb';
@@ -779,23 +778,6 @@ describe('InteractiveClaudeManager', () => {
       );
     });
 
-    // Bearer token (orchAuthToken.ts). The interactive substrate is the one
-    // path whose MCP config lives ON DISK, so the token deliberately travels in
-    // the PTY env instead — the claude CLI passes its full process env down to
-    // stdio MCP servers and to the PreToolUse/Stop/Question shell hooks.
-    it('exports a CYBOFLOW_ORCH_TOKEN that verifies against the resolved run id', async () => {
-      mgr.setOrchSocketPath('/tmp/orch.sock');
-      const env = await mgr.callInitializeCliEnvironment({ ...opts, runId: 'run-tok-i' });
-      expect(env.CYBOFLOW_RUN_ID).toBe('run-tok-i');
-      expect(orchTokenRegistry.verify('run-tok-i', env.CYBOFLOW_ORCH_TOKEN)).toBe(true);
-      expect(orchTokenRegistry.verify('run-other', env.CYBOFLOW_ORCH_TOKEN)).toBe(false);
-    });
-
-    it('omits CYBOFLOW_ORCH_TOKEN when no orchestrator socket is injected', async () => {
-      const env = await mgr.callInitializeCliEnvironment(opts);
-      expect(env.CYBOFLOW_ORCH_TOKEN).toBeUndefined();
-    });
-
     it('omits CYBOFLOW_RUN_ARTIFACTS_DIR when no orchestrator socket is injected', async () => {
       const env = await mgr.callInitializeCliEnvironment(opts);
       expect(env.CYBOFLOW_RUN_ARTIFACTS_DIR).toBeUndefined();
@@ -1049,9 +1031,6 @@ describe('InteractiveClaudeManager', () => {
           mcpServers?: { cyboflow?: { env?: Record<string, string> } };
         };
         expect(written.mcpServers?.cyboflow?.env?.CYBOFLOW_ORCH_SOCKET).toBe('/tmp/orch.sock');
-        // The bearer token must NOT be in the file — it rides the PTY env.
-        expect(written.mcpServers?.cyboflow?.env?.CYBOFLOW_ORCH_TOKEN).toBeUndefined();
-        expect(fs.readFileSync(appConfigPath, 'utf8')).not.toMatch(/[0-9a-f]{64}/);
 
         // …and the user's checkout was NOT touched: no .cyboflow dir, no
         // .git/info/exclude append.
@@ -1712,54 +1691,6 @@ describe('InteractiveClaudeManager', () => {
       // so its completion promise never resolves. Detach it so vitest does not
       // flag an unhandled pending promise.
       void spawnA;
-    });
-
-    it('two panels sharing ONE session (Add-chat): killing the second-spawned panel tears down ONLY that panel, not the first', async () => {
-      // Regression for the sessionId->panelId lookup bug: cleanupCliResources
-      // used to derive "the" panel for a sessionId via findPanelIdForSession,
-      // which returned whichever panel happened to iterate first out of
-      // interactiveRuns/processes (insertion order == panel-A, spawned first)
-      // — REGARDLESS of which panel's process actually exited. Killing
-      // panel-B (spawned second, sharing panel-A's session) used to tear down
-      // panel-A's live run instead, because it was "the" panel for that
-      // session. The fix threads panelId straight through from the base
-      // contract, so this must tear down exactly the panel that was killed.
-      const sharedSessionId = 'sess-shared';
-      const spawnA = mgr.spawnCliProcess({ panelId: 'panel-A', sessionId: sharedSessionId, worktreePath: '/tmp/A', prompt: 'a' });
-      await waitFor(() => mgr.fakeSources.length >= 1 && mgr.fakeSources[0].started);
-      const spawnB = mgr.spawnCliProcess({ panelId: 'panel-B', sessionId: sharedSessionId, worktreePath: '/tmp/B', prompt: 'b' });
-      await waitFor(() => mgr.fakeSources.length >= 2 && mgr.fakeSources[1].started);
-
-      const srcA = mgr.fakeSources[0];
-      const srcB = mgr.fakeSources[1];
-      expect(mgr.publicInteractiveRuns().has('panel-A')).toBe(true);
-      expect(mgr.publicInteractiveRuns().has('panel-B')).toBe(true);
-
-      // Kill panel-B — the SECOND panel spawned into the shared session.
-      await mgr.killProcess('panel-B');
-
-      // Only B's TranscriptSource stopped; A (still live) must be untouched.
-      expect(srcB.stopped).toBe(true);
-      expect(srcA.stopped).toBe(false);
-
-      // Router pending cleared under B's id, never A's.
-      expect(clearApprovalSpy).toHaveBeenCalledWith('panel-B');
-      expect(clearApprovalSpy).not.toHaveBeenCalledWith('panel-A');
-
-      // B's maps cleared; A's sibling entries survive — no cross-panel leak.
-      expect(mgr.publicInteractiveRuns().has('panel-B')).toBe(false);
-      expect(mgr.publicTailSources().has('panel-B')).toBe(false);
-      expect(mgr.publicPipelines().has('panel-B')).toBe(false);
-      expect(mgr.publicInteractiveRuns().has('panel-A')).toBe(true);
-      expect(mgr.publicTailSources().has('panel-A')).toBe(true);
-      expect(mgr.publicPipelines().has('panel-A')).toBe(true);
-
-      // Drain A cleanly to release its pending spawn promise.
-      mgr.ptys[0].fireExit(0);
-      await new Promise((r) => setTimeout(r, 600));
-      await spawnA;
-
-      void spawnB;
     });
   });
 

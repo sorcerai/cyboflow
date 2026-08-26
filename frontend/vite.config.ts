@@ -20,19 +20,12 @@ import { createHash } from 'node:crypto';
  * browsers ignore any `'unsafe-inline'` in the same directive anyway.
  *
  * Per-directive notes:
- *   script-src   'self' + inline hashes only. NO 'unsafe-eval' — nothing in the
- *                bundle was found to need it. Monaco is self-hosted from the
- *                local `monaco-editor` package (see src/utils/monacoLoader.ts)
- *                rather than fetched from a CDN, so there is no remote script
- *                host to allow here — that used to be jsdelivr, a standing RCE
- *                surface for a renderer with IPC powers; deleting the entry was
- *                the whole point of self-hosting.
+ *   script-src   'self' + inline hashes + jsdelivr (see MONACO_CDN below). NO
+ *                'unsafe-eval' — nothing in the bundle was found to need it.
  *   style-src    'unsafe-inline' is required: Monaco, xterm and react-remark all
  *                inject <style> elements at runtime. Accepted for v1.
  *   font-src     @fontsource woff2 ship in the bundle ('self'); `data:` covers
- *                any inlined font; Monaco's codicon.ttf (~80KB, above Vite's
- *                inline threshold) is emitted as a hashed build asset and
- *                served from 'self' too.
+ *                Monaco's inlined codicon font.
  *   img-src      artifact screenshots arrive over IPC as base64 `data:` URLs
  *                (see electron.d.ts artifacts:*), and log/file exports build
  *                `blob:` object URLs.
@@ -43,7 +36,8 @@ import { createHash } from 'node:crypto';
  *                frame-src (they inherit the embedder's policy).
  *   connect-src  the renderer makes NO direct network calls — Sentry runs
  *                through @sentry/electron/renderer (IPC to main) and Aptabase
- *                is main-process only.
+ *                is main-process only. jsdelivr is listed for the Monaco
+ *                loader's own fetches.
  *   object-src / base-uri  hard 'none': no plugin content, and no <base> tag
  *                hijack of the relative asset paths this `base: './'` build uses.
  *
@@ -51,16 +45,26 @@ import { createHash } from 'node:crypto';
  * when delivered via <meta>, so listing them would only produce console noise.
  */
 
+/**
+ * Monaco is loaded from jsdelivr at runtime: `@monaco-editor/react` defaults to
+ * the CDN AMD loader and this project never calls `loader.config({ paths })`, so
+ * the editor and diff panels fetch monaco-editor over the network even in the
+ * packaged app. Allowing the host here keeps those panels working; it is also a
+ * standing finding — self-hosting monaco would let this entry (and the
+ * remote-script trust it implies) be deleted.
+ */
+const MONACO_CDN = 'https://cdn.jsdelivr.net';
+
 function buildCsp(inlineScriptHashes: string[]): string {
   const hashes = inlineScriptHashes.map((h) => `'${h}'`).join(' ');
   return [
     `default-src 'self'`,
-    `script-src 'self' ${hashes}`.replace(/\s+/g, ' '),
-    `style-src 'self' 'unsafe-inline'`,
-    `font-src 'self' data:`,
+    `script-src 'self' ${hashes} ${MONACO_CDN}`.replace(/\s+/g, ' '),
+    `style-src 'self' 'unsafe-inline' ${MONACO_CDN}`,
+    `font-src 'self' data: ${MONACO_CDN}`,
     `img-src 'self' data: blob:`,
     `media-src 'self' data: blob:`,
-    `connect-src 'self' data: blob:`,
+    `connect-src 'self' data: blob: ${MONACO_CDN}`,
     `worker-src 'self' blob:`,
     `child-src 'self' blob:`,
     `frame-src 'self' blob: http://localhost:* http://127.0.0.1:*`,

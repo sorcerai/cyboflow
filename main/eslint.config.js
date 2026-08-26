@@ -23,63 +23,6 @@ module.exports = [
     }
   },
   {
-    // Standalone-typecheck invariant (docs/ARCHITECTURE.md → "Team-tier v2"):
-    // main/src/orchestrator/** must stay extractable to a plain Node service, so
-    // it may not reach for Electron or for a concrete service implementation.
-    // The seam is a DatabaseLike-style interface or a value injected by the boot
-    // wiring in main/src/index.ts.
-    //
-    // `allowTypeImports` is on because a type-only import is erased by tsc and so
-    // never binds the extracted service to anything at runtime. The companion
-    // ratchet test (src/orchestrator/__tests__/standaloneInvariant.test.ts) scans
-    // the same tree for dynamic `require('electron')`, which no import rule sees,
-    // and holds the frozen exemption list.
-    files: ['src/orchestrator/**/*.ts'],
-    ignores: [
-      'src/orchestrator/**/*.test.ts',
-      'src/orchestrator/**/*.itest.ts',
-      'src/orchestrator/**/__tests__/**'
-    ],
-    rules: {
-      '@typescript-eslint/no-restricted-imports': ['error', {
-        paths: [{
-          name: 'electron',
-          message:
-            'orchestrator/** must stay standalone-extractable: no electron. Inject the fact you need from main/src/index.ts instead (see docs/ARCHITECTURE.md).',
-          allowTypeImports: true
-        }],
-        patterns: [{
-          group: ['**/services/*', '**/services/**'],
-          message:
-            'orchestrator/** must not import a concrete service: depend on an interface (DatabaseLike-style) or take the value from the boot wiring in main/src/index.ts.',
-          allowTypeImports: true
-        }]
-      }]
-    }
-  },
-  {
-    // Frozen exemptions to the rule above. This list may SHRINK, never grow —
-    // the ratchet test carries the same set with a reason for each entry and
-    // fails if one goes stale. Keep the two lists in sync.
-    files: [
-      'src/orchestrator/trpc/ipcAdapter.ts',
-      'src/orchestrator/mcpServer/scriptPath.ts',
-      'src/orchestrator/runEventBridge.ts',
-      'src/orchestrator/runRawEventsListing.ts',
-      'src/orchestrator/runUnifiedMessagesListing.ts',
-      'src/orchestrator/agentThreadUnifiedMessagesListing.ts',
-      'src/orchestrator/verify/codexVerificationAgentQuery.ts',
-      'src/orchestrator/dynamicWorkflows/dynamicWorkflowTracker.ts',
-      'src/orchestrator/eval/evalJury.ts',
-      'src/orchestrator/eval/pairwiseJudge.ts',
-      'src/orchestrator/eval/codexPairwiseJudge.ts',
-      'src/orchestrator/agentThread/agentThreadEventsSink.ts'
-    ],
-    rules: {
-      '@typescript-eslint/no-restricted-imports': 'off'
-    }
-  },
-  {
     ignores: ['dist/', 'node_modules/', '*.config.js']
   }
 ];

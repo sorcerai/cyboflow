@@ -33,13 +33,8 @@ import { useAgentProviderAccess } from '../../hooks/useAgentProviderAccess';
 import { isAgentProviderEnabled } from '../../../../shared/types/agentRuntime';
 import {
   USAGE_PROVIDER_LABELS,
-  formatSpendAmount,
-  hasSpendToShow,
   isPercentPossiblyStale,
-  usageTier,
   usageWindowFillClass,
-  usageWindowKey,
-  type ProviderSpendSummary,
   type ProviderUsageSnapshot,
   type ProviderUsageWindow,
   type UsageProvider,
@@ -128,7 +123,7 @@ function UsageMeterRow({
   const timeLeft = formatTimeLeft(usageWindow.resetsAtMs, nowMs);
   const resetClock = formatResetClock(usageWindow.resetsAtMs, nowMs);
   return (
-    <div className="flex items-center gap-2.5 text-xs" data-testid={`usage-window-${usageWindowKey(usageWindow)}`}>
+    <div className="flex items-center gap-2.5 text-xs" data-testid={`usage-window-${usageWindow.kind}`}>
       <span className="w-[104px] shrink-0 truncate text-text-secondary">{usageWindow.label}</span>
       {/* Meter anatomy matches ChatMetaStrip's context meter so the two read as
           one family: 6px track, 1px border, sunken fill, absolute bar. */}
@@ -179,63 +174,6 @@ function UsageMeterRow({
   );
 }
 
-/**
- * Extra-usage credits — the money line, laid out on the same grid as the quota
- * rows so the card reads as one table.
- *
- * It is NOT a quota window and is never sorted among them: the balance can pass
- * its own cap (13.93 against a 10.00 limit) and, when extra usage is switched
- * off, a full meter means nothing will be charged — not that a lane is about to
- * stop. Hence the trailing "off", which is the part that changes what you do.
- */
-function SpendRow({ spend }: { spend: ProviderSpendSummary }): React.ReactElement {
-  const used = formatSpendAmount(spend.usedMinor, spend.currency, spend.exponent);
-  const limit = spend.limitMinor === null
-    ? null
-    : formatSpendAmount(spend.limitMinor, spend.currency, spend.exponent);
-  const fillClass = spend.percent === null ? null : usageTier(spend.percent).fillClass;
-  return (
-    <div className="flex items-center gap-2.5 text-xs" data-testid="usage-spend">
-      <span className="w-[104px] shrink-0 truncate text-text-secondary">Extra usage</span>
-      <span
-        className="relative h-1.5 w-[84px] shrink-0 overflow-hidden border border-border-primary bg-surface-sunken"
-        aria-hidden
-      >
-        {fillClass !== null && (
-          <span
-            className={`absolute inset-y-0 left-0 ${fillClass}`}
-            style={{ width: `${Math.min(spend.percent ?? 0, 100)}%` }}
-          />
-        )}
-      </span>
-      {spend.percent === null ? (
-        <span className="text-text-tertiary" data-testid="usage-spend-no-percent">n/a</span>
-      ) : (
-        <span className="w-9 shrink-0 text-right tabular-nums text-text-primary">
-          {Math.round(spend.percent)}%
-        </span>
-      )}
-      <span className="truncate tabular-nums text-text-tertiary">
-        {limit === null ? used : `${used} of ${limit}`}
-      </span>
-      {!spend.enabled && (
-        // Switched off: the balance above is history, not headroom.
-        <span
-          className="shrink-0 text-[10px] uppercase tracking-[0.08em] text-text-muted"
-          title={
-            spend.disabledReason === null
-              ? 'Extra usage is switched off'
-              : `Extra usage is switched off (${spend.disabledReason})`
-          }
-          data-testid="usage-spend-off"
-        >
-          off
-        </span>
-      )}
-    </div>
-  );
-}
-
 function ProviderCard({
   snapshot,
   nowMs,
@@ -260,12 +198,7 @@ function ProviderCard({
       </div>
 
       <div className="mt-2 flex flex-col gap-1.5">
-        {snapshot.windows.map((w) => (
-          <UsageMeterRow key={usageWindowKey(w)} window={w} nowMs={nowMs} />
-        ))}
-        {snapshot.spend !== null && hasSpendToShow(snapshot.spend) && (
-          <SpendRow spend={snapshot.spend} />
-        )}
+        {snapshot.windows.map((w) => <UsageMeterRow key={w.kind} window={w} nowMs={nowMs} />)}
       </div>
 
       <div className={`mt-2 text-[11px] ${isStale ? 'text-status-warning' : 'text-text-muted'}`}>

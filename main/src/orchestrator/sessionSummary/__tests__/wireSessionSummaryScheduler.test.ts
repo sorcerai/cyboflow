@@ -53,8 +53,6 @@ const OK_RESULT: SessionSummarizerResult = {
   summary: 'current state',
   historySentences: ['did a thing'],
   costUsd: 0.0001,
-  state: null,
-  waitingOn: null,
 };
 
 interface Harness {

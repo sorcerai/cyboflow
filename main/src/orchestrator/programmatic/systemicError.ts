@@ -197,16 +197,6 @@ const SHAPE_PATTERNS: SystemicPattern[] = [
     pattern: /\berror_[a-z]+(?:_[a-z]+)*\b/,
   },
   {
-    // claudeCodeManager's own fallback literal, used when the SDK's `result`
-    // event reports an error but carries no `.result` text. It named no cause,
-    // so it fell all the way through to 'other' and made that bucket
-    // permanently unactionable (CYBOFLOW-APP-B). Naming it here does not
-    // explain the failure — it separates "the SDK told us nothing" from "we
-    // failed to classify what the SDK told us", which are different bugs.
-    name: 'sdk-result-unspecified',
-    pattern: /agent session ended with an error/i,
-  },
-  {
     // An explicit abort/cancel that reached the failure path.
     name: 'aborted',
     pattern: /\bAbortError\b|\baborted\b/i,
@@ -296,117 +286,6 @@ export function classifyErrorPattern(error: string | undefined): string {
   const shape = SHAPE_PATTERNS.find(({ pattern }) => pattern.test(error));
   if (shape) return shape.name;
   return 'other';
-}
-
-/**
- * The classes that name no cause. An event tagged with one of these tells a
- * triager nothing beyond "it failed", which is why the fingerprint tags below
- * exist and why they are attached for exactly these two values.
- */
-const UNCLASSIFIED_CLASSES: ReadonlySet<string> = new Set(['other', 'unknown']);
-
-/**
- * Fixed vocabulary for {@link describeErrorShape} — every return value appears
- * here, so the tag stays low-cardinality by construction.
- */
-type ErrorShape =
-  | 'empty'
-  | 'json-envelope'
-  | 'stack-trace'
-  | 'multiline'
-  | 'one-line-short'
-  | 'one-line-long';
-
-/**
- * The STRUCTURE of an error string, with none of its content. Cheap to read off
- * a Sentry tag and enough to tell apart the failure modes that currently share
- * the `'other'` bucket: an API envelope surfaced verbatim, a thrown stack, a
- * one-line message.
- */
-export function describeErrorShape(error: string | undefined): ErrorShape {
-  const text = error?.trim();
-  if (!text) return 'empty';
-  if (text.startsWith('{') || text.startsWith('[')) return 'json-envelope';
-  if (/\n\s+at\s/.test(text)) return 'stack-trace';
-  if (text.includes('\n')) return 'multiline';
-  return text.length <= 120 ? 'one-line-short' : 'one-line-long';
-}
-
-/**
- * Reduce an error string to its SKELETON: the invariant scaffolding of the
- * message with every value-carrying part replaced by a placeholder. Paths,
- * URLs, emails, ids, numbers and quoted spans are exactly the parts that vary
- * between two occurrences of the same failure — and exactly the parts that can
- * carry a user's code, repo name or prompt. Removing them serves grouping and
- * privacy at once.
- *
- * Order matters: URLs and emails are consumed before the generic path rule,
- * which would otherwise eat their insides and leave a different skeleton.
- */
-function skeletonize(text: string): string {
-  return text
-    .replace(/\bhttps?:\/\/\S+/gi, '<url>')
-    .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, '<email>')
-    .replace(/\b[0-9a-f]{8,}\b/gi, '<hex>')
-    .replace(/(?:\/[^\s'"`,;:()\[\]{}]+){2,}/g, '<path>')
-    .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, '<str>')
-    .replace(/\d+/g, '#')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
-    .slice(0, 400);
-}
-
-/**
- * A stable 8-hex digest of {@link skeletonize}'s output (FNV-1a, 32-bit).
- *
- * WHAT IT BUYS. `errorClass: 'other'` cannot say whether 93 events are one bug
- * or twenty — this can, without ever shipping the message itself. Two events
- * that share a digest are the same failure; a bucket that splits into three
- * digests is three bugs. The raw text for a digest is already on the reporting
- * machine, in the local error buffer captureSeamError writes before Sentry is
- * consulted, so a digest is also the join key between an inbox group and a
- * user's own logs or bug report.
- *
- * FNV-1a rather than a crypto hash: this module is pure and dependency-free by
- * contract (it must stay importable from the standalone-typechecked plane), and
- * collision resistance is not a security property here — a collision merges two
- * groups a human then splits by reading the local text.
- */
-export function digestErrorSkeleton(error: string | undefined): string {
-  const skeleton = skeletonize(error ?? '');
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < skeleton.length; i++) {
-    hash ^= skeleton.charCodeAt(i);
-    // FNV prime (16777619) by shift-add, kept in 32-bit unsigned space.
-    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
-  }
-  return hash.toString(16).padStart(8, '0');
-}
-
-/**
- * The extra Sentry tags an UNCLASSIFIED failure should carry, and nothing at
- * all for a classified one — `errorClass: 'auth-failure'` already says what
- * happened, so adding a shape and a digest to it would only inflate tag
- * cardinality.
- *
- * Spread into a captureSeamError tag bag at the seams that classify a raw
- * message:
- *
- * ```ts
- * const errorClass = classifyErrorPattern(message);
- * captureSeamError('some-seam', new Error(`… (${errorClass})`), {
- *   errorClass,
- *   ...unclassifiedErrorTags(errorClass, message),
- * });
- * ```
- */
-export function unclassifiedErrorTags(
-  errorClass: string,
-  error: string | undefined,
-): Record<string, string> {
-  if (!UNCLASSIFIED_CLASSES.has(errorClass)) return {};
-  return { errorShape: describeErrorShape(error), errorDigest: digestErrorSkeleton(error) };
 }
 
 /** Garbage guard: never trust a computed reset delay beyond this horizon. */

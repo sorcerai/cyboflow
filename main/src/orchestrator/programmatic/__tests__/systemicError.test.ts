@@ -1,12 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  isSystemicStepError,
-  parseLimitResetDelayMs,
-  classifyErrorPattern,
-  describeErrorShape,
-  digestErrorSkeleton,
-  unclassifiedErrorTags,
-} from '../systemicError';
+import { isSystemicStepError, parseLimitResetDelayMs, classifyErrorPattern } from '../systemicError';
 
 describe('isSystemicStepError', () => {
   const positives: Array<[string, string]> = [
@@ -224,89 +217,5 @@ describe('parseLimitResetDelayMs', () => {
 
   it('returns null for undefined error text', () => {
     expect(parseLimitResetDelayMs(undefined, nowMs)).toBeNull();
-  });
-});
-
-describe('describeErrorShape', () => {
-  it.each([
-    ['undefined', undefined, 'empty'],
-    ['whitespace only', '   \n  ', 'empty'],
-    ['JSON object envelope', '{"type":"overloaded"}', 'json-envelope'],
-    ['JSON array envelope', '[{"code":1}]', 'json-envelope'],
-    ['thrown stack', 'Boom\n    at run (index.js:1:1)', 'stack-trace'],
-    ['multiline prose', 'Boom\nsomething else went wrong', 'multiline'],
-    ['short one-liner', 'Boom', 'one-line-short'],
-    ['long one-liner', 'x'.repeat(121), 'one-line-long'],
-  ])('classifies %s', (_label, input, expected) => {
-    expect(describeErrorShape(input)).toBe(expected);
-  });
-
-  it('prefers the stack shape over the plain multiline shape', () => {
-    // Both rules match a stack; the more specific one must win or every stack
-    // collapses into the generic 'multiline' bucket.
-    expect(describeErrorShape('Boom\nsecond line\n    at run (index.js:1:1)')).toBe('stack-trace');
-  });
-});
-
-describe('digestErrorSkeleton', () => {
-  it('is stable for the same message', () => {
-    expect(digestErrorSkeleton('spawn failed for panel')).toBe(digestErrorSkeleton('spawn failed for panel'));
-  });
-
-  it('is 8 lowercase hex characters', () => {
-    expect(digestErrorSkeleton('anything at all')).toMatch(/^[0-9a-f]{8}$/);
-  });
-
-  it('ignores the varying parts: paths, ids, numbers, urls, quoted spans', () => {
-    // Two occurrences of ONE failure on two machines must group together.
-    const a = 'failed to read /Users/ada/dev/repo/src/a.ts for panel 4f2c1a9b7d (attempt 3) from https://api.example.com/v1 saying "no such file"';
-    const b = 'failed to read /Users/bob/work/other/src/zzz.ts for panel 91ce77aa02 (attempt 11) from https://api.other.dev/v2 saying "still missing"';
-    expect(digestErrorSkeleton(a)).toBe(digestErrorSkeleton(b));
-  });
-
-  it('separates genuinely different failures', () => {
-    expect(digestErrorSkeleton('spawn ENOENT')).not.toBe(digestErrorSkeleton('connection reset by peer'));
-  });
-
-  it('ignores case and whitespace runs', () => {
-    expect(digestErrorSkeleton('Spawn   Failed')).toBe(digestErrorSkeleton('spawn failed'));
-  });
-
-  it('digests an absent message without throwing', () => {
-    expect(digestErrorSkeleton(undefined)).toMatch(/^[0-9a-f]{8}$/);
-  });
-});
-
-describe('unclassifiedErrorTags', () => {
-  it('adds shape + digest for the unclassified buckets', () => {
-    const tags = unclassifiedErrorTags('other', 'something we could not name');
-    expect(tags).toEqual({ errorShape: 'one-line-short', errorDigest: expect.stringMatching(/^[0-9a-f]{8}$/) });
-    expect(Object.keys(unclassifiedErrorTags('unknown', undefined))).toEqual(['errorShape', 'errorDigest']);
-  });
-
-  it('adds nothing to an already-classified failure', () => {
-    // errorClass already names the cause; extra tags would only inflate cardinality.
-    expect(unclassifiedErrorTags('auth-failure', 'invalid api key')).toEqual({});
-    expect(unclassifiedErrorTags('binary-missing', 'spawn claude ENOENT')).toEqual({});
-  });
-
-  it('tags exactly the classes classifyErrorPattern leaves unnamed', () => {
-    const unnamed = 'the quick brown fox jumped';
-    expect(classifyErrorPattern(unnamed)).toBe('other');
-    expect(unclassifiedErrorTags(classifyErrorPattern(unnamed), unnamed)).not.toEqual({});
-  });
-});
-
-describe("classifyErrorPattern: the SDK's own unspecified-result literal", () => {
-  it("names claudeCodeManager's fallback literal instead of dropping it in 'other'", () => {
-    // The fallback the SDK result path uses when the result event carries no
-    // text — the largest contributor to the opaque 'other' bucket.
-    expect(classifyErrorPattern('The agent session ended with an error.')).toBe('sdk-result-unspecified');
-  });
-
-  it('still lets a real cause in the same message win', () => {
-    expect(classifyErrorPattern('The agent session ended with an error. usage limit reached')).toBe(
-      'usage-limit-reached',
-    );
   });
 });

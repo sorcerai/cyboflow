@@ -498,7 +498,7 @@ export class CodexSdkManager extends AbstractCliManager {
     return {};
   }
 
-  protected async cleanupCliResources(_panelId: string, _sessionId: string): Promise<void> {
+  protected async cleanupCliResources(_sessionId: string): Promise<void> {
     return;
   }
 

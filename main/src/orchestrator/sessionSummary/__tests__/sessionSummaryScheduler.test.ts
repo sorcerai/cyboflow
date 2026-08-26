@@ -68,8 +68,6 @@ const OK_RESULT: SessionSummarizerResult = {
   summary: 'current state',
   historySentences: ['did a thing'],
   costUsd: 0.0001,
-  state: null,
-  waitingOn: null,
 };
 
 /** A summarize fn resolving after a controllable deferral (default: immediate). */
@@ -445,22 +443,6 @@ describe('sessionSummaryScheduler', () => {
     scheduler.maybeSummarizeNow(SID, 'lazy-catchup');
     await flush();
     expect(persistCalls[0].costUsdDelta).toBeCloseTo(0.0025);
-  });
-
-  it('threads state and waitingOn through to persistSessionSummaryResult', async () => {
-    const { db, persistCalls } = makeFakeDb({
-      session: eligibleSession(),
-      messages: [convMsg(1, 'user', 0), convMsg(2, 'assistant', 1000)],
-    });
-    const scheduler = makeSessionSummaryScheduler(
-      makeDeps({ summarize: makeSummarize({ ...OK_RESULT, state: 'needs_input', waitingOn: 'X?' }) }, db),
-    );
-
-    scheduler.maybeSummarizeNow(SID, 'lazy-catchup');
-    await flush();
-
-    expect(persistCalls[0].state).toBe('needs_input');
-    expect(persistCalls[0].waitingOn).toBe('X?');
   });
 
   it('dispose() clears a pending timer so it never fires', async () => {

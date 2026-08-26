@@ -31,9 +31,9 @@ const queryMock = vi.fn();
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: (...args: unknown[]) => queryMock(...args),
 }));
-
-/** Stand-in for the boot-resolved path the wiring site now injects as the factory's first argument. */
-const FAKE_CLAUDE_EXECUTABLE_PATH = '/fake/claude';
+vi.mock('../../../services/panels/claude/claudeExecutablePath', () => ({
+  resolveClaudeExecutablePath: () => '/fake/claude',
+}));
 
 import {
   createTranscriptAccumulator,
@@ -252,7 +252,7 @@ describe('makeDependencyCommandCanUseTool — the §7.2 execution-time guard', (
 describe('makeVerificationAgentQuery — sandbox wiring', () => {
   it('installs the dependency guard as canUseTool WITHOUT weakening the hermetic options', async () => {
     install(makeFakeQuery([sdkResultSuccess({ structuredOutput: { version: 1 } })]));
-    const fn = makeVerificationAgentQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makeVerificationAgentQuery();
 
     await fn({ prompt: 'p', systemPrompt: 's', cwd: '/wt', allowedTools: ['Bash', 'Read'], env: {} });
 
@@ -261,7 +261,7 @@ describe('makeVerificationAgentQuery — sandbox wiring', () => {
     expect(opts.settingSources).toEqual([]);
     expect(opts.strictMcpConfig).toBe(true);
     expect(opts.mcpServers).toEqual({});
-    expect(opts.pathToClaudeCodeExecutable).toBe(FAKE_CLAUDE_EXECUTABLE_PATH);
+    expect(opts.pathToClaudeCodeExecutable).toBe('/fake/claude');
     // …and mutually exclusive with permissionPromptToolName, which is never set.
     expect(opts.permissionPromptToolName).toBeUndefined();
 

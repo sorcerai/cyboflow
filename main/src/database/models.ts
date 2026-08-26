@@ -50,16 +50,6 @@ export interface Session {
   status_message?: string;
   created_at: string;
   updated_at: string;
-  /**
-   * When the session last came to REST (migration 119), space-separated UTC as
-   * written by datetime('now') — DISTINCT from `updated_at`, which any write to
-   * the row bumps and so cannot serve as an activity clock. Written only inside
-   * updateSession's status transition (see IDLE_SINCE_ON_STATUS_CHANGE in
-   * database.ts) and by the boot sweep. NULL means the session is busy
-   * (`running`/`pending`) or predates the column; readers COALESCE to
-   * `updated_at`, which is the pre-migration behavior.
-   */
-  idle_since?: string | null;
   last_output?: string;
   exit_code?: number;
   pid?: number;
@@ -942,19 +932,6 @@ export interface SessionSummary {
   calls_count: number;
   cost_usd_total: number;
   updated_at: string;
-  /**
-   * Review-home board triage verdict (migration 121). Normalized at the read
-   * boundary in database.ts — only 'working' | 'complete' | 'needs_input'
-   * survive; any other value (including a not-yet-summarized row, or a
-   * future/bogus value written some other way) reads as null.
-   */
-  state: string | null;
-  /**
-   * One-sentence "what it asked you", shown on the board for a 'needs_input'
-   * row (migration 121). Normalized at the read boundary: trimmed, blank
-   * becomes null, and anything over 300 chars is truncated to it.
-   */
-  waiting_on: string | null;
 }
 
 /**

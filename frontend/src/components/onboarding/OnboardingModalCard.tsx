@@ -1,9 +1,7 @@
 import cyboflowLogo from '../../assets/cyboflow-logo.svg';
-import { visibleStepNumber, visibleStepTotal } from '../../utils/onboarding';
+import { ONBOARDING_STEP_COUNT } from '../../utils/onboarding';
 import { ONBOARDING_TITLES } from './copy';
 import { OnboardingDots } from './OnboardingDots';
-
-const NO_SKIPPED: ReadonlySet<number> = new Set<number>();
 
 /** Footer primary-button descriptor, computed per step by the gate. */
 export interface PrimaryAction {
@@ -17,8 +15,6 @@ export interface PrimaryAction {
 interface OnboardingModalCardProps {
   step: number;
   maxVisitedStep: number;
-  /** Step indices this run does not show (see OnboardingDots). */
-  skippedSteps?: ReadonlySet<number>;
   /** Step 0 renders the full-bleed hero header instead of the compact bar. */
   hero: boolean;
   children: React.ReactNode;
@@ -36,7 +32,7 @@ interface OnboardingModalCardProps {
 }
 
 /**
- * The 468×512 centered onboarding card (the modal steps). Fixed compact header
+ * The 468×512 centered onboarding card (steps 0,1,2,3,7). Fixed compact header
  * (terracotta) except step 0's hero, a scrolling body, and a fixed footer:
  * Skip · dots · Back · primary. The scrim captures pointer events but does NOT
  * dismiss — onboarding is gated, not click-away closable.
@@ -44,7 +40,6 @@ interface OnboardingModalCardProps {
 export function OnboardingModalCard({
   step,
   maxVisitedStep,
-  skippedSteps,
   hero,
   children,
   primary,
@@ -54,7 +49,6 @@ export function OnboardingModalCard({
   scrimOpacity = 1,
 }: OnboardingModalCardProps): React.JSX.Element {
   const showBack = step > 0;
-  const visible = skippedSteps ?? NO_SKIPPED;
   return (
     <div className="pointer-events-auto fixed inset-0 flex items-center justify-center p-6">
       <div
@@ -75,7 +69,7 @@ export function OnboardingModalCard({
         className="relative flex max-h-full max-w-full flex-col overflow-hidden border border-border-emphasized bg-bg-primary shadow-modal"
         style={{ width: 468, height: 512 }}
       >
-        {/* Compact header — every modal step but 0, whose hero lives in the body. */}
+        {/* Compact header — steps 1,2,3,7. Step 0's hero lives inside the body. */}
         {!hero && (
           <div className="flex flex-shrink-0 items-center gap-2.5 bg-interactive px-5 py-[13px] text-on-interactive">
             <img
@@ -87,7 +81,7 @@ export function OnboardingModalCard({
             />
             <span className="flex-1 text-[15px] font-bold tracking-[-.01em]">{ONBOARDING_TITLES[step]}</span>
             <span className="text-[9px] tracking-[.14em] text-on-interactive/80">
-              STEP {visibleStepNumber(step, visible)} / {visibleStepTotal(visible)}
+              STEP {step + 1} / {ONBOARDING_STEP_COUNT}
             </span>
           </div>
         )}
@@ -105,12 +99,7 @@ export function OnboardingModalCard({
           >
             Skip
           </button>
-          <OnboardingDots
-            step={step}
-            maxVisitedStep={maxVisitedStep}
-            skippedSteps={visible}
-            onGoTo={onGoTo}
-          />
+          <OnboardingDots step={step} maxVisitedStep={maxVisitedStep} onGoTo={onGoTo} />
           <span className="flex-1" />
           {showBack && (
             <button

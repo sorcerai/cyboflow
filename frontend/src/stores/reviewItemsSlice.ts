@@ -108,20 +108,10 @@ export function applyReviewItemChangeToList(
  * sorted blocking-first. Stable within each blocking group (preserves input
  * relative order). Returns a NEW array; the input is never mutated.
  *
- * NON-BLOCKING findings are emitted silently — they go to the triage queue, not
- * the run's "Needs your input" strip — so they are dropped here. Only the
+ * Findings are emitted silently — they go to the triage queue, not the run's
+ * "Needs your input" strip — so `kind === 'finding'` is dropped here. Only the
  * attention kinds (permission approvals, decisions, human tasks, notification
- * FYIs) and BLOCKING findings surface in the strip.
- *
- * A blocking finding MUST surface: it parks the run at the aggregate-unblock
- * boundary exactly like a decision gate (countPendingBlockingReviewItems counts
- * every pending human-audience blocking row regardless of kind), so dropping it
- * here leaves the run wedged with no in-session exit — the only visible card is
- * whatever gate it is blocking, whose answer path then refuses with
- * `noOp: 'blocked'` and no way to find the culprit. ReviewItemCard already has
- * the branch for it (Resolve & resume / Dismiss / Promote to task on
- * `surface="session"`); this selector was the only thing keeping that branch
- * unreachable.
+ * FYIs) surface in the strip.
  */
 export function pendingReviewItemsForRun(
   items: ReviewItem[],
@@ -129,10 +119,7 @@ export function pendingReviewItemsForRun(
 ): ReviewItem[] {
   return items
     .filter(
-      (it) =>
-        it.run_id === runId
-        && it.status === 'pending'
-        && (it.kind !== 'finding' || it.blocking),
+      (it) => it.run_id === runId && it.status === 'pending' && it.kind !== 'finding',
     )
     // Array.prototype.sort is spec-stable (ES2019+), so equal-blocking items
     // keep their input relative order without a manual index tie-breaker.

@@ -79,66 +79,6 @@ describe('session summary CRUD round-trip', () => {
   });
 });
 
-describe('session_summaries state/waiting_on (migration 121)', () => {
-  it('persistSessionSummaryResult with state + waitingOn round-trips both', () => {
-    createSession('s1');
-    db.persistSessionSummaryResult({
-      sessionId: 's1',
-      summary: 'Waiting on a decision.',
-      lastTurnId: 3,
-      costUsdDelta: 0.001,
-      entries: ['Waiting on a decision.'],
-      state: 'needs_input',
-      waitingOn: 'Ship as boot check or dialog?',
-    });
-
-    const row = db.getSessionSummary('s1');
-    expect(row?.state).toBe('needs_input');
-    expect(row?.waiting_on).toBe('Ship as boot check or dialog?');
-  });
-
-  it('persistSessionSummaryResult without state/waitingOn reads back both as null (old call sites unchanged)', () => {
-    createSession('s1');
-    db.persistSessionSummaryResult({
-      sessionId: 's1',
-      summary: 'No triage state yet.',
-      lastTurnId: 3,
-      costUsdDelta: 0.001,
-      entries: ['No triage state yet.'],
-    });
-
-    const row = db.getSessionSummary('s1');
-    expect(row?.state).toBeNull();
-    expect(row?.waiting_on).toBeNull();
-  });
-
-  it('getSessionSummary normalizes an out-of-band bogus state to null and clamps waiting_on to 300 chars', () => {
-    createSession('s1');
-    db.upsertSessionSummary({ sessionId: 's1', summary: 'x', lastTurnId: 1, costUsdDelta: 0 });
-
-    const longWaitingOn = 'a'.repeat(500);
-    db.getDb()
-      .prepare('UPDATE session_summaries SET state = ?, waiting_on = ? WHERE session_id = ?')
-      .run('bogus-future-value', longWaitingOn, 's1');
-
-    const row = db.getSessionSummary('s1');
-    expect(row?.state).toBeNull();
-    expect(row?.waiting_on).toBe('a'.repeat(300));
-    expect(row?.waiting_on).toHaveLength(300);
-  });
-
-  it('upsertSessionSummary called twice replaces state rather than accumulating it', () => {
-    createSession('s1');
-    db.upsertSessionSummary({ sessionId: 's1', summary: 'First.', lastTurnId: 1, costUsdDelta: 0, state: 'working', waitingOn: null });
-    expect(db.getSessionSummary('s1')?.state).toBe('working');
-
-    db.upsertSessionSummary({ sessionId: 's1', summary: 'Second.', lastTurnId: 2, costUsdDelta: 0, state: 'complete', waitingOn: null });
-    const row = db.getSessionSummary('s1');
-    expect(row?.state).toBe('complete');
-    expect(row?.waiting_on).toBeNull();
-  });
-});
-
 describe('upsertSessionSummary accumulation', () => {
   it('replaces summary/last_turn_id but accumulates calls_count and cost_usd_total', () => {
     createSession('s1');

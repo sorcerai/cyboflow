@@ -74,13 +74,8 @@ interface DbRow {
   substrate?: string;
 }
 
-function makeServices(
-  dbSession: DbRow | undefined,
-  opts?: { interactiveCliManager?: 'live' | 'absent' },
-) {
+function makeServices(dbSession: DbRow | undefined) {
   const stopClaudePanel = vi.fn(async () => {});
-  const stopInteractivePanel = vi.fn(async () => {});
-  const killLiveSession = vi.fn(async () => {});
   const codexSdkManager = { on: vi.fn(), stopPanel: vi.fn(async () => {}) };
   const codexPtyManager = { on: vi.fn(), stopPanel: vi.fn(async () => {}) };
   const ompSdkManager = { on: vi.fn(), stopPanel: vi.fn(async () => {}) };
@@ -96,29 +91,13 @@ function makeServices(
       getSession: vi.fn(() => dbSession),
     },
     claudeCodeManager: { stopPanel: stopClaudePanel, stopSession: vi.fn() },
-    // The claude-interactive lane's OWN manager — a completely separate
-    // process map from claudeCodeManager's SDK substrate. Defaults to
-    // present; pass opts.interactiveCliManager: 'absent' to exercise the
-    // killLiveSession fallback.
-    interactiveCliManager:
-      opts?.interactiveCliManager === 'absent' ? undefined : { stopPanel: stopInteractivePanel },
-    killLiveSession,
     codexSdkManager,
     codexPtyManager,
     ompSdkManager,
     ompPtyManager,
     configManager: { isDemoMode: () => false },
   } as unknown as AppServices;
-  return {
-    services,
-    stopClaudePanel,
-    stopInteractivePanel,
-    killLiveSession,
-    codexSdkManager,
-    codexPtyManager,
-    ompSdkManager,
-    ompPtyManager,
-  };
+  return { services, stopClaudePanel, codexSdkManager, codexPtyManager, ompSdkManager, ompPtyManager };
 }
 
 function register(services: AppServices) {
@@ -252,41 +231,5 @@ describe('sessions:stop — per-lane teardown', () => {
 
     expect(made.stopClaudePanel).toHaveBeenCalledWith('panel-1');
     expect(made.ompSdkManager.stopPanel).not.toHaveBeenCalled();
-  });
-
-  // Regression: the claude-interactive lane runs on its OWN manager
-  // (interactiveCliManager), a completely separate process map from
-  // claudeCodeManager's SDK substrate. sessions:stop used to have no branch
-  // for this lane and fell through to claudeCodeManager.stopPanel, which
-  // silently no-ops (the PTY's panelId was never registered on that manager)
-  // — the REPL kept running after "Stop".
-  it('routes a claude-interactive panel to interactiveCliManager, never claudeCodeManager', async () => {
-    const made = makeServices({
-      id: 's1',
-      chat_run_id: 'gate-run-1',
-      agent_runtime: 'claude-sdk',
-      substrate: 'interactive',
-    });
-    const handlers = register(made.services);
-
-    const result = (await invoke(handlers, 'sessions:stop', 's1')) as { success: boolean };
-
-    expect(result.success).toBe(true);
-    expect(made.stopInteractivePanel).toHaveBeenCalledWith('panel-1');
-    expect(made.stopClaudePanel).not.toHaveBeenCalled();
-  });
-
-  it('falls back to killLiveSession for a claude-interactive panel when interactiveCliManager is absent', async () => {
-    const made = makeServices(
-      { id: 's1', chat_run_id: 'gate-run-1', agent_runtime: 'claude-sdk', substrate: 'interactive' },
-      { interactiveCliManager: 'absent' },
-    );
-    const handlers = register(made.services);
-
-    const result = (await invoke(handlers, 'sessions:stop', 's1')) as { success: boolean };
-
-    expect(result.success).toBe(true);
-    expect(made.killLiveSession).toHaveBeenCalledWith('gate-run-1');
-    expect(made.stopClaudePanel).not.toHaveBeenCalled();
   });
 });

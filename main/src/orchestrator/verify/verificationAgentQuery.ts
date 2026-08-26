@@ -20,6 +20,7 @@
  */
 import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk';
 import { loadSdkQuery } from '../../utils/lazyAgentSdk';
+import { resolveClaudeExecutablePath } from '../../services/panels/claude/claudeExecutablePath';
 import type { LoggerLike } from '../types';
 import { VerificationAgentQueryError, type VerificationAgentQueryFn } from './verificationAgentRunner';
 import { FORBIDDEN_DEP_COMMAND_PATTERN } from './dependencyCommandGuard';
@@ -401,13 +402,8 @@ export function makeDependencyCommandCanUseTool(
  * VerificationAgentQueryError} carrying whatever transcript accumulated before
  * the failure — the runner's catch writes that partial transcript (fail-soft)
  * before mapping the throw to the fail-open `skipped` bucket.
- *
- * @param claudeExecutablePath The packaged-build native-binary path resolved once
- * at boot by `resolveClaudeExecutablePath()` (services layer) and threaded in by
- * the wiring site — `undefined` in dev, which lets the SDK resolve it itself.
  */
 export function makeVerificationAgentQuery(
-  claudeExecutablePath: string | undefined,
   logger?: LoggerLike,
   timeoutMs: number = VERIFICATION_AGENT_TIMEOUT_MS,
 ): VerificationAgentQueryFn {
@@ -451,7 +447,7 @@ export function makeVerificationAgentQuery(
           // mutually exclusive with `permissionPromptToolName`, which this file
           // sets nowhere.
           canUseTool: makeDependencyCommandCanUseTool(allowedTools, logger),
-          pathToClaudeCodeExecutable: claudeExecutablePath,
+          pathToClaudeCodeExecutable: resolveClaudeExecutablePath(),
           outputFormat: { type: 'json_schema', schema: VERIFICATION_REPORT_JSON_SCHEMA },
           abortController: controller,
         },

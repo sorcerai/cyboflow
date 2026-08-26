@@ -5,7 +5,6 @@ import {
   buildCodexAppServerThreadStartParams,
   buildCodexAppServerTurnOptions,
 } from './runConfig';
-import { orchTokenRegistry } from '../../../../orchestrator/orchAuthToken';
 
 const runtimeConfig = {
   orchSocketPath: '/tmp/cyboflow-orch.sock',
@@ -43,9 +42,6 @@ describe('Codex app-server run configuration', () => {
             env: {
               CYBOFLOW_RUN_ID: 'run-1',
               CYBOFLOW_ORCH_SOCKET: '/tmp/cyboflow-orch.sock',
-              // Randomly minted per run — asserted for shape here and for
-              // correctness by the dedicated bearer-token test below.
-              CYBOFLOW_ORCH_TOKEN: expect.any(String),
             },
             required: true,
             default_tools_approval_mode: 'approve',
@@ -174,31 +170,10 @@ describe('Codex app-server run configuration', () => {
       PATH: '/opt/homebrew/bin:/Users/me/.nvm/versions/node/v22/bin:/usr/local/bin',
       CYBOFLOW_RUN_ID: 'run-1',
       CYBOFLOW_ORCH_SOCKET: '/tmp/cyboflow-orch.sock',
-      CYBOFLOW_ORCH_TOKEN: expect.any(String),
       // Marks the tree as agent-spawned so the project gate self-governs its
       // vitest fork pool instead of taking the whole box per sprint lane.
       CYBOFLOW_MANAGED_TEST_CONCURRENCY: '1',
     });
-  });
-
-  it('mints one bearer token per run and puts the SAME value on both channels', () => {
-    const params = buildCodexAppServerThreadStartParams('run-tok', {
-      panelId: 'run-tok',
-      sessionId: 'run-tok',
-      worktreePath: '/tmp/worktree',
-      prompt: 'ship it',
-      model: 'gpt-5.5',
-    }, runtimeConfig);
-    const mcp = (params.config as {
-      mcp_servers: { cyboflow: { env: Record<string, string> } };
-    }).mcp_servers.cyboflow.env;
-    const appServerEnv = buildCodexAppServerEnvironment('run-tok', runtimeConfig, {}, () => '');
-
-    // The MCP subprocess and the shell hook (which inherits the app-server env)
-    // are two clients of one run — a mismatch would get one of them refused.
-    expect(mcp.CYBOFLOW_ORCH_TOKEN).toBe(appServerEnv.CYBOFLOW_ORCH_TOKEN);
-    expect(orchTokenRegistry.verify('run-tok', mcp.CYBOFLOW_ORCH_TOKEN)).toBe(true);
-    expect(orchTokenRegistry.verify('run-other', mcp.CYBOFLOW_ORCH_TOKEN)).toBe(false);
   });
 
   it('recovers pnpm when the inherited PATH is the restricted launchd PATH (packaged-app symptom)', () => {

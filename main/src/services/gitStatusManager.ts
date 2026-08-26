@@ -229,17 +229,6 @@ export class GitStatusManager extends EventEmitter {
   }
 
   /**
-   * Read the cache without ever fetching, and without applying the TTL — for
-   * the quick-session board's 3s poll, which must never spawn a git
-   * subprocess. `lastChecked` (epoch ms) lets the caller label staleness
-   * itself; warming the cache is a separate explicit action (the
-   * `sessions:warm-quick-git` IPC handler → getGitStatus, which IS TTL-aware).
-   */
-  peekCachedStatus(sessionId: string): { status: GitStatus; lastChecked: number } | null {
-    return this.cache[sessionId] || null;
-  }
-
-  /**
    * Get git status for a specific session (with caching)
    */
   async getGitStatus(sessionId: string): Promise<GitStatus | null> {

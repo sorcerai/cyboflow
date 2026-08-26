@@ -37,36 +37,17 @@
 -- and index.
 --
 -- REPLAY SAFETY (a ledger-wiped DB re-runs every file end to end — see 088/093).
--- The backfill UPDATE below is the one statement here that is NOT naturally
--- re-runnable: it is unconditional, so a replay would revert whatever the user
--- has since chosen back to these initial values. It is gated on an explicit
--- sentinel instead.
---
--- The sentinel is a TEMP table holding one fact, captured BEFORE the ALTERs run:
--- did `status_sync_mode` already exist? That is the only honest signal for "the
--- columns are not new, so their contents are someone's choices rather than this
--- migration's defaults" — and it works for installs that applied the earlier
--- version of this file too, because it reads the schema rather than a marker
--- that would not be there. It has to be captured up front: once the ALTERs run,
--- the column exists either way. TEMP so it is scoped to this connection, and
--- dropped at the end so a later boot re-probes rather than trusting a stale row.
---
--- This used to lean on the migration runner instead: the file's first statement
--- was an ALTER that threw "duplicate column name" on a replay, and the runner
--- rolled the WHOLE file back and stamped it applied. That behaviour was a bug
--- (it silently discarded every other statement in any migration whose first
--- ALTER collided) and idempotence is now decided per STATEMENT, so a replay runs
--- this file to the end. Nothing here may depend on an early abort any more.
+-- The whole file executes inside ONE transaction, so the ledger-wiped replay
+-- hinges on its FIRST statement: the `ALTER TABLE ... ADD COLUMN
+-- status_sync_mode` throws "duplicate column name: status_sync_mode", the
+-- runner rolls the transaction back (nothing below it ran) and records the
+-- ledger marker under its idempotent-ALTER tolerance — the ONLY failure shape
+-- that tolerance covers. That is why the three ALTERs come first and the table
+-- recreate last: a leading bare CREATE TABLE would instead re-run the recreate
+-- on every replay, and a leading UPDATE would re-backfill a user's later
+-- setting changes back to these defaults.
 
 PRAGMA foreign_keys=OFF;
-
--- Sentinel probe — see REPLAY SAFETY above. Must precede the ALTERs: once they
--- run, the column's presence no longer distinguishes a replay from a first apply.
-DROP TABLE IF EXISTS temp._mig094_replay;
-CREATE TEMP TABLE _mig094_replay AS
-SELECT EXISTS (
-  SELECT 1 FROM pragma_table_info('tracker_connections') WHERE name = 'status_sync_mode'
-) AS columns_pre_existed;
 
 ALTER TABLE tracker_connections
   ADD COLUMN status_sync_mode TEXT NOT NULL DEFAULT 'auto'
@@ -81,10 +62,7 @@ ALTER TABLE tracker_connections
 UPDATE tracker_connections
    SET status_sync_mode = CASE WHEN two_way = 1 THEN 'auto' ELSE 'manual' END,
        pull_mode = 'auto',
-       push_mode = 'manual'
- WHERE (SELECT columns_pre_existed FROM temp._mig094_replay) = 0;
-
-DROP TABLE IF EXISTS temp._mig094_replay;
+       push_mode = 'manual';
 
 CREATE TABLE tracker_outbox_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

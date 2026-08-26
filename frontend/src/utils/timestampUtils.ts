@@ -24,28 +24,11 @@ export function formatFullDateTime(timestamp: string | Date): string {
 
 /**
  * Formats the distance between a timestamp and now
- *
- * A STRING argument goes through {@link parseTimestamp}, not a bare
- * `new Date()`: callers pass raw SQLite columns here (e.g. WorkflowCard's
- * `lastUsedAt`, folded from `workflow_runs.created_at`), and SQLite writes
- * "YYYY-MM-DD HH:MM:SS" — UTC with no zone marker, which JS reads as LOCAL.
- * That shifted every such value into the future by the host's UTC offset, and
- * because the buckets below floor a negative interval into the `else` arm, the
- * result rendered as a confident "just now" rather than anything that looked
- * wrong. Every workflow card read "used just now" for any run in the preceding
- * offset-many hours.
- *
- * Already-zoned values (ISO with 'T', including anything serialized from a
- * main-process `Date` across IPC) pass through untouched, and a `Date` argument
- * is used as-is — so callers that were already correct, including the ones that
- * wrap the argument in `parseTimestamp` themselves (ChatTranscript), are
- * unaffected.
- *
  * @param date - The date to compare
  * @returns Human-readable time distance
  */
 export function formatDistanceToNow(date: Date | string): string {
-  const dateObj = typeof date === 'string' ? parseTimestamp(date) : date;
+  const dateObj = typeof date === 'string' ? new Date(date) : date;
   const now = new Date();
   const diffMs = now.getTime() - dateObj.getTime();
   const diffSeconds = Math.floor(diffMs / 1000);
@@ -75,16 +58,9 @@ export function parseTimestamp(timestamp: string | Date): Date {
     return timestamp;
   }
   
-  // Allow-list on the UNZONED shape — SQLite's CURRENT_TIMESTAMP / datetime()
-  // ("YYYY-MM-DD HH:MM:SS"), plus its T-separated and fractional variants.
-  // Anything already carrying a zone (a trailing 'Z', a numeric offset) fails
-  // to match and goes to the platform parser untouched, which is correct for it.
-  // The fraction is unbounded (\.\d+): a 3-digit cap sent "…19:12:52.123456"
-  // down the bare-parse path, where it was read as LOCAL and landed the host's
-  // UTC offset away. Kept byte-identical to main/src/utils/timestampUtils.ts —
-  // the two copies previously disagreed, which is what made this bug class easy
-  // to reintroduce on whichever side you were not looking at.
-  const sqliteDateTimeRegex = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/;
+  // SQLite DATETIME format: "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD HH:MM:SS.SSS"
+  // These are stored in UTC but without timezone indicator
+  const sqliteDateTimeRegex = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{3})?$/;
   
   if (sqliteDateTimeRegex.test(timestamp)) {
     // This is a SQLite timestamp in UTC, convert to ISO format with Z suffix

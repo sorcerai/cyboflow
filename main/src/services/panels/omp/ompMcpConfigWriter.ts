@@ -73,12 +73,6 @@ export function buildOmpCyboflowMcpServerEntry(
     env: {
       CYBOFLOW_RUN_ID: 'CYBOFLOW_RUN_ID',
       CYBOFLOW_ORCH_SOCKET: 'CYBOFLOW_ORCH_SOCKET',
-      // Bare-name indirection is load-bearing for this one, not just stylistic:
-      // it is a per-run SECRET (orchAuthToken.ts), and this file is shared by
-      // every lane in the worktree and persists on disk. Naming the var makes
-      // OMP copy the value from its own process env at spawn
-      // (`ompSdkManager.buildSpawnEnvironment`), so the token never lands here.
-      CYBOFLOW_ORCH_TOKEN: 'CYBOFLOW_ORCH_TOKEN',
       ...electronRunAsNodeGuardEnv(nodeExecutablePath),
     },
     timeout: 0,

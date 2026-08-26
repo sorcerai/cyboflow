@@ -21,29 +21,6 @@
  */
 export type QuickSessionState = 'running' | 'idle' | 'blocked';
 
-/**
- * Cache-only git snapshot for a quick-session board row, attached at the IPC
- * seam from `GitStatusManager.peekCachedStatus` (never a fresh fetch — the 3s
- * board poll must not spawn git subprocesses). All numeric/boolean fields are
- * normalized from the manager's optional-field `GitStatus` (`?? false` /
- * `?? 0`); `null` on the row means the git cache has no entry yet for this
- * session (never warmed, or evicted).
- */
-export interface QuickSessionGitSnapshot {
-  /** Ahead of the base branch with no uncommitted changes, no untracked files, and not behind. */
-  isReadyToMerge: boolean;
-  /** Uncommitted modified/staged changes present in the worktree. */
-  hasUncommittedChanges: boolean;
-  /** Untracked files present in the worktree. */
-  hasUntrackedFiles: boolean;
-  /** Commits ahead of the base branch. */
-  ahead: number;
-  /** Commits behind the base branch. */
-  behind: number;
-  /** When this snapshot was computed (epoch ms from the cache entry, as UTC ISO) — the staleness label. */
-  lastCheckedIso: string;
-}
-
 /** One row of the quick-session status board. */
 export interface QuickSessionRow {
   /** sessions.id — the quick session. */
@@ -57,16 +34,8 @@ export interface QuickSessionRow {
   /** Derived live state. */
   state: QuickSessionState;
   /**
-   * ISO timestamp the session last rested — `sessions.idle_since`, stamped at
-   * the busy→resting status transition (migration 119), falling back to
-   * `sessions.updated_at` for a row that has not transitioned since the column
-   * landed. Present for `idle` rows so the UI can show "idle for N min"; null
-   * for `running`/`blocked`.
-   *
-   * It reads `idle_since` rather than `updated_at` because `updated_at` is
-   * bumped by ANY write to the session row — a rename, a folder move, the boot
-   * sweep, a status refinement — which used to restart the quiet clock on
-   * events that were not activity.
+   * ISO timestamp the session last rested (sessions.updated_at). Present for
+   * `idle` rows so the UI can show "idle for N min"; null for `running`/`blocked`.
    */
   idleSince: string | null;
   /**
@@ -79,32 +48,4 @@ export interface QuickSessionRow {
    * for a `blocked` row (a pending gate needs you regardless of viewed-ness).
    */
   unviewed: boolean;
-  /**
-   * The session's last rest boundary as UTC ISO — `COALESCE(sessions.idle_since,
-   * sessions.updated_at)` (migration 119; a rename or folder move no longer
-   * resets it). The needs-input sort key: present regardless of `state`, unlike
-   * `idleSince` (which is set only for `idle` rows).
-   */
-  restedAtIso: string | null;
-  /** sessions.status verbatim ('completed'/'stopped'/'failed'/…) — the UI's "stopped early vs clean" split that the derived `state` (which collapses these into `idle`) can't express. */
-  rawStatus: string;
-  /** sessions.exit_code. Written by the PTY substrate; usually null for SDK-substrate rows. */
-  exitCode: number | null;
-  /** Rolling haiku summary (session_summaries.summary). Null when never summarized, or when the session-summary feature toggle is off (nulled at the IPC seam). */
-  summary: string | null;
-  /** Summarizer triage verdict (session_summaries.state), already normalized at the DB read boundary. Null when never classified, or when the toggle is off. */
-  summaryState: 'working' | 'complete' | 'needs_input' | null;
-  /** One-sentence "what it asked you" for a `needs_input` summaryState. Null when not applicable, or when the toggle is off. */
-  waitingOn: string | null;
-  /**
-   * False for sessions the summarizer can never cover — a Codex or OMP agent
-   * provider, since the scheduler only summarizes Claude sessions and the PTY
-   * ingest only reads Claude transcripts. Lets the UI distinguish "no summaries
-   * for this provider" from "no summary yet".
-   */
-  summarySupported: boolean;
-  /** sessions.worktree_name — the branch label shown in the details view. */
-  worktreeName: string | null;
-  /** Cache-only git snapshot (see {@link QuickSessionGitSnapshot}); null when the git cache has no entry for this session. */
-  git: QuickSessionGitSnapshot | null;
 }

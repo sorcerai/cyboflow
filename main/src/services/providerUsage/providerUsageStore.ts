@@ -27,7 +27,6 @@
 import { EventEmitter } from 'events';
 import type { RateLimitEvent } from '../../../../shared/types/claudeStream';
 import type {
-  ProviderSpendSummary,
   ProviderUsageSnapshot,
   ProviderUsageState,
   ProviderUsageWindow,
@@ -40,7 +39,6 @@ import {
   USAGE_WINDOW_LABELS,
   compareWindowsByPressure,
   usageTier,
-  usageWindowKey,
 } from '../../../../shared/types/providerUsage';
 import type { CodexRateLimits } from '../panels/codex/appServer/rateLimits';
 
@@ -59,30 +57,6 @@ const PERSIST_DEBOUNCE_MS = 2_000;
  * `resetsAt` nor `rateLimitType` would be immortal.
  */
 const NO_RESET_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
-
-/**
- * How far apart two reset timestamps may be and still name the SAME window.
- *
- * The two Claude sources report the same reset at different precision: the
- * `/usage` poll returns ISO 8601 with sub-second digits
- * (`…T19:09:59.822085+00:00`), while `rate_limit_event` reports whole epoch
- * SECONDS (`1787685000`) — 178 ms apart for one observed five-hour window.
- * Compared exactly, the stream reading looked like a different window, so the
- * polled percentage was not retained and the meter blanked seconds after every
- * poll. Consecutive real windows are five hours or seven days apart, so a
- * minute of slack cannot merge two of them.
- */
-const RESET_MATCH_TOLERANCE_MS = 60_000;
-
-/**
- * Whether an incoming reading describes the window a stored record already
- * holds. Two unknown resets match (neither reading names a boundary); a known
- * reset never matches an unknown one.
- */
-function isSameResetWindow(a: number | null, b: number | null): boolean {
-  if (a === null || b === null) return a === b;
-  return Math.abs(a - b) <= RESET_MATCH_TOLERANCE_MS;
-}
 
 /** The narrow log surface this store needs — `console` satisfies it. */
 export interface ProviderUsageLogger {
@@ -120,35 +94,17 @@ function mostSevere(a: UsageStatus, b: UsageStatus): UsageStatus {
  * Declared here rather than imported: the SDK's own type is behind an
  * explicitly-experimental method name and must not become a compile dependency.
  */
-/** The poll slots that map 1:1 onto a whole-account window. */
-export type ClaudeUsagePollSlot =
-  | 'five_hour'
-  | 'seven_day'
-  | 'seven_day_opus'
-  | 'seven_day_sonnet'
-  | 'seven_day_oauth_apps';
-
 export interface ClaudeUsagePoll {
   subscriptionType: string | null;
   rateLimitsAvailable: boolean;
-  rateLimits: (Partial<Record<
-    ClaudeUsagePollSlot,
+  rateLimits: Partial<Record<
+    'five_hour' | 'seven_day' | 'seven_day_opus' | 'seven_day_sonnet' | 'seven_day_oauth_apps',
     { utilization: number | null; resets_at: string | null } | null
-  >> & {
-    /**
-     * Per-model weekly windows, server-driven and ADDITIVE — the bucket names
-     * ("Fable") are supplied by the server, so they cannot be enumerated here.
-     */
-    model_scoped?: unknown;
-    /** Money view of extra-usage credits (minor units + currency). */
-    spend?: unknown;
-    /** The older credits view of the same thing; used only when `spend` is absent. */
-    extra_usage?: unknown;
-  }) | null;
+  >> | null;
 }
 
 /** Poll slot → the window kind it populates. */
-const CLAUDE_POLL_WINDOWS: ReadonlyArray<readonly [UsageWindowKind, ClaudeUsagePollSlot]> = [
+const CLAUDE_POLL_WINDOWS: ReadonlyArray<readonly [UsageWindowKind, keyof NonNullable<ClaudeUsagePoll['rateLimits']>]> = [
   ['claude_five_hour', 'five_hour'],
   ['claude_seven_day', 'seven_day'],
   ['claude_seven_day_opus', 'seven_day_opus'],
@@ -174,96 +130,6 @@ function clampPercent(value: number | undefined | null): number | null {
   return Math.max(0, Math.min(100, value));
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function asFiniteNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-/**
- * The poll's `model_scoped[]` — per-model weekly windows the server adds on its
- * own schedule ("Fable"). Narrowed entry by entry rather than cast: the array is
- * explicitly additive, so an entry in a shape we do not recognise must be
- * dropped, never turned into a window with a missing name or an invented number.
- */
-function parseModelScopedWindows(value: unknown, nowMs: number): ProviderUsageWindow[] {
-  if (!Array.isArray(value)) return [];
-  const windows: ProviderUsageWindow[] = [];
-  for (const entry of value) {
-    if (!isRecord(entry)) continue;
-    const displayName = typeof entry.display_name === 'string' ? entry.display_name.trim() : '';
-    if (displayName === '') continue;
-    const usedPercent = clampPercent(asFiniteNumber(entry.utilization));
-    // Same rule as every other polled window: no number, no row.
-    if (usedPercent === null) continue;
-    windows.push({
-      kind: 'claude_model_scoped',
-      scopeLabel: displayName,
-      label: `Weekly (${displayName})`,
-      status: usageTier(usedPercent).status,
-      usedPercent,
-      percentSource: 'poll',
-      percentObservedAtMs: nowMs,
-      resetsAtMs: isoToMs(typeof entry.resets_at === 'string' ? entry.resets_at : null),
-      windowMinutes: null,
-      observedAtMs: nowMs,
-    });
-  }
-  return windows;
-}
-
-/**
- * Extra-usage credits, from whichever of the two shapes the account reports.
- *
- * `spend` is preferred: it states the currency and the minor-unit exponent
- * explicitly. `extra_usage` is the older credits view of the same balance and
- * is read only as a fallback — assuming USD there, because that view names no
- * currency at all and every observed account reports one alongside it.
- *
- * `percent` is taken from the provider VERBATIM. It reads 100 while 1393 minor
- * units stand against a 1000 cap; recomputing it to 139 would be this module
- * inventing a number the vendor did not report.
- */
-function parseSpend(rateLimits: Record<string, unknown>): ProviderSpendSummary | null {
-  const spend = rateLimits.spend;
-  if (isRecord(spend) && isRecord(spend.used)) {
-    const used = spend.used;
-    const usedMinor = asFiniteNumber(used.amount_minor);
-    if (usedMinor !== null) {
-      const limit = isRecord(spend.limit) ? spend.limit : null;
-      return {
-        usedMinor,
-        limitMinor: limit === null ? null : asFiniteNumber(limit.amount_minor),
-        currency: typeof used.currency === 'string' ? used.currency : 'USD',
-        exponent: asFiniteNumber(used.exponent) ?? 2,
-        percent: clampPercent(asFiniteNumber(spend.percent)),
-        enabled: spend.enabled === true,
-        disabledReason: typeof spend.disabled_reason === 'string' ? spend.disabled_reason : null,
-      };
-    }
-  }
-
-  const extra = rateLimits.extra_usage;
-  if (isRecord(extra)) {
-    const usedMinor = asFiniteNumber(extra.used_credits);
-    if (usedMinor !== null) {
-      return {
-        usedMinor,
-        limitMinor: asFiniteNumber(extra.monthly_limit),
-        currency: typeof extra.currency === 'string' ? extra.currency : 'USD',
-        exponent: asFiniteNumber(extra.decimal_places) ?? 2,
-        percent: clampPercent(asFiniteNumber(extra.utilization)),
-        enabled: extra.is_enabled === true,
-        disabledReason: typeof extra.disabled_reason === 'string' ? extra.disabled_reason : null,
-      };
-    }
-  }
-
-  return null;
-}
-
 /**
  * A window is live when its reset is still in the future. A window with no reset
  * falls back to an age cap. Expiry is evaluated on READ (see `getState`) — a
@@ -280,14 +146,10 @@ interface PersistedBlob {
 }
 
 export class ProviderUsageStore {
-  /** Per-provider windows keyed by {@link usageWindowKey} — Claude reports its
-   *  windows in SEPARATE events, so replacing a whole snapshot per event would
-   *  make them flap. Keyed by KEY rather than kind because the poll's
-   *  `model_scoped[]` rows all share one kind and must not collide. */
-  private readonly windows = new Map<UsageProvider, Map<string, ProviderUsageWindow>>();
+  /** Per-provider windows keyed by kind — Claude reports its windows in SEPARATE
+   *  events, so replacing a whole snapshot per event would make them flap. */
+  private readonly windows = new Map<UsageProvider, Map<UsageWindowKind, ProviderUsageWindow>>();
   private readonly planTypes = new Map<UsageProvider, string | null>();
-  /** Extra-usage credits per provider. Only Claude reports any today. */
-  private readonly spends = new Map<UsageProvider, ProviderSpendSummary | null>();
 
   private persistTimer: NodeJS.Timeout | null = null;
   private persistPending = false;
@@ -310,15 +172,14 @@ export class ProviderUsageStore {
    */
   getState(nowMs: number = Date.now()): ProviderUsageState {
     const state: ProviderUsageState = {};
-    for (const [provider, byKey] of this.windows) {
-      const live = [...byKey.values()].filter((w) => isLive(w, nowMs));
+    for (const [provider, byKind] of this.windows) {
+      const live = [...byKind.values()].filter((w) => isLive(w, nowMs));
       if (live.length === 0) continue;
       live.sort(compareWindowsByPressure);
       state[provider] = {
         provider,
         windows: live,
         planType: this.planTypes.get(provider) ?? null,
-        spend: this.spends.get(provider) ?? null,
         observedAtMs: live.reduce((max, w) => Math.max(max, w.observedAtMs), 0),
       };
     }
@@ -336,8 +197,7 @@ export class ProviderUsageStore {
    * nothing it could correctly update.
    *
    * `utilization` is absent from most readings. When it is, and the same window
-   * (same kind AND the same reset, within {@link RESET_MATCH_TOLERANCE_MS})
-   * already has a known percentage, that percentage is
+   * (same kind AND same reset) already has a known percentage, that percentage is
    * RETAINED — otherwise a plain `allowed` event arriving after a 95% warning
    * would blank the meter and read as a recovery that never happened.
    */
@@ -357,9 +217,8 @@ export class ProviderUsageStore {
         typeof info.utilization === 'number' ? info.utilization * 100 : null,
       );
 
-      // A streamed reading is never model-scoped, so its key is its kind.
-      const previous = this.windows.get('claude')?.get(usageWindowKey({ kind, scopeLabel: null }));
-      const sameWindow = previous !== undefined && isSameResetWindow(previous.resetsAtMs, resetsAtMs);
+      const previous = this.windows.get('claude')?.get(kind);
+      const sameWindow = previous !== undefined && previous.resetsAtMs === resetsAtMs;
       const retained = sameWindow ? previous : undefined;
       const usedPercent = reported ?? retained?.usedPercent ?? null;
       // A RETAINED percentage keeps its original provenance and measurement time
@@ -383,7 +242,6 @@ export class ProviderUsageStore {
 
       this.putWindow('claude', {
         kind,
-        scopeLabel: null,
         label: USAGE_WINDOW_LABELS[kind],
         status,
         usedPercent,
@@ -415,21 +273,19 @@ export class ProviderUsageStore {
     try {
       if (!usage.rateLimitsAvailable || usage.rateLimits === null) {
         this.windows.delete('claude');
-        this.spends.delete('claude');
         this.planTypes.set('claude', usage.subscriptionType ?? null);
         this.onChanged();
         return;
       }
 
-      const next = new Map<string, ProviderUsageWindow>();
+      const next = new Map<UsageWindowKind, ProviderUsageWindow>();
       for (const [kind, slot] of CLAUDE_POLL_WINDOWS) {
         const reading = usage.rateLimits[slot];
         if (reading === undefined || reading === null) continue;
         const usedPercent = clampPercent(reading.utilization);
         if (usedPercent === null) continue;
-        next.set(usageWindowKey({ kind, scopeLabel: null }), {
+        next.set(kind, {
           kind,
-          scopeLabel: null,
           label: USAGE_WINDOW_LABELS[kind],
           status: usageTier(usedPercent).status,
           usedPercent,
@@ -440,20 +296,12 @@ export class ProviderUsageStore {
           observedAtMs: nowMs,
         });
       }
-      // Per-model weekly buckets ride the same authoritative replacement: one
-      // the server stops reporting is a bucket the account no longer has.
-      for (const window of parseModelScopedWindows(usage.rateLimits.model_scoped, nowMs)) {
-        next.set(usageWindowKey(window), window);
-      }
 
       if (next.size === 0) {
         this.windows.delete('claude');
       } else {
         this.windows.set('claude', next);
       }
-      // Credits are AUTHORITATIVE per poll too — an account that stops reporting
-      // them has none, and a retained balance would be a number nobody stands behind.
-      this.spends.set('claude', parseSpend(usage.rateLimits));
       this.planTypes.set('claude', usage.subscriptionType ?? null);
       this.onChanged();
     } catch (error) {
@@ -477,7 +325,7 @@ export class ProviderUsageStore {
     try {
       if (rateLimits.limitId !== 'codex') return;
 
-      const next = new Map<string, ProviderUsageWindow>();
+      const next = new Map<UsageWindowKind, ProviderUsageWindow>();
       for (const [kind, slot] of [
         ['codex_primary', rateLimits.primary],
         ['codex_secondary', rateLimits.secondary],
@@ -485,9 +333,8 @@ export class ProviderUsageStore {
         if (slot === null) continue;
         const usedPercent = clampPercent(slot.usedPercent);
         if (usedPercent === null) continue;
-        next.set(usageWindowKey({ kind, scopeLabel: null }), {
+        next.set(kind, {
           kind,
-          scopeLabel: null,
           label: codexWindowLabel(kind, slot.windowDurationMins),
           status: usageTier(usedPercent).status,
           usedPercent,
@@ -528,15 +375,8 @@ export class ProviderUsageStore {
         if (snapshot === undefined) continue;
         const live = snapshot.windows.filter((w) => isLive(w, nowMs));
         if (live.length === 0) continue;
-        // Re-key on the way in: a blob written before model-scoped windows
-        // existed carries no `scopeLabel`, which reads as null and keys by kind
-        // exactly as it did then.
-        this.windows.set(
-          snapshot.provider,
-          new Map(live.map((w) => [usageWindowKey({ kind: w.kind, scopeLabel: w.scopeLabel ?? null }), { ...w, scopeLabel: w.scopeLabel ?? null }])),
-        );
+        this.windows.set(snapshot.provider, new Map(live.map((w) => [w.kind, w])));
         this.planTypes.set(snapshot.provider, snapshot.planType);
-        this.spends.set(snapshot.provider, snapshot.spend ?? null);
       }
     } catch (error) {
       this.warn('hydrate', error);
@@ -578,12 +418,12 @@ export class ProviderUsageStore {
   // -------------------------------------------------------------------------
 
   private putWindow(provider: UsageProvider, window: ProviderUsageWindow): void {
-    let byKey = this.windows.get(provider);
-    if (byKey === undefined) {
-      byKey = new Map();
-      this.windows.set(provider, byKey);
+    let byKind = this.windows.get(provider);
+    if (byKind === undefined) {
+      byKind = new Map();
+      this.windows.set(provider, byKind);
     }
-    byKey.set(usageWindowKey(window), window);
+    byKind.set(window.kind, window);
   }
 
   private onChanged(): void {

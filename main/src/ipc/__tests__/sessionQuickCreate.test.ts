@@ -291,7 +291,6 @@ function makeServices(opts?: {
     getSession: vi.fn(() => fakeSession),
     refreshSessionFromDatabase: vi.fn(() => fakeSession),
     updateSession: vi.fn(),
-    addSessionError: vi.fn(),
     addSessionOutput: vi.fn(),
     addPanelConversationMessage: vi.fn(),
     addPanelOutput: vi.fn(),
@@ -719,45 +718,6 @@ describe('sessions:create-quick handler - substrate threading + eager PTY spawn'
       [null, 'sess-001'],
       [null, 'sess-002'],
     ]);
-  });
-
-  it('surfaces a failed eager interactive spawn as a session error, not a blank terminal', async () => {
-    // The regression this guards (CYBOFLOW-APP-1E): a `claude` that is not on
-    // PATH rejected the fire-and-forget spawn, create-quick had already returned
-    // success + a claudePanelId, and the user got a terminal that never emitted
-    // a byte with no error on any surface.
-    const { services, fakeInteractiveCliManager, fakeSessionManager } = makeServices();
-    fakeInteractiveCliManager.startPanel.mockRejectedValueOnce(
-      new Error('Claude Code (Interactive) not available: claude executable not found in PATH'),
-    );
-    const handlers = registerWith(services);
-
-    const result = (await invoke(handlers, 'sessions:create-quick', {
-      projectId: 42,
-      branchName: TEST_BRANCH,
-      substrate: 'interactive',
-    })) as { success: boolean };
-
-    // The door still succeeds — the spawn is fail-soft by design.
-    expect(result.success).toBe(true);
-
-    expect(fakeSessionManager.addSessionError).toHaveBeenCalledTimes(1);
-    const [erroredSessionId, headline, details] = fakeSessionManager.addSessionError.mock
-      .calls[0] as unknown as [string, string, string];
-    expect(erroredSessionId).toBe('sess-001');
-    // Copy keyed off the BOUNDED error class, naming the one thing the user can fix.
-    expect(headline).toBe('claude not found');
-    expect(details).toContain('PATH');
-    expect(details).toContain('Settings');
-
-    // …and the status must END as 'error'. The rejection lands inside the
-    // microtask window the 'running' write opens, so without the re-assert the
-    // running write silently wins and the session looks healthy.
-    const statuses = fakeSessionManager.updateSession.mock.calls
-      .filter((c) => (c as unknown as [string, { status?: string }])[0] === 'sess-001')
-      .map((c) => (c as unknown as [string, { status?: string }])[1]?.status);
-    expect(statuses).toContain('running');
-    expect(statuses[statuses.length - 1]).toBe('error');
   });
 
   it('eagerly spawns the interactive REPL (fire-and-forget) and returns claudePanelId', async () => {

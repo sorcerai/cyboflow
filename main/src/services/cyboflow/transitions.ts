@@ -6,7 +6,7 @@ import { emitUsage } from '../../orchestrator/telemetrySink';
 import { CYBOFLOW_WORKFLOW_NAMES } from '../../../../shared/types/workflows';
 import type { TelemetryFlow } from '../../../../shared/types/telemetry';
 import { captureSeamError } from '../telemetry';
-import { classifyErrorPattern, unclassifiedErrorTags } from '../../orchestrator/programmatic/systemicError';
+import { classifyErrorPattern } from '../../orchestrator/programmatic/systemicError';
 
 /**
  * Emit an anonymized `workflow_run_completed` usage event after a terminal
@@ -89,7 +89,6 @@ function reportRunFinalizeFailure(
       fromStatus,
       flow,
       substrate: row?.substrate ?? 'sdk',
-      ...unclassifiedErrorTags(errorClass, errorMessage),
     });
   } catch {
     // Telemetry must never break a state transition.

@@ -5,7 +5,6 @@ import { isValidEffortForProvider } from '../../../../../../shared/types/reasoni
 import { codexPermissionFlagsForMode } from '../codexPtyManager';
 import { electronRunAsNodeGuardEnv } from '../../../../utils/electronNodeGuard';
 import { getShellPath } from '../../../../utils/shellPath';
-import { orchTokenEnv } from '../../../../orchestrator/orchAuthToken';
 import { managedTestConcurrencyEnv } from '../../../../../../shared/types/testConcurrency';
 import type {
   AppServerJsonValue,
@@ -34,10 +33,6 @@ function buildMcpConfig(
         env: {
           CYBOFLOW_RUN_ID: runId,
           CYBOFLOW_ORCH_SOCKET: runtimeConfig.orchSocketPath,
-          // Bearer token for `runId` (orchAuthToken.ts) — the socket server
-          // refuses to bind the runId without it. This config is sent over the
-          // app-server JSON-RPC channel, never written to disk.
-          ...orchTokenEnv(runId),
           // Guard: nodeExecutablePath may resolve to the Electron app binary for a
           // packaged app with no standalone node on PATH — without this flag,
           // messaging Codex boots a whole new Cyboflow app. See electronNodeGuard.
@@ -94,9 +89,6 @@ export function buildCodexAppServerEnvironment(
     [pathKey]: mergePathValue(resolveShellPath(), inheritedEnvironment[pathKey]),
     CYBOFLOW_RUN_ID: runId,
     CYBOFLOW_ORCH_SOCKET: runtimeConfig.orchSocketPath,
-    // Bearer token for `runId`. The app-server passes its env down to the
-    // PreToolUse shell hook, which is the client that actually presents it.
-    ...orchTokenEnv(runId),
     // The app-server — and every command the Codex agent shells out to,
     // including the project gate — inherits this env, so marking it here is what
     // makes a Codex lane's gate self-govern its vitest fork pool.

@@ -56,6 +56,8 @@ export const ALL_PANEL_LANES = [
   'codex-pty',
   'omp-sdk',
   'omp-pty',
+  'pi-sdk',
+  'pi-pty',
 ] as const;
 
 export type PanelLane = (typeof ALL_PANEL_LANES)[number];
@@ -72,6 +74,7 @@ const PROVIDER_LANES: Readonly<
   claude: { sdk: 'claude-sdk', interactive: 'claude-interactive' },
   codex: { sdk: 'codex-sdk', interactive: 'codex-pty' },
   omp: { sdk: 'omp-sdk', interactive: 'omp-pty' },
+  pi: { sdk: 'pi-sdk', interactive: 'pi-pty' },
 };
 
 /** The lanes served by a PTY manager — each provider's interactive lane. */
@@ -155,34 +158,4 @@ export function resolvePanelLane(
 /** True when the lane is served by a PTY manager rather than a structured one. */
 export function isPtyLane(lane: PanelLane): boolean {
   return PTY_LANES.has(lane);
-}
-
-/** The four lanes owned by a dedicated per-provider manager (not Claude's two). */
-export type NonClaudeLane = Exclude<PanelLane, 'claude-sdk' | 'claude-interactive'>;
-
-/**
- * The manager owning a non-Claude lane's live process, from a bag of per-lane
- * owners; undefined for the two Claude lanes, whose close-out paths are
- * caller-specific (the interactive lane degrades to `killLiveSession` when its
- * manager is absent, and `claudeCodeManager.stopPanel` is the session-level
- * Stop that predates the interactive split).
- *
- * The `Record<NonClaudeLane, …>` argument is the point: each call site names
- * every non-Claude lane's owner explicitly, so a provider added to
- * `ALL_PANEL_LANES` fails to compile at every dispatch seam instead of quietly
- * falling into a switch's `default`.
- */
-export function nonClaudeLaneOwner<M>(
-  lane: PanelLane,
-  owners: Readonly<Record<NonClaudeLane, M | undefined>>,
-): M | undefined {
-  switch (lane) {
-    case 'codex-sdk':
-    case 'codex-pty':
-    case 'omp-sdk':
-    case 'omp-pty':
-      return owners[lane];
-    default:
-      return undefined;
-  }
 }

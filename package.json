@@ -1,6 +1,6 @@
 {
   "name": "cyboflow",
-  "version": "0.2.7",
+  "version": "0.2.6",
   "private": true,
   "description": "Cyboflow - Multi-session AI code assistant manager",
   "author": {
@@ -33,7 +33,7 @@
     "dev:perf": "node scripts/ensure-sqlite-abi.mjs electron && concurrently \"pnpm run --filter frontend dev\" \"wait-on http://localhost:${CYBOFLOW_VITE_PORT:-4521} && CYBOFLOW_PERF_TRACE=1 electron . --inspect=${CYBOFLOW_INSPECT_PORT:-9229} --remote-debugging-port=${CYBOFLOW_CDP_PORT:-9223}\"",
     "build": "pnpm run build:frontend && pnpm run build:main && pnpm run build:electron",
     "build:frontend": "pnpm run --filter frontend build",
-    "build:main": "pnpm run --filter main build && node scripts/bundle-mcp-server.mjs && node scripts/bundle-preload.mjs",
+    "build:main": "pnpm run --filter main build && node scripts/bundle-mcp-server.mjs",
     "build:electron": "electron-builder --publish never",
     "build:mac": "pnpm run build:frontend && pnpm run build:main && pnpm run electron:rebuild && pnpm run inject-build-info && node scripts/configure-build.js && electron-builder --mac --universal --publish never --config build/electron-builder.generated.json",
     "build:mac:universal": "pnpm run build:frontend && pnpm run build:main && pnpm run electron:rebuild && pnpm run inject-build-info && node scripts/configure-build.js && electron-builder --mac --universal --publish never --config build/electron-builder.generated.json",

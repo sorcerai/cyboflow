@@ -16,11 +16,9 @@ const STATE: ProviderUsageState = {
   codex: {
     provider: 'codex',
     planType: 'prolite',
-    spend: null,
     observedAtMs: 1784_000_000_000,
     windows: [{
       kind: 'codex_primary',
-      scopeLabel: null,
       label: 'Weekly',
       status: 'warning',
       usedPercent: 59,

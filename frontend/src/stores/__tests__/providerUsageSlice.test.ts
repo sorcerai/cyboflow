@@ -30,12 +30,10 @@ function state(percent: number): ProviderUsageState {
   return {
     codex: {
       provider: 'codex',
-      spend: null,
       planType: 'prolite',
       observedAtMs: 1,
       windows: [{
         kind: 'codex_primary',
-        scopeLabel: null,
         label: 'Weekly',
         status: 'ok',
         usedPercent: percent,

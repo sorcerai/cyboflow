@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import '../../../utils/monacoLoader';
 import { DiffEditor, type DiffEditorProps, type MonacoDiffEditor } from '@monaco-editor/react';
 import { AlertCircle, FileText, Check, Loader2, Eye, Code } from 'lucide-react';
 import type { FileDiff } from '../../../types/diff';

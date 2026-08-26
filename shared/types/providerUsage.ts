@@ -37,7 +37,6 @@ export type UsageWindowKind =
   | 'claude_seven_day_sonnet'
   | 'claude_seven_day_oauth_apps'
   | 'claude_seven_day_overage_included'
-  | 'claude_model_scoped'
   | 'claude_overage'
   | 'codex_primary'
   | 'codex_secondary';
@@ -61,17 +60,7 @@ export type UsageSource = 'poll' | 'stream';
 
 export interface ProviderUsageWindow {
   kind: UsageWindowKind;
-  /**
-   * The server-supplied model bucket this window is scoped to ("Fable"), or
-   * null for a window that covers the whole account.
-   *
-   * `claude_model_scoped` rows are DYNAMIC — the poll's `model_scoped[]` array
-   * is server-driven and names buckets no enum here could enumerate ahead of
-   * time — so the kind alone does not identify one. Use {@link usageWindowKey}
-   * wherever a window needs a stable identity (map keys, React keys).
-   */
-  scopeLabel: string | null;
-  /** Display label ("5-hour session", "Weekly", "Weekly (Fable)"). */
+  /** Display label ("5-hour session", "Weekly", "Weekly (Opus)"). */
   label: string;
   status: UsageStatus;
   /** 0-100, or null when the provider reported no number. NEVER coerce to 0. */
@@ -106,83 +95,12 @@ export function isPercentPossiblyStale(window: ProviderUsageWindow): boolean {
   return window.usedPercent !== null && window.percentSource === 'stream';
 }
 
-/**
- * The stable identity of a window: its kind, plus the model bucket for the
- * dynamic `claude_model_scoped` rows. Two model-scoped windows share a kind and
- * would otherwise collide in a map (and share a React key).
- */
-export function usageWindowKey(window: Pick<ProviderUsageWindow, 'kind' | 'scopeLabel'>): string {
-  return window.scopeLabel === null ? window.kind : `${window.kind}:${window.scopeLabel}`;
-}
-
-/**
- * Extra-usage credits — MONEY, not a quota window.
- *
- * Claude's poll describes the same thing twice: `spend` (minor units with an
- * explicit currency and exponent) and the older `extra_usage` (credits plus
- * `decimal_places`). Both are folded into this one shape at ingest, `spend`
- * winning when the account reports both.
- *
- * It is deliberately NOT a {@link ProviderUsageWindow}: it has no reset to count
- * down to, the spend can EXCEED its limit (13.93 used against a 10.00 cap), and
- * sorting it among the quota windows would let a maxed-but-DISABLED credit line
- * outrank the window that is actually about to stop your lanes.
- */
-export interface ProviderSpendSummary {
-  /** Spent so far, in minor units (1393 = $13.93 at exponent 2). */
-  usedMinor: number;
-  /** The cap, in minor units, or null when the account reports none. */
-  limitMinor: number | null;
-  /** ISO 4217 code ("USD"). */
-  currency: string;
-  /** Minor-unit exponent: 2 for cents. */
-  exponent: number;
-  /** The provider's OWN percentage — reported, never recomputed from the
-   *  amounts above, which is why it can read 100% while used exceeds limit. */
-  percent: number | null;
-  /** Whether extra usage is actually switched on. A disabled line is
-   *  informational: nothing will be charged, and no lane will be unblocked. */
-  enabled: boolean;
-  /** The provider's machine reason ("org_level_disabled_until"), or null. */
-  disabledReason: string | null;
-}
-
-/**
- * Whether a credits line says anything worth a row.
- *
- * An account that has never switched extra usage on reports it in full anyway —
- * `used 0`, `limit null`, `enabled false` — and a permanent "0% $0.00 off" row
- * on every card is noise that pushes the quota windows down. The store still
- * records the observation; this is only about whether to draw it.
- */
-export function hasSpendToShow(spend: ProviderSpendSummary): boolean {
-  return spend.enabled || spend.usedMinor > 0 || spend.limitMinor !== null;
-}
-
-/** "$13.93" — minor units rendered with the provider's own currency + exponent. */
-export function formatSpendAmount(minor: number, currency: string, exponent: number): string {
-  const value = minor / 10 ** exponent;
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency,
-      minimumFractionDigits: exponent,
-      maximumFractionDigits: exponent,
-    }).format(value);
-  } catch {
-    // An unknown/malformed currency code must not throw inside a render.
-    return `${value.toFixed(exponent)} ${currency}`;
-  }
-}
-
 export interface ProviderUsageSnapshot {
   provider: UsageProvider;
   /** Most-constrained window first. */
   windows: ProviderUsageWindow[];
   /** Codex reports a plan ("prolite"); Claude does not. */
   planType: string | null;
-  /** Extra-usage credits, when the provider reports them. Codex: always null. */
-  spend: ProviderSpendSummary | null;
   /** max(window.observedAtMs) — drives the "as of Xm ago" footer. */
   observedAtMs: number;
 }
@@ -235,7 +153,6 @@ export const USAGE_WINDOW_LABELS: Record<UsageWindowKind, string> = {
   claude_seven_day_sonnet: 'Weekly (Sonnet)',
   claude_seven_day_oauth_apps: 'Weekly (OAuth apps)',
   claude_seven_day_overage_included: 'Weekly (incl. overage)',
-  claude_model_scoped: 'Weekly (model)',
   claude_overage: 'Overage',
   codex_primary: 'Primary',
   codex_secondary: 'Secondary',
@@ -251,13 +168,8 @@ export const USAGE_PROVIDER_LABELS: Record<UsageProvider, string> = {
  * window that has one, since we cannot claim it is more or less constrained.
  */
 export function compareWindowsByPressure(a: ProviderUsageWindow, b: ProviderUsageWindow): number {
-  if (a.usedPercent === null && b.usedPercent === null) {
-    return usageWindowKey(a).localeCompare(usageWindowKey(b));
-  }
+  if (a.usedPercent === null && b.usedPercent === null) return a.kind.localeCompare(b.kind);
   if (a.usedPercent === null) return 1;
   if (b.usedPercent === null) return -1;
-  if (b.usedPercent !== a.usedPercent) return b.usedPercent - a.usedPercent;
-  // Equal pressure: order by identity so two model-scoped rows at the same
-  // percentage do not swap places between renders.
-  return usageWindowKey(a).localeCompare(usageWindowKey(b));
+  return b.usedPercent - a.usedPercent;
 }

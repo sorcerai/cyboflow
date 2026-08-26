@@ -11,7 +11,6 @@
  * the parent from the two tRPC list queries.
  */
 import type { WorkflowCardMeta } from './workflowMeta';
-import { parseTimestamp } from '../../../utils/timestampUtils';
 
 interface WorkflowListRowProps {
   meta: WorkflowCardMeta;
@@ -20,19 +19,12 @@ interface WorkflowListRowProps {
 }
 
 /**
- * Format a timestamp as a compact "used X ago" relative label.
+ * Format an ISO timestamp as a compact "used X ago" relative label.
  * Returns null when the timestamp is missing or unparseable.
- *
- * parseTimestamp, not `new Date`: the value is `lastUsedAt`, folded straight
- * from `workflow_runs.created_at`, which SQLite stores space-separated and
- * unzoned — a shape JS reads as LOCAL, putting it the host's UTC offset in the
- * future. The `Math.max(0, …)` clamp below then floors that to zero, so the row
- * rendered a confident "just now" for every flow run in the preceding
- * offset-many hours rather than anything that looked wrong.
  */
-function formatRelative(raw: string | null): string | null {
-  if (raw === null) return null;
-  const then = parseTimestamp(raw).getTime();
+function formatRelative(iso: string | null): string | null {
+  if (iso === null) return null;
+  const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return null;
 
   const diffMs = Math.max(0, Date.now() - then);

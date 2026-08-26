@@ -259,19 +259,8 @@ export function makeSdkVisionQuery(
         options: {
           model,
           maxTurns: 1,
-          // The images are inline in the prompt; the judge needs no tools — and
-          // `tools: []` is what actually enforces that. `allowedTools` governs
-          // AUTO-APPROVAL ONLY (SDK contract), so on its own it leaves the whole
-          // toolset plus every user-configured MCP server in context, where one
-          // speculative tool_use would spend this query's single agentic turn and
-          // end it as `error_max_turns` with no structured output. Same hermetic
-          // set as `orchestrator/verify/verificationAgentQuery.ts`.
-          tools: [],
+          // The images are inline in the prompt; the judge needs no tools.
           allowedTools: [],
-          disallowedTools: ['mcp__*'],
-          settingSources: [],
-          strictMcpConfig: true,
-          mcpServers: {},
           pathToClaudeCodeExecutable: resolveClaudeExecutablePath(),
           outputFormat: { type: 'json_schema', schema },
           abortController: controller,

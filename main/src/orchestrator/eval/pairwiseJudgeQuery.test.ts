@@ -50,11 +50,11 @@ const queryMock = vi.fn();
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: (...args: unknown[]) => queryMock(...args),
 }));
+vi.mock('../../services/panels/claude/claudeExecutablePath', () => ({
+  resolveClaudeExecutablePath: () => '/fake/claude',
+}));
 
 import { makePairwiseJudgeQuery, PAIRWISE_JUDGE_TIMEOUT_MS } from './pairwiseJudgeQuery';
-
-/** Stand-in for the boot-resolved path the wiring site now injects as the factory's first argument. */
-const FAKE_CLAUDE_EXECUTABLE_PATH = '/fake/claude';
 
 let lastOptions: unknown;
 
@@ -74,13 +74,13 @@ beforeEach(() => {
 describe('makePairwiseJudgeQuery', () => {
   it('a timed-out query rejects with the TYPED EvalJudgeTimeoutError', async () => {
     install(makeBlockUntilAbortQuery());
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5);
+    const fn = makePairwiseJudgeQuery(undefined, 5);
     await expect(fn({ prompt: 'p', schema: {} })).rejects.toBeInstanceOf(EvalJudgeTimeoutError);
   });
 
   it('a query that drains to completion NORMALLY (no rejection) after the deadline already fired still rejects with the TYPED EvalJudgeTimeoutError (post-drain in-loop check)', async () => {
     install(makeSlowNaturalCompletionQuery(30));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5);
+    const fn = makePairwiseJudgeQuery(undefined, 5);
 
     const rejection = fn({ prompt: 'p', schema: {} });
     await expect(rejection).rejects.toBeInstanceOf(EvalJudgeTimeoutError);
@@ -94,7 +94,7 @@ describe('makePairwiseJudgeQuery', () => {
     // what makes isDeterministicJudgeFailure() see a timeout (no slot retry) rather
     // than a retryable generic Error.
     install(makeRejectOnAbortQuery());
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5);
+    const fn = makePairwiseJudgeQuery(undefined, 5);
 
     const rejection = fn({ prompt: 'p', schema: {} });
     await expect(rejection).rejects.toBeInstanceOf(EvalJudgeTimeoutError);
@@ -106,14 +106,14 @@ describe('makePairwiseJudgeQuery', () => {
   it('an EvalJudgeTimeoutError thrown by the generator itself is rethrown BY IDENTITY (same object), not wrapped anew', async () => {
     const original = new EvalJudgeTimeoutError('boom from generator');
     install(makeRejectingQuery(original));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makePairwiseJudgeQuery();
 
     await expect(fn({ prompt: 'p', schema: {} })).rejects.toBe(original);
   });
 
   it('a non-timeout SDK failure rejects with a plain Error, NOT the typed timeout class (retry-once contract)', async () => {
     install(makeRejectingQuery(new Error('sdk boom')));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makePairwiseJudgeQuery();
 
     const rejection = fn({ prompt: 'p', schema: {} });
     await expect(rejection).rejects.toThrow('sdk boom');
@@ -127,7 +127,7 @@ describe('makePairwiseJudgeQuery', () => {
     // failure the worker classifies as RETRYABLE — so a slot that had already
     // spent its whole turn budget drew a guaranteed-wasted identical retry.
     install(makeFakeQuery([sdkAssistantText('still deliberating'), sdkResultError({ subtype: 'error_max_turns' })]));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makePairwiseJudgeQuery();
 
     const rejection = fn({ prompt: 'p', schema: {} });
     await expect(rejection).rejects.toBeInstanceOf(EvalJudgeMaxTurnsError);
@@ -137,11 +137,11 @@ describe('makePairwiseJudgeQuery', () => {
   it('is deterministic per judgeErrors for BOTH exhaustion classes but not for a generic failure', async () => {
     // The property the worker's per-slot retry policy actually branches on.
     install(makeFakeQuery([sdkResultError({ subtype: 'error_max_turns' })]));
-    const maxTurns = await makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH)({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
+    const maxTurns = await makePairwiseJudgeQuery()({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
     install(makeBlockUntilAbortQuery());
-    const timedOut = await makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH, undefined, 5)({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
+    const timedOut = await makePairwiseJudgeQuery(undefined, 5)({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
     install(makeRejectingQuery(new Error('sdk boom')));
-    const generic = await makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH)({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
+    const generic = await makePairwiseJudgeQuery()({ prompt: 'p', schema: {} }).catch((e: unknown) => e);
 
     expect(isDeterministicJudgeFailure(maxTurns)).toBe(true);
     expect(isDeterministicJudgeFailure(timedOut)).toBe(true);
@@ -158,7 +158,7 @@ describe('makePairwiseJudgeQuery', () => {
       ]),
     );
 
-    await expect(makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH)({ prompt: 'p', schema: {} })).resolves.toEqual({
+    await expect(makePairwiseJudgeQuery()({ prompt: 'p', schema: {} })).resolves.toEqual({
       preference: 'B',
       confidence: 0.7,
     });
@@ -166,7 +166,7 @@ describe('makePairwiseJudgeQuery', () => {
 
   it('returns the structured_output of the successful result', async () => {
     install(makeFakeQuery([sdkResultSuccess({ structuredOutput: { preference: 'A', confidence: 0.8 } })]));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makePairwiseJudgeQuery();
 
     const out = await fn({ prompt: 'p', schema: { type: 'object' } });
 
@@ -175,26 +175,16 @@ describe('makePairwiseJudgeQuery', () => {
 
   it('passes PAIRWISE_ALLOWED_TOOLS, json_schema outputFormat, and NO cwd key', async () => {
     install(makeFakeQuery([sdkResultSuccess({ structuredOutput: {} })]));
-    const fn = makePairwiseJudgeQuery(FAKE_CLAUDE_EXECUTABLE_PATH);
+    const fn = makePairwiseJudgeQuery();
 
     await fn({ prompt: 'p', schema: { type: 'object', required: ['preference'] } });
 
     const opts = lastOptions as Record<string, unknown>;
     expect(opts.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
-    // Regression guard (`allowedTools` is AUTO-APPROVAL ONLY): `tools` is what
-    // removes Write/Edit/Bash and the user's MCP servers from the model's
-    // context. Without it a speculative tool_use spends a turn this query
-    // cannot spare. See the option block's comment for the measured numbers.
-    expect(opts.tools).toEqual(['Read', 'Grep', 'Glob']);
-    expect(opts.disallowedTools).toEqual(['mcp__*']);
-    expect(opts.settingSources).toEqual([]);
-    expect(opts.strictMcpConfig).toBe(true);
-    expect(opts.mcpServers).toEqual({});
     expect(opts.outputFormat).toEqual({
       type: 'json_schema',
       schema: { type: 'object', required: ['preference'] },
     });
-    expect(opts.pathToClaudeCodeExecutable).toBe(FAKE_CLAUDE_EXECUTABLE_PATH);
     expect('cwd' in opts).toBe(false);
   });
 

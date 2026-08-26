@@ -10,7 +10,7 @@ import { getShellPath, findExecutableInPath } from '../../../utils/shellPath';
 import { captureSeamError } from '../../telemetry';
 import { assertAgentProviderAllowed, isAgentProviderAllowed } from '../../agentProviderGuard';
 import type { AgentProvider } from '../../../../../shared/types/agentRuntime';
-import { classifyErrorPattern, unclassifiedErrorTags } from '../../../orchestrator/programmatic/systemicError';
+import { classifyErrorPattern } from '../../../orchestrator/programmatic/systemicError';
 import { findNodeExecutable } from '../../../utils/nodeFinder';
 import { describeMissingInterpreter } from './cliVersionProbe';
 import type { CliSpawnOutcome } from '../../../../../shared/types/cliPanels';
@@ -208,17 +208,9 @@ export abstract class AbstractCliManager extends EventEmitter {
   protected abstract initializeCliEnvironment(options: CliSpawnOptions): Promise<{ [key: string]: string }>;
 
   /**
-   * Clean up CLI-specific resources (e.g., config files, temporary files) for
-   * the panel that just exited or was killed.
-   *
-   * Takes BOTH ids: `panelId` for per-panel state (a run record, a tail
-   * source, a router entry) — the exiting panel's own resources only, never a
-   * still-live sibling's — and `sessionId` for state that is deliberately
-   * SHARED across every panel in a session (e.g. the SDK manager's per-session
-   * `.claude/commands` bundle, refcounted so the last live lane removes it). A
-   * subclass with no session-scoped state can ignore `sessionId`.
+   * Clean up CLI-specific resources (e.g., config files, temporary files)
    */
-  protected abstract cleanupCliResources(panelId: string, sessionId: string): Promise<void>;
+  protected abstract cleanupCliResources(sessionId: string): Promise<void>;
 
   /**
    * Get CLI-specific environment variables
@@ -369,9 +361,8 @@ export abstract class AbstractCliManager extends EventEmitter {
       }
     }
 
-    // Clean up CLI-specific resources — scoped to THIS panel (see the abstract
-    // method doc: a sibling panel in the same session must be left alone).
-    await this.cleanupCliResources(panelId, sessionId);
+    // Clean up CLI-specific resources
+    await this.cleanupCliResources(sessionId);
 
     // Kill the process and all its children
     if (pid) {
@@ -880,7 +871,6 @@ export abstract class AbstractCliManager extends EventEmitter {
       substrate: 'interactive',
       cliTool: this.getCliToolName(),
       errorClass: spawnErrorClass,
-      ...unclassifiedErrorTags(spawnErrorClass, errorMsg),
     });
     throw new Error(`Failed to spawn ${this.getCliToolName()}: ${errorMsg}`);
   }
@@ -1004,8 +994,8 @@ export abstract class AbstractCliManager extends EventEmitter {
         this.logger?.info(`${this.getCliToolName()} process exited normally for panel ${panelId} (session ${sessionId})`);
       }
 
-      // Clean up CLI-specific resources — scoped to THIS panel.
-      await this.cleanupCliResources(panelId, sessionId);
+      // Clean up CLI-specific resources
+      await this.cleanupCliResources(sessionId);
 
       this.emit('exit', {
         panelId,

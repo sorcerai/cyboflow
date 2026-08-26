@@ -30,7 +30,6 @@ import * as os from 'os';
 import * as path from 'path';
 import type Database from 'better-sqlite3';
 import { OrchSocketServer } from '../orchSocketServer';
-import { OrchTokenRegistry, ORCH_AUTH_KILL_SWITCH_ENV_VAR } from '../../orchAuthToken';
 import type { LoggerLike } from '../../types';
 import type { OrchSocketProvider } from '../../runLauncher';
 import { dbAdapter } from '../../__test_fixtures__/dbAdapter';
@@ -148,21 +147,12 @@ describe('OrchSocketServer', () => {
   let logger: SpyLogger;
   let server: OrchSocketServer;
   let socketPath: string;
-  /**
-   * A suite-local token registry, injected into every server built here.
-   * Binding a runId now requires that run's bearer token, and using a real
-   * registry (rather than an accept-all stub) keeps these transport tests
-   * honest about the authenticated path without touching the process-wide
-   * singleton the production spawn seams mint into.
-   */
-  let tokens: OrchTokenRegistry;
   const openClients: net.Socket[] = [];
 
   beforeEach(() => {
     db = createTestDb({ disableForeignKeys: true });
     logger = makeSpyLogger();
     socketPath = makeTmpSocketPath();
-    tokens = new OrchTokenRegistry();
   });
 
   afterEach(async () => {
@@ -187,7 +177,7 @@ describe('OrchSocketServer', () => {
       toolInputJson: '{"cmd":"ls"}',
     });
 
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     const { client, waitForLines } = connectClient(socketPath);
@@ -195,7 +185,7 @@ describe('OrchSocketServer', () => {
     await waitForConnect(client);
 
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-1', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-1', runId: 'run-a' }) + '\n',
     );
 
     const lines = await waitForLines(1);
@@ -214,7 +204,7 @@ describe('OrchSocketServer', () => {
   // -------------------------------------------------------------------------
 
   it('reassembles a JSON message split across two socket writes and routes it exactly once', async () => {
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     const { client, waitForLines, lines } = connectClient(socketPath);
@@ -222,7 +212,7 @@ describe('OrchSocketServer', () => {
     await waitForConnect(client);
 
     const full =
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-split', runId: 'run-z', token: tokens.mint('run-z') }) + '\n';
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-split', runId: 'run-z' }) + '\n';
     const mid = Math.floor(full.length / 2);
 
     // Two writes for the single framed message; the trailing newline arrives in
@@ -247,7 +237,7 @@ describe('OrchSocketServer', () => {
   // -------------------------------------------------------------------------
 
   it('logs and drops a malformed (non-JSON) line without crashing the server or the connection', async () => {
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     const { client, waitForLines } = connectClient(socketPath);
@@ -257,7 +247,7 @@ describe('OrchSocketServer', () => {
     // First a malformed line, then a valid one on the SAME connection.
     client.write('this is not json\n');
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-after-bad', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-after-bad', runId: 'run-a' }) + '\n',
     );
 
     const lines = await waitForLines(1);
@@ -283,7 +273,7 @@ describe('OrchSocketServer', () => {
   // -------------------------------------------------------------------------
 
   it('getSocketPath() returns the path and hasClientForRun reflects a bound runId', async () => {
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     expect(server.getSocketPath()).toBe(socketPath);
@@ -294,7 +284,7 @@ describe('OrchSocketServer', () => {
     await waitForConnect(client);
 
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-bind', runId: 'run-bound', token: tokens.mint('run-bound') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-bind', runId: 'run-bound' }) + '\n',
     );
     await waitForLines(1);
 
@@ -326,7 +316,7 @@ describe('OrchSocketServer', () => {
     fs.writeFileSync(socketPath, 'stale');
     expect(fs.existsSync(socketPath)).toBe(true);
 
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     expect(fs.existsSync(dir)).toBe(true);
@@ -336,7 +326,7 @@ describe('OrchSocketServer', () => {
     openClients.push(client);
     await waitForConnect(client);
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live', runId: 'run-a' }) + '\n',
     );
     const lines = await waitForLines(1);
     expect(parse(lines[0]).ok).toBe(true);
@@ -382,7 +372,7 @@ describe('OrchSocketServer', () => {
     fs.writeFileSync(socketPath, 'stale');
     vi.mocked(fs.existsSync).mockReturnValueOnce(false);
 
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start(); // must recover (unlink + retry), not hang
 
     const warnedEaddr = logger.warn.mock.calls.some(
@@ -395,7 +385,7 @@ describe('OrchSocketServer', () => {
     openClients.push(client);
     await waitForConnect(client);
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-eaddr', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-eaddr', runId: 'run-a' }) + '\n',
     );
     const lines = await waitForLines(1);
     expect(parse(lines[0]).ok).toBe(true);
@@ -407,14 +397,14 @@ describe('OrchSocketServer', () => {
 
   it('start() refuses to clobber a socket a LIVE server is already listening on', async () => {
     // Server A owns the path and is actively listening.
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
     expect(fs.existsSync(socketPath)).toBe(true);
 
     // Server B targets the SAME path. Its start() must detect the live listener
     // via the connect-probe and reject, rather than unlink A's socket out from
     // under it (the two-instance orch.sock clobber that stranded MCP subprocesses).
-    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await expect(serverB.start()).rejects.toThrow(/already listening/i);
 
     // A is untouched: still listening, still round-trips a real client.
@@ -422,7 +412,7 @@ describe('OrchSocketServer', () => {
     openClients.push(client);
     await waitForConnect(client);
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live', runId: 'run-a' }) + '\n',
     );
     const lines = await waitForLines(1);
     expect(parse(lines[0]).ok).toBe(true);
@@ -434,7 +424,7 @@ describe('OrchSocketServer', () => {
 
   it('EADDRINUSE against a LIVE socket rejects instead of unlinking it', async () => {
     // Server A is live on the path.
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     // Server B skips its pre-bind probe (existsSync→false once) so it reaches
@@ -442,7 +432,7 @@ describe('OrchSocketServer', () => {
     // probe→bind race. The EADDRINUSE handler must re-probe, see A alive, and
     // reject rather than unlink A's live socket out from under it.
     vi.mocked(fs.existsSync).mockReturnValueOnce(false);
-    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await expect(serverB.start()).rejects.toThrow(/already listening/i);
 
     // A is untouched: still listening, still round-trips a real client.
@@ -450,7 +440,7 @@ describe('OrchSocketServer', () => {
     openClients.push(client);
     await waitForConnect(client);
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live-eaddr', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-live-eaddr', runId: 'run-a' }) + '\n',
     );
     const lines = await waitForLines(1);
     expect(parse(lines[0]).ok).toBe(true);
@@ -462,14 +452,14 @@ describe('OrchSocketServer', () => {
 
   it('stop() does NOT unlink the socket file when another instance has rebound the path', async () => {
     // Server A binds the path and records its inode.
-    const serverA = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    const serverA = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await serverA.start();
 
     // An older build (no pre-bind probe) clobbers the path and binds its own
     // socket there — exactly the two-instance collision that stranded every
     // later MCP subprocess. Reproduce it by force-replacing the file.
     fs.rmSync(socketPath, { force: true });
-    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    const serverB = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await serverB.start();
     const inodeB = fs.statSync(socketPath).ino;
 
@@ -491,7 +481,7 @@ describe('OrchSocketServer', () => {
     openClients.push(client);
     await waitForConnect(client);
     client.write(
-      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-owned', runId: 'run-a', token: tokens.mint('run-a') }) + '\n',
+      JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'req-owned', runId: 'run-a' }) + '\n',
     );
     const lines = await waitForLines(1);
     expect(parse(lines[0]).ok).toBe(true);
@@ -505,7 +495,7 @@ describe('OrchSocketServer', () => {
   // -------------------------------------------------------------------------
 
   it('satisfies the OrchSocketProvider interface', async () => {
-    server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
+    server = new OrchSocketServer(socketPath, dbAdapter(db), logger);
     await server.start();
 
     // This assignment fails to compile if the structural shape drifts.
@@ -515,274 +505,5 @@ describe('OrchSocketServer', () => {
     // contract retired with the stale_socket rung), so pin it directly rather
     // than through an interface no longer worth declaring.
     expect(server.hasClientForRun('nope')).toBe(false);
-  });
-
-  // -------------------------------------------------------------------------
-  // Peer authentication (per-run bearer tokens)
-  //
-  // The runId on the wire is SELF-DECLARED, and binding it is what grants a
-  // connection run-scoped powers (shell-approval routing, entity writes, the
-  // global agent's `agent:<threadId>` fs/SQL family). These pin that a bind
-  // requires the run's token.
-  // -------------------------------------------------------------------------
-
-  describe('bind authentication', () => {
-    /** Send one list-approvals frame and give the server time to act on it. */
-    async function sendFrame(client: net.Socket, frame: Record<string, unknown>): Promise<void> {
-      client.write(JSON.stringify(frame) + '\n');
-      await new Promise((r) => setTimeout(r, 120));
-    }
-
-    function waitForClose(client: net.Socket, timeoutMs = 2000): Promise<void> {
-      return new Promise<void>((resolve, reject) => {
-        if (client.destroyed) {
-          resolve();
-          return;
-        }
-        const timer = setTimeout(() => reject(new Error('socket did not close')), timeoutMs);
-        client.once('close', () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-    }
-
-    it('refuses to bind a runId presented with NO token and closes the connection', async () => {
-      seedRun(db, { id: 'run-a' });
-      tokens.mint('run-a');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, lines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      await sendFrame(client, {
-        type: 'mcp-list-pending-approvals',
-        requestId: 'req-notoken',
-        runId: 'run-a',
-      });
-
-      await waitForClose(client);
-      // The message must never have reached the handler.
-      expect(lines).toHaveLength(0);
-      expect(server.hasClientForRun('run-a')).toBe(false);
-      expect(
-        logger.warn.mock.calls.some(([msg]) => String(msg).includes('refused a run binding')),
-      ).toBe(true);
-    });
-
-    it('refuses to bind a runId presented with the WRONG token and closes the connection', async () => {
-      seedRun(db, { id: 'run-a' });
-      seedRun(db, { id: 'run-b' });
-      tokens.mint('run-a');
-      // Another run's perfectly valid token must not open this run.
-      const otherRunsToken = tokens.mint('run-b');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, lines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      await sendFrame(client, {
-        type: 'mcp-list-pending-approvals',
-        requestId: 'req-wrongtoken',
-        runId: 'run-a',
-        token: otherRunsToken,
-      });
-
-      await waitForClose(client);
-      expect(lines).toHaveLength(0);
-      expect(server.hasClientForRun('run-a')).toBe(false);
-    });
-
-    it('binds and routes normally when the correct token is presented, and never logs the secret', async () => {
-      seedRun(db, { id: 'run-a' });
-      const token = tokens.mint('run-a');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, waitForLines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      client.write(
-        JSON.stringify({
-          type: 'mcp-list-pending-approvals',
-          requestId: 'req-ok',
-          runId: 'run-a',
-          token,
-        }) + '\n',
-      );
-
-      const lines = await waitForLines(1);
-      expect(parse(lines[0]).ok).toBe(true);
-      expect(server.hasClientForRun('run-a')).toBe(true);
-
-      // A token in a log line is a token in a support bundle.
-      const everythingLogged = JSON.stringify([
-        logger.info.mock.calls,
-        logger.warn.mock.calls,
-        logger.error.mock.calls,
-        logger.debug.mock.calls,
-      ]);
-      expect(everythingLogged).not.toContain(token);
-    });
-
-    it('does not let a connection bound to one run bind a SECOND run with the first run\'s token', async () => {
-      seedRun(db, { id: 'run-a' });
-      seedRun(db, { id: 'run-b' });
-      const tokenA = tokens.mint('run-a');
-      tokens.mint('run-b');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, waitForLines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      client.write(
-        JSON.stringify({
-          type: 'mcp-list-pending-approvals',
-          requestId: 'req-a',
-          runId: 'run-a',
-          token: tokenA,
-        }) + '\n',
-      );
-      await waitForLines(1);
-      expect(server.hasClientForRun('run-a')).toBe(true);
-
-      // Same connection, now claiming run-b while still holding only run-a's token.
-      await sendFrame(client, {
-        type: 'mcp-list-pending-approvals',
-        requestId: 'req-b',
-        runId: 'run-b',
-        token: tokenA,
-      });
-
-      await waitForClose(client);
-      expect(server.hasClientForRun('run-b')).toBe(false);
-    });
-
-    it('drops lines already buffered behind a refused bind instead of routing them', async () => {
-      seedRun(db, { id: 'run-a' });
-      tokens.mint('run-a');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, lines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      // Two complete frames in ONE write: the first is refused, so the second
-      // must never be routed even though it is already in the receive buffer.
-      client.write(
-        JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'r1', runId: 'run-a' }) +
-          '\n' +
-          JSON.stringify({ type: 'mcp-list-pending-approvals', requestId: 'r2', runId: 'run-a' }) +
-          '\n',
-      );
-      await waitForClose(client);
-      await new Promise((r) => setTimeout(r, 100));
-      expect(lines).toHaveLength(0);
-    });
-
-    it('accepts an unauthenticated bind when the kill switch is set, and says so loudly', async () => {
-      const prior = process.env[ORCH_AUTH_KILL_SWITCH_ENV_VAR];
-      process.env[ORCH_AUTH_KILL_SWITCH_ENV_VAR] = '1';
-      try {
-        seedRun(db, { id: 'run-a' });
-        server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-        await server.start();
-
-        const { client, waitForLines } = connectClient(socketPath);
-        openClients.push(client);
-        await waitForConnect(client);
-
-        // No token minted at all, and none presented.
-        client.write(
-          JSON.stringify({
-            type: 'mcp-list-pending-approvals',
-            requestId: 'req-legacy',
-            runId: 'run-a',
-          }) + '\n',
-        );
-
-        const lines = await waitForLines(1);
-        expect(parse(lines[0]).ok).toBe(true);
-        expect(server.hasClientForRun('run-a')).toBe(true);
-        expect(
-          logger.warn.mock.calls.some(([msg]) =>
-            String(msg).includes('peer authentication is DISABLED'),
-          ),
-        ).toBe(true);
-      } finally {
-        if (prior === undefined) delete process.env[ORCH_AUTH_KILL_SWITCH_ENV_VAR];
-        else process.env[ORCH_AUTH_KILL_SWITCH_ENV_VAR] = prior;
-      }
-    });
-
-    it('leaves a connection that never declares a runId open, and answers it with an error', async () => {
-      // Nothing in the production wire contract omits runId (all 55 message
-      // arms require it), so this pins that the unbound surface stays as it
-      // was: parse, no bind, no run-scoped state, and an error back.
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const { client, waitForLines } = connectClient(socketPath);
-      openClients.push(client);
-      await waitForConnect(client);
-
-      client.write(JSON.stringify({ type: 'no-such-type', requestId: 'req-unbound' }) + '\n');
-
-      const lines = await waitForLines(1);
-      const resp = parse(lines[0]);
-      expect(resp.requestId).toBe('req-unbound');
-      expect(resp.ok).toBe(false);
-      expect(client.destroyed).toBe(false);
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // Filesystem hardening
-  // -------------------------------------------------------------------------
-
-  describe('socket permissions', () => {
-    // chmod on a socket node is meaningful on POSIX; Windows has no mode bits.
-    const posix = process.platform !== 'win32';
-
-    it.skipIf(!posix)('creates the sockets directory 0700 and the socket file 0600', async () => {
-      // A nested dir this test owns, so the mode assertion is about what
-      // start() did rather than about whatever tmpdir happens to be.
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `orch-perm-${process.pid}-`));
-      socketPath = path.join(dir, 'nested', 'orch.sock');
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      const dirMode = fs.statSync(path.dirname(socketPath)).mode & 0o777;
-      const fileMode = fs.statSync(socketPath).mode & 0o777;
-      expect(dirMode).toBe(0o700);
-      expect(fileMode).toBe(0o600);
-
-      await server.stop();
-      fs.rmSync(dir, { recursive: true, force: true });
-    });
-
-    it.skipIf(!posix)('tightens a sockets directory an older build left world-readable', async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `orch-perm-${process.pid}-`));
-      const sockets = path.join(dir, 'sockets');
-      fs.mkdirSync(sockets, { mode: 0o755 });
-      fs.chmodSync(sockets, 0o755);
-      socketPath = path.join(sockets, 'orch.sock');
-
-      server = new OrchSocketServer(socketPath, dbAdapter(db), logger, {}, tokens);
-      await server.start();
-
-      expect(fs.statSync(sockets).mode & 0o777).toBe(0o700);
-
-      await server.stop();
-      fs.rmSync(dir, { recursive: true, force: true });
-    });
   });
 });

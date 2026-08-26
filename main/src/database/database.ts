@@ -6,101 +6,6 @@ import type { ToolPanel, ToolPanelType, ToolPanelState, ToolPanelMetadata } from
 import { DEFAULT_PERMISSION_MODE } from '../../../shared/types/permissionMode';
 import { sumSessionOutputTokenUsage, type SessionTokenTotals } from './sessionTokenUsage';
 import { reconcileSessionsPluginsColumn } from './reconcileSessionsPluginsColumn';
-import { splitSqlStatements, stripLeadingSqlComments } from './splitSqlStatements';
-
-/**
- * A .sql migration file did not apply. Thrown by runFileBasedMigrations() and
- * propagated out of DatabaseService.initialize() so boot ABORTS instead of
- * running application code against a schema that is missing whatever the
- * migration was supposed to add. The boot sequence in main/src/index.ts catches
- * this and shows a blocking dialog before quitting.
- */
-export class MigrationFailedError extends Error {
-  constructor(readonly migration: string, cause: unknown) {
-    super(
-      `Migration ${migration} failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-      { cause },
-    );
-    this.name = 'MigrationFailedError';
-  }
-}
-
-/**
- * True when `err` is SQLite refusing a statement whose effect is ALREADY in the
- * schema — the only class of failure a re-applied migration is allowed to skip.
- *
- * Two shapes, and only these two:
- *   - `ALTER TABLE … ADD [COLUMN]` → "duplicate column name: X"
- *   - `CREATE TABLE|INDEX|VIEW|TRIGGER` → "… already exists"
- * SQLite has no `ADD COLUMN IF NOT EXISTS`, and the older migrations predate
- * the `CREATE … IF NOT EXISTS` habit, so these are how an already-applied
- * statement announces itself.
- *
- * Both directions are checked on purpose: the message must be the idempotence
- * signal AND the statement that raised it must be the DDL that signal belongs
- * to. A failed backfill, a constraint violation, or a typo does not match
- * either shape and fails the boot.
- *
- * This matters beyond re-numbered files: the migration chain carries a
- * documented re-run convergence property (see the header of
- * 088_artifacts_revision_ensure.sql) — a ledger-wiped database must be able to
- * replay every file against the final schema — and several table-recreate
- * migrations rebuild indexes that the replay then finds already present.
- */
-function isAlreadyAppliedSchemaStatement(statement: string, err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  const head = stripLeadingSqlComments(statement);
-  if (message.includes('duplicate column name:')) {
-    return /^ALTER\s+TABLE\b[\s\S]*\bADD\b/i.test(head);
-  }
-  if (/\balready exists\b/i.test(message)) {
-    return /^CREATE\s+(?:\w+\s+){0,2}(?:TABLE|INDEX|VIEW|TRIGGER)\b/i.test(head);
-  }
-  return false;
-}
-
-/**
- * The `sessions.idle_since` write, appended to updateSession's SET list whenever
- * the caller supplies a status (migration 119).
- *
- * idle_since is the session's real LAST-ACTIVITY boundary — the moment it came
- * to rest after a turn. It exists because the quick-session board's "quiet for
- * N" label used to read `updated_at`, which ANY write to the row bumps (a
- * rename, a folder move, the boot sweep, a status refinement), so the quiet
- * clock restarted on things that were not activity at all.
- *
- * This is deliberately a chokepoint rather than a per-substrate event. Every
- * session-status write in the app already funnels through updateSession —
- * sessionManager.updateSession (the ipc/events callers), sessionManager's
- * system/result writer, events.ts's all-panels-stopped check, and the facade
- * rester — so stamping here inherits all six lanes (claude-sdk,
- * claude-interactive, codex-sdk, codex-pty, omp-sdk, omp-pty) with no new event
- * type and no per-manager emission. Writing it in the SAME UPDATE as the status
- * also makes disagreement between idle_since and the status the board derives
- * `idle` from structurally impossible.
- *
- * Three arms, in order:
- *   1. new status is busy (`running`/`pending`) → NULL. A busy session has no
- *      idle time; clearing it also means a NULL can be read as "not resting".
- *   2. OLD status was busy and the new one is not → this is the busy→resting
- *      transition, the only real boundary; stamp `datetime('now')`.
- *   3. otherwise (resting → resting, e.g. `stopped` → `failed`) → preserve. A
- *      status REFINEMENT is not a new boundary and must not reset the clock.
- *
- * Arm 2 depends on SQLite evaluating every expression in an UPDATE's SET list
- * against the PRE-update row, so the bare `status` here is the old value even
- * though `status = ?` is assigned in the same statement.
- *
- * The single `?` binds the NEW status; callers must push it a second time.
- * `datetime('now')` yields the same space-separated UTC form as
- * CURRENT_TIMESTAMP/updated_at, so readers normalize it with the same
- * strftime() the ' ' vs 'T' ordering trap already forces on updated_at.
- */
-const IDLE_SINCE_ON_STATUS_CHANGE = `idle_since = CASE
-      WHEN ? IN ('running', 'pending') THEN NULL
-      WHEN status IN ('running', 'pending') THEN datetime('now')
-      ELSE idle_since
-    END`;
 
 // Interface for legacy claude_panel_settings during migration
 interface ClaudePanelSetting {
@@ -190,34 +95,6 @@ export interface SchemaVersionStatus {
   appMax: number;
   /** True when onDisk > appMax: the DB knows a schema this binary does not. */
   tooNew: boolean;
-}
-
-/** `session_summaries.state` values the review-home board understands (migration 121). */
-const SESSION_SUMMARY_STATES = new Set(['working', 'complete', 'needs_input']);
-
-/**
- * Validates a `session_summaries.state` value at the read/write boundary
- * (migration 121). No CHECK constraint backs this column — see the migration
- * header — so anything outside the known set, including a non-string or a
- * future value this binary doesn't know about yet, degrades to null rather
- * than propagating.
- */
-function normalizeSummaryState(value: unknown): string | null {
-  return typeof value === 'string' && SESSION_SUMMARY_STATES.has(value) ? value : null;
-}
-
-const WAITING_ON_MAX_LENGTH = 300;
-
-/**
- * Validates/clamps a `session_summaries.waiting_on` value at the read/write
- * boundary (migration 121). Non-string becomes null; blank (after trim)
- * becomes null; anything past 300 chars is truncated to it.
- */
-function normalizeWaitingOn(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return null;
-  return trimmed.length > WAITING_ON_MAX_LENGTH ? trimmed.slice(0, WAITING_ON_MAX_LENGTH) : trimmed;
 }
 
 export class DatabaseService {
@@ -1787,25 +1664,9 @@ export class DatabaseService {
   /**
    * Scans the migrations directory for numeric-prefix .sql files and applies
    * any that have not yet been recorded as applied in user_preferences.
-   *
-   * Each file runs STATEMENT BY STATEMENT inside one transaction, and the ledger
-   * marker is written inside that same transaction — so the marker exists if and
-   * only if every statement in the file landed.
-   *
-   * Idempotence is per STATEMENT, not per file. The ledger tracks by FILENAME,
-   * so renumbering a migration (113-118 were renumbered twice in Aug 2026) makes
-   * the file re-apply against a database where some of its statements already
-   * ran. An `ALTER TABLE … ADD COLUMN` whose column is already there is skipped
-   * and the rest of the file continues. Stamping the marker on a FILE-level
-   * catch — what this used to do — was silent data loss: the throw had already
-   * rolled the whole transaction back, so every other statement in the file was
-   * discarded while the ledger claimed the migration was applied.
-   *
-   * Every other failure is FAIL-CLOSED: the transaction rolls back, nothing is
-   * stamped, and a MigrationFailedError propagates out of initialize() so boot
-   * stops. Continuing would run application code against a schema that does not
-   * match it, which surfaces later as scattered "no such column" errors with no
-   * trace back to the migration that never applied.
+   * Each file is applied in its own transaction so a single failure does not
+   * prevent subsequent files from running (matching Cyboflow's existing migration
+   * tolerance pattern).
    */
   private runFileBasedMigrations(): void {
     // Bootstrap: legacy inline migrations 003-005 ran before this runner existed.
@@ -1838,12 +1699,7 @@ export class DatabaseService {
         return { name, prefix: parseInt(match[1], 10) };
       })
       .filter((x): x is { name: string; prefix: number } => x !== null)
-      // Tie-break by full name: five legacy prefixes (059-063) are shared by
-      // more than one file, and a prefix-only sort leaves their relative order
-      // to readdirSync's filesystem order — platform-undefined. New duplicates
-      // are blocked by migrationPrefixes.test.ts; this keeps the legacy ones
-      // applying in the same order everywhere.
-      .sort((a, b) => a.prefix - b.prefix || a.name.localeCompare(b.name, 'en'));
+      .sort((a, b) => a.prefix - b.prefix);
 
     const selectApplied = this.db.prepare(
       "SELECT value FROM user_preferences WHERE key = ?"
@@ -1863,9 +1719,8 @@ export class DatabaseService {
       try {
         sql = readFileSync(sqlPath, 'utf-8');
       } catch (err) {
-        // Fail-closed like a failing statement: the file is listed in the
-        // directory but unreadable, so we cannot know the schema is complete.
-        throw new MigrationFailedError(name, err);
+        console.error(`[Database] Could not read migration ${name}:`, err);
+        continue;
       }
 
       // SQLite docs: PRAGMA foreign_keys toggles are no-ops inside a transaction
@@ -1878,30 +1733,27 @@ export class DatabaseService {
       if (needsFkOff) this.db.pragma('foreign_keys = OFF');
       try {
         this.transaction(() => {
-          for (const statement of splitSqlStatements(sql)) {
-            try {
-              this.db.exec(statement);
-            } catch (err) {
-              // A re-applied migration (renumbered file, or a ledger-wiped
-              // replay) hits the column or index it already added. Skip THAT
-              // statement only — the rest of the file still has to run, inside
-              // this same transaction.
-              if (!isAlreadyAppliedSchemaStatement(statement, err)) throw err;
-              const errMsg = err instanceof Error ? err.message : String(err);
-              console.warn(
-                `[Database] Migration ${name}: statement already applied, skipping (${errMsg})`,
-              );
-            }
-          }
+          this.db.exec(sql);
           insertApplied.run(key);
         });
         console.log(`[Database] Applied file migration: ${name}`);
       } catch (err) {
-        // Fail-closed. The transaction rolled back and nothing was stamped, so
-        // the schema is missing what this file adds; booting on would run the
-        // app against a schema its code does not match.
-        console.error(`[Database] Migration ${name} failed — aborting boot:`, err);
-        throw err instanceof MigrationFailedError ? err : new MigrationFailedError(name, err);
+        // Detect idempotent ALTER TABLE failures (e.g. "duplicate column name: X").
+        // SQLite does not support ADD COLUMN IF NOT EXISTS; when a migration that only
+        // adds a column is re-executed after the ledger marker was erased (e.g. in tests
+        // that selectively reset the migration ledger), the column already exists and
+        // SQLite throws "SqliteError: duplicate column name: <col>".  Treat this as a
+        // successful idempotent application: record the ledger marker so subsequent
+        // initialize() calls skip cleanly, and log at warn (not error).
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes('duplicate column name:')) {
+          insertApplied.run(key);
+          console.warn(`[Database] Migration ${name} column already exists (idempotent ok): ${errMsg}`);
+        } else {
+          // Match Cyboflow's existing tolerance pattern (try/catch around 004/005):
+          // log + continue so a single broken file does not brick the app boot.
+          console.error(`[Database] Migration ${name} failed:`, err);
+        }
       } finally {
         // Always restore FK enforcement, even if the transaction threw.
         if (needsFkOff) this.db.pragma('foreign_keys = ON');
@@ -2551,10 +2403,6 @@ export class DatabaseService {
     if (data.status !== undefined) {
       updates.push('status = ?');
       values.push(data.status);
-      // Stamp/clear the last-activity clock in the SAME statement, so it can
-      // never disagree with the status the board derives `idle` from.
-      updates.push(IDLE_SINCE_ON_STATUS_CHANGE);
-      values.push(data.status);
     }
     if (data.status_message !== undefined) {
       updates.push('status_message = ?');
@@ -2652,16 +2500,12 @@ export class DatabaseService {
   }
 
   markSessionAsViewed(id: string): Session | undefined {
-    // Deliberately does NOT bump updated_at. This guard is still load-bearing
-    // after migration 119 moved the board's "quiet for N" label onto
-    // idle_since — the reason simply changed: unviewed is
-    // `last_viewed_at < updated_at`, so bumping updated_at here would mark the
-    // session unviewed again the instant it was opened, re-arming the blue dot
-    // and the landing "waiting on you" count. (The sidebar's lastActivity no
-    // longer depends on it for a resting session — sessionManager COALESCEs
-    // idle_since first — but a busy session still falls through to updated_at.)
-    // Viewed-ness stays correct as written: stamping last_viewed_at alone
-    // flips the predicate to viewed.
+    // Deliberately does NOT bump updated_at: updated_at doubles as the
+    // session's last-ACTIVITY clock (the quick-sessions board derives its
+    // "quiet for N" label from it), and merely viewing a session is not
+    // activity — bumping it here reset the idle clock on every open.
+    // Viewed-ness stays correct: unviewed is last_viewed_at < updated_at,
+    // and stamping last_viewed_at alone flips that to viewed.
     this.db.prepare(`
       UPDATE sessions
       SET last_viewed_at = CURRENT_TIMESTAMP
@@ -2887,18 +2731,9 @@ export class DatabaseService {
     if (sessionIds.length === 0) return;
     
     const placeholders = sessionIds.map(() => '?').join(',');
-    // idle_since = COALESCE(idle_since, updated_at) — the sweep stamps LAST KNOWN
-    // ACTIVITY, not boot time. These rows were `running`/`pending` when the app
-    // died, so their idle_since is NULL and updated_at holds the last thing the
-    // session actually did; using CURRENT_TIMESTAMP here would tell the board
-    // every crashed session went quiet the instant the app relaunched. The
-    // COALESCE also makes the sweep non-destructive if an already-rested row is
-    // ever passed in.
     this.db.prepare(`
-      UPDATE sessions
-      SET status = 'stopped',
-          idle_since = COALESCE(idle_since, updated_at),
-          updated_at = CURRENT_TIMESTAMP
+      UPDATE sessions 
+      SET status = 'stopped', updated_at = CURRENT_TIMESTAMP 
       WHERE id IN (${placeholders})
     `).run(...sessionIds);
   }
@@ -3250,13 +3085,9 @@ export class DatabaseService {
 
   reorderSessions(sessionOrders: Array<{ id: string; displayOrder: number }>): void {
     // No updated_at bump: a sidebar drag rewrites EVERY session's row in one
-    // transaction. The original symptom — the whole project stamped with one
-    // identical timestamp, collapsing the board's "quiet for N" labels — is now
-    // fixed at the source (migration 119 put those labels on idle_since, which
-    // a display_order write never touches), but the guard stays: a bump here
-    // would still mark every session in the project unviewed at once, and would
-    // still move the sidebar's lastActivity for any BUSY session in the project
-    // (those have idle_since NULL and fall through to updated_at).
+    // transaction, so bumping updated_at here stamped the whole project with
+    // an identical timestamp and collapsed the quick-sessions board's
+    // "quiet for N" labels (idleSince = updated_at) to a single shared value.
     const stmt = this.db.prepare(`
       UPDATE sessions
       SET display_order = ?
@@ -3921,44 +3752,26 @@ export class DatabaseService {
 
   // Session-summary operations (migration 083, session-summary-plan.md §4).
   getSessionSummary(sessionId: string): SessionSummary | undefined {
-    const row = this.db.prepare(`
+    return this.db.prepare(`
       SELECT * FROM session_summaries WHERE session_id = ?
     `).get(sessionId) as SessionSummary | undefined;
-    if (!row) return undefined;
-    // Normalize state/waiting_on on the way out — a row written by a
-    // different binary, an older migration, or a hand-edited DB must not
-    // leak an unvalidated value to callers (migration 121).
-    return { ...row, state: normalizeSummaryState(row.state), waiting_on: normalizeWaitingOn(row.waiting_on) };
   }
 
-  // Single UPSERT: replaces summary/last_turn_id/state/waiting_on with the
-  // freshly computed values, but ACCUMULATES calls_count/cost_usd_total
-  // across every call for the session (§3 cost surfacing). Never touches
-  // `sessions.updated_at` — the activity-clock contract
-  // (sessionUpdatedAtSemantics.test.ts). `state`/`waitingOn` are optional so
-  // existing call sites keep compiling unchanged; omitted means null.
-  upsertSessionSummary(params: {
-    sessionId: string;
-    summary: string;
-    lastTurnId: number;
-    costUsdDelta: number;
-    state?: string | null;
-    waitingOn?: string | null;
-  }): void {
-    const state = normalizeSummaryState(params.state ?? null);
-    const waitingOn = normalizeWaitingOn(params.waitingOn ?? null);
+  // Single UPSERT: replaces summary/last_turn_id with the freshly computed
+  // values, but ACCUMULATES calls_count/cost_usd_total across every call for
+  // the session (§3 cost surfacing). Never touches `sessions.updated_at` —
+  // the activity-clock contract (sessionUpdatedAtSemantics.test.ts).
+  upsertSessionSummary(params: { sessionId: string; summary: string; lastTurnId: number; costUsdDelta: number }): void {
     this.db.prepare(`
-      INSERT INTO session_summaries (session_id, summary, last_turn_id, calls_count, cost_usd_total, state, waiting_on, updated_at)
-      VALUES (?, ?, ?, 1, ?, ?, ?, datetime('now'))
+      INSERT INTO session_summaries (session_id, summary, last_turn_id, calls_count, cost_usd_total, updated_at)
+      VALUES (?, ?, ?, 1, ?, datetime('now'))
       ON CONFLICT(session_id) DO UPDATE SET
         summary = excluded.summary,
         last_turn_id = excluded.last_turn_id,
         calls_count = calls_count + 1,
         cost_usd_total = cost_usd_total + excluded.cost_usd_total,
-        state = excluded.state,
-        waiting_on = excluded.waiting_on,
         updated_at = datetime('now')
-    `).run(params.sessionId, params.summary, params.lastTurnId, params.costUsdDelta, state, waitingOn);
+    `).run(params.sessionId, params.summary, params.lastTurnId, params.costUsdDelta);
   }
 
   // Append-only per-sitting history sentences (§1), oldest first via id ASC.
@@ -3992,8 +3805,6 @@ export class DatabaseService {
     lastTurnId: number;
     costUsdDelta: number;
     entries: string[];
-    state?: string | null;
-    waitingOn?: string | null;
   }): boolean {
     const persist = this.db.transaction(() => {
       const session = this.db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(params.sessionId);
@@ -4004,8 +3815,6 @@ export class DatabaseService {
         summary: params.summary,
         lastTurnId: params.lastTurnId,
         costUsdDelta: params.costUsdDelta,
-        state: params.state,
-        waitingOn: params.waitingOn,
       });
       this.appendSessionSummaryEntries(params.sessionId, params.entries);
       return true;

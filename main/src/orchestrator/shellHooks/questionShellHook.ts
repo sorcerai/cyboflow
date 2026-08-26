@@ -63,12 +63,6 @@ export interface QuestionHookOptions {
   socketPath: string;
   /** Resolved CYBOFLOW_RUN_ID (workflow_runs.id). */
   runId: string;
-  /**
-   * Resolved CYBOFLOW_ORCH_TOKEN — this run's bearer token (orchAuthToken.ts).
-   * Without it the orchestrator refuses to bind `runId` and closes the socket,
-   * which this hook treats like any other unreachable-orchestrator path.
-   */
-  token?: string;
   /** Logger for connect/disconnect/timeout diagnostics (stderr-backed in prod). */
   logger: QuestionHookLogger;
   /** Socket factory (defaults to net.createConnection). */
@@ -90,8 +84,6 @@ const ACK_TIMEOUT_MS = 3000;
 export interface QuestionHookEnv {
   socketPath: string;
   runId: string;
-  /** Absent when the spawn predates per-run tokens or auth is disabled. */
-  token?: string;
 }
 
 /**
@@ -103,10 +95,7 @@ export function resolveQuestionHookEnv(env: Record<string, string | undefined>):
   const socketPath = env.CYBOFLOW_ORCH_SOCKET;
   const runId = env.CYBOFLOW_RUN_ID;
   if (!socketPath || !runId) return null;
-  // The token key is omitted rather than set to undefined so the resolved shape
-  // stays byte-identical for a spawn that carries none.
-  const token = env.CYBOFLOW_ORCH_TOKEN;
-  return { socketPath, runId, ...(token ? { token } : {}) };
+  return { socketPath, runId };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +109,7 @@ export function resolveQuestionHookEnv(env: Record<string, string | undefined>):
  * the hard timeout) simply resolves once the attempt is over.
  */
 export function runQuestionHook(opts: QuestionHookOptions): Promise<void> {
-  const { socketPath, runId, token, logger } = opts;
+  const { socketPath, runId, logger } = opts;
   const connect = opts.connect ?? ((p: string) => net.createConnection(p));
 
   const requestId = `question-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
@@ -154,12 +143,7 @@ export function runQuestionHook(opts: QuestionHookOptions): Promise<void> {
 
     socket.on('connect', () => {
       logger.debug(`[Cyboflow Question hook] connected to orchestrator (run ${runId})`);
-      const line = JSON.stringify({
-        type: 'interactive-question-open',
-        requestId,
-        runId,
-        ...(token !== undefined ? { token } : {}),
-      }) + '\n';
+      const line = JSON.stringify({ type: 'interactive-question-open', requestId, runId }) + '\n';
       socket.write(line);
     });
 
@@ -239,12 +223,7 @@ export async function main(): Promise<void> {
       );
       return;
     }
-    await runQuestionHook({
-      socketPath: env.socketPath,
-      runId: env.runId,
-      token: env.token,
-      logger: stderrLogger,
-    });
+    await runQuestionHook({ socketPath: env.socketPath, runId: env.runId, logger: stderrLogger });
   } catch (err) {
     stderrLogger.error(
       `[Cyboflow Question hook] unexpected error — proceeding: ${err instanceof Error ? err.message : String(err)}`,

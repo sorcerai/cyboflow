@@ -6,36 +6,6 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-## [0.2.7] — 2026-08-25
-
-### Added
-
-- **Session triage board.** The flat quick-session board becomes triage groups: the summarizer returns a triage state `{state, waiting_on}` on new `session_summaries` columns (migration 121), rows get kick-free triage enrichment, and inline session rename now works on both the triage-board rows and the sidebar rail (with a click-away dismiss that no longer opens the session).
-- **Per-model usage buckets.** The Claude card surfaces per-model weekly buckets and extra-usage credits, hiding the extra-usage row for an account with no credits.
-- **Idle-since quiet clock.** Sessions persist `idle_since` at the busy→resting transition (migration 119, rows already at rest backfilled), and the quick-session board plus the sidebar activity clock read it instead of `updated_at`.
-- **Renderer sandbox.** The renderer runs sandboxed via an esbuild-bundled preload, and Monaco is self-hosted so `cdn.jsdelivr.net` drops from the production CSP.
-- **orch.sock hardening.** Per-run bearer tokens and owner-only permissions on the orchestrator socket.
-- **Onboarding default-agent prompt.** When onboarding activates several agents, cyboflow asks which to default to; each provider names its structured runtime with a `default_runtime` step slug.
-- **One MCP tool registry.** cyboflow's MCP tool declaration, validation, and dispatch now derive from a single registry (the OMP gate tool-list tripwire points at it).
-
-### Changed
-
-- The legacy `ipcMain.handle` surface is frozen — new IPC goes through tRPC (enforced by test).
-- Duplicate migration prefixes are blocked and same-prefix files ordered deterministically; the orchestrator standalone-typecheck invariant is enforced mechanically.
-- The opaque `other` errorClass is split with a shape + digest fingerprint.
-
-### Fixed
-
-- **SQLite timestamp parsing.** A family of unzoned-timestamp fixes: `parseTimestamp` (main and frontend) normalizes unzoned SQLite values and guards on the value's shape rather than the presence of a `T`; `formatDistanceToNow`, the wizard workflow row, and the sidebar activity clock all parse as UTC; and the polled Claude percentage survives a jittered reset timestamp.
-- The migration runner is fail-closed with per-statement idempotence.
-- Three substrate-dispatch bugs — stop, cleanup, and delete routing.
-- One-shot SDK queries are restricted with `tools`, not `allowedTools`.
-- A failed eager REPL spawn surfaces instead of a blank terminal.
-- Blocking findings surface in the run's pending-input strip.
-- Plugin install records fold into one gallery card per plugin id, with version and install stats kept as unbreakable units.
-- OMP fleet supervisor runtime.
-- CI: darwin-only `afterSign` cases are skipped off macOS and homed on the macOS runner; better-sqlite3 flips to the Electron ABI before the smoke tier; the unit-test job timeout rises 10 → 25 minutes; deterministic onboarding-scrim marker for the E2E boot helper.
-
 ## [0.2.6] — 2026-08-24
 
 ### Added

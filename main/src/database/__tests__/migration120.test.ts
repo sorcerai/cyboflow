@@ -1,5 +1,5 @@
 /**
- * Migration 122_agent_runtime_omp_fleet.sql — admitting 'omp-fleet'.
+ * Migration 120_widen_agent_runtime_pi.sql — admitting the pi runtimes.
  *
  * The regression this file exists to prevent: an earlier attempt shipped the
  * widening as a NEW file numbered 101 (a gap below the already-released 103)
@@ -10,7 +10,7 @@
  * CHECK lists from memory, silently UN-widening 'omp-sdk'/'omp-pty'.
  *
  * So the tests below run the REAL upgrade a shipped-release user performs: a DB is built
- * by a DatabaseService whose migrations dir omits 122 ONLY (103 and 104 are
+ * by a DatabaseService whose migrations dir omits 120 ONLY (103 and 104 are
  * present, exactly as they are on a shipped install), rows are seeded, and a
  * second DatabaseService pointed at the full dir boots on the same file.
  *
@@ -23,9 +23,9 @@
  *      adds imperatively and no .sql file lists.
  *   5. Indexes, triggers and FK edges are unchanged and foreign_key_check clean.
  *   6. The deliberate narrowings hold: omp-fleet is rejected on the two tables
- *      122 does not widen, and a bogus runtime is still rejected everywhere.
+ *      120 does not widen, and a bogus runtime is still rejected everywhere.
  *   7. The fresh-install path lands the same constraints.
- *   8. Re-applying 122 after a cleared ledger marker is a harmless no-op.
+ *   8. Re-applying 120 after a cleared ledger marker is a harmless no-op.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type BetterSqlite3 from 'better-sqlite3';
@@ -35,13 +35,13 @@ import { join } from 'node:path';
 import { DatabaseService } from '../database';
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations');
-const MIGRATION_122 = '122_agent_runtime_omp_fleet.sql';
+const MIGRATION_120 = '120_widen_agent_runtime_pi.sql';
 
 let tmpDir: string;
 let dbPath: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), 'cyboflow-migration122-'));
+  tmpDir = mkdtempSync(join(tmpdir(), 'cyboflow-migration120-'));
   dbPath = join(tmpDir, 'test.db');
 });
 
@@ -50,16 +50,16 @@ afterEach(() => {
 });
 
 /**
- * A migrations dir holding every real migration EXCEPT 122 — i.e. a shipped
+ * A migrations dir holding every real migration EXCEPT 120 — i.e. a shipped
  * 0.2.3 install, with 103 and 104 already applied. This is the distinction that
  * matters: excluding everything at-or-above the new file's number (as the 101
  * attempt's own test did) fabricates a pre-state that no user is ever in.
  */
-function migrationsDirWithout122(): string {
-  const dir = join(tmpDir, 'migrations-pre-122');
+function migrationsDirWithout120(): string {
+  const dir = join(tmpDir, 'migrations-pre-120');
   mkdirSync(dir);
   for (const name of readdirSync(MIGRATIONS_DIR)) {
-    if (name === MIGRATION_122) continue;
+    if (name === MIGRATION_120) continue;
     if (!/^\d{3}_.*\.sql$/.test(name)) continue;
     copyFileSync(join(MIGRATIONS_DIR, name), join(dir, name));
   }
@@ -75,7 +75,7 @@ function openAt(migrationsDir: string): DatabaseService {
 
 /** Seed the rows a 0.2.3 OMP user actually has, plus the legacy baseline. */
 function seedRows(db: BetterSqlite3.Database): void {
-  db.prepare(`INSERT INTO projects (id, name, path) VALUES (1, 'Proj', '/tmp/p122')`).run();
+  db.prepare(`INSERT INTO projects (id, name, path) VALUES (1, 'Proj', '/tmp/p120')`).run();
   db.prepare(
     `INSERT INTO workflows (id, project_id, name, spec_json) VALUES ('wf-1', 1, 'sprint', '{}')`,
   ).run();
@@ -98,6 +98,17 @@ function seedRows(db: BetterSqlite3.Database): void {
   );
   insertRun.run('run-claude', 'claude', 'claude-sdk');
   insertRun.run('run-omp', 'omp', 'omp-sdk');
+
+  // The ONE table 120 recreates via DROP TABLE — seed it so the snapshot
+  // proves row/column/index/FK survival through the recreate.
+  db.prepare(
+    `INSERT INTO agent_invocations (agent_invocation_id, run_id, step_id, agent_provider, agent_runtime)
+     VALUES ('inv-seed-1', 'run-claude', 'step-1', 'codex', 'codex-sdk')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO agent_invocations (agent_invocation_id, run_id, step_id, agent_provider, agent_runtime, panel_id)
+     VALUES ('inv-seed-2', 'run-claude', 'step-2', 'omp', 'omp-pty', 'panel-7')`,
+  ).run();
 }
 
 function allRows(db: BetterSqlite3.Database, table: string): Array<Record<string, unknown>> {
@@ -142,7 +153,7 @@ interface Snapshot {
   fks: Record<string, string[]>;
 }
 
-const TARGET_TABLES = ['sessions', 'workflow_runs'] as const;
+const TARGET_TABLES = ['sessions', 'workflow_runs', 'agent_invocations'] as const;
 
 function snapshot(db: BetterSqlite3.Database): Snapshot {
   const snap: Snapshot = { rows: {}, columns: {}, objects: {}, fks: {} };
@@ -155,16 +166,16 @@ function snapshot(db: BetterSqlite3.Database): Snapshot {
   return snap;
 }
 
-/** Migrate to the shipped pre-122 state, seed, snapshot; then boot with 122. */
-function upgradeThrough122(): { db: BetterSqlite3.Database; before: Snapshot; svc: DatabaseService } {
-  const pre122 = migrationsDirWithout122();
-  // Two pre-122 boots, not one: initializeSchema() reads PRAGMA table_info(sessions)
+/** Migrate to the shipped pre-120 state, seed, snapshot; then boot with 120. */
+function upgradeThrough120(): { db: BetterSqlite3.Database; before: Snapshot; svc: DatabaseService } {
+  const pre120 = migrationsDirWithout120();
+  // Two pre-120 boots, not one: initializeSchema() reads PRAGMA table_info(sessions)
   // before schema.sql has created the table, so its imperative
   // "ALTER TABLE sessions ADD COLUMN status_message" only lands on the SECOND
-  // launch. Settling that here keeps the snapshot diff about 122 alone — and
+  // launch. Settling that here keeps the snapshot diff about 120 alone — and
   // makes `status_message` present in the pre-state, which is the whole point.
-  openAt(pre122).close();
-  const pre = openAt(pre122);
+  openAt(pre120).close();
+  const pre = openAt(pre120);
   seedRows(pre.getDb());
   const before = snapshot(pre.getDb());
   pre.close();
@@ -200,16 +211,18 @@ function tryRun(db: BetterSqlite3.Database, id: string, provider: string, runtim
   }
 }
 
-describe('Migration 122: omp-fleet admitted on the session + workflow-run runtime CHECKs', () => {
-  it('(a) makes omp-fleet storable on sessions and workflow_runs', () => {
-    const { db, svc } = upgradeThrough122();
+describe('Migration 120: the native pi runtimes admitted on sessions + workflow_runs', () => {
+  it('(a) makes the fleet and pi runtimes storable on sessions and workflow_runs', () => {
+    const { db, svc } = upgradeThrough120();
     expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
-    expect(tryRun(db, 'run-fleet', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
+    expect(trySession(db, 's-pi-pty', 'pi', 'pi-pty')).toBeNull();
+    expect(tryRun(db, 'run-pi', 'pi', 'pi-sdk')).toBeNull();
     svc.close();
   });
 
   it("(b) preserves 103's widenings — omp-sdk and omp-pty stay storable on sessions", () => {
-    const { db, svc } = upgradeThrough122();
+    const { db, svc } = upgradeThrough120();
     expect(trySession(db, 's-new-omp-sdk', 'omp', 'omp-sdk')).toBeNull();
     expect(trySession(db, 's-new-omp-pty', 'omp', 'omp-pty')).toBeNull();
     expect(tryRun(db, 'run-new-omp-sdk', 'omp', 'omp-sdk')).toBeNull();
@@ -217,7 +230,7 @@ describe('Migration 122: omp-fleet admitted on the session + workflow-run runtim
   });
 
   it('(c) preserves every pre-existing row verbatim, including the omp-sdk session', () => {
-    const { db, before, svc } = upgradeThrough122();
+    const { db, before, svc } = upgradeThrough120();
     for (const t of TARGET_TABLES) {
       expect(allRows(db, t)).toEqual(before.rows[t]);
     }
@@ -228,19 +241,19 @@ describe('Migration 122: omp-fleet admitted on the session + workflow-run runtim
   });
 
   it('(d) loses no column — status_message (added imperatively, listed in no .sql) survives', () => {
-    const { db, before, svc } = upgradeThrough122();
+    const { db, before, svc } = upgradeThrough120();
     for (const t of TARGET_TABLES) {
       expect(columnNames(db, t)).toEqual(before.columns[t]);
     }
     expect(columnNames(db, 'sessions')).toContain('status_message');
     // The temp parking columns must not leak into the final shape.
-    expect(columnNames(db, 'sessions')).not.toContain('agent_runtime_widen_122');
-    expect(columnNames(db, 'workflow_runs')).not.toContain('agent_runtime_widen_122');
+    expect(columnNames(db, 'sessions')).not.toContain('agent_runtime_widen_120');
+    expect(columnNames(db, 'workflow_runs')).not.toContain('agent_runtime_widen_120');
     svc.close();
   });
 
   it('(e) leaves indexes, triggers and foreign keys untouched', () => {
-    const { db, before, svc } = upgradeThrough122();
+    const { db, before, svc } = upgradeThrough120();
     for (const t of TARGET_TABLES) {
       expect(schemaObjectNames(db, t)).toEqual(before.objects[t]);
       expect(fkEdges(db, t)).toEqual(before.fks[t]);
@@ -249,47 +262,55 @@ describe('Migration 122: omp-fleet admitted on the session + workflow-run runtim
     svc.close();
   });
 
-  it('(f) keeps omp-fleet off workflow_variants and agent_invocations, and still rejects bogus runtimes', () => {
-    const { db, svc } = upgradeThrough122();
+  it('(f) variants admit pi-sdk but reject pi-pty; invocations admit both; bogus rejected', () => {
+    const { db, svc } = upgradeThrough120();
+    // workflow_variants mirrors the LAUNCHABLE list: pi-sdk in, pi-pty out.
+    db.prepare(
+      `INSERT INTO workflow_variants (id, workflow_id, label, agent_provider, agent_runtime)
+       VALUES ('wfv-pi', 'wf-1', 'pi-arm', 'pi', 'pi-sdk')`,
+    ).run();
     expect(() =>
       db
         .prepare(
           `INSERT INTO workflow_variants (id, workflow_id, label, agent_provider, agent_runtime)
-           VALUES ('wfv-fleet', 'wf-1', 'fleet-arm', 'omp', 'omp-fleet')`,
+           VALUES ('wfv-pty', 'wf-1', 'pty-arm', 'pi', 'pi-pty')`,
         )
         .run(),
     ).toThrow(/CHECK constraint failed/);
-    expect(() =>
-      db
-        .prepare(
-          `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
-           VALUES ('inv-fleet', 'run-claude', 'omp', 'omp-fleet')`,
-        )
-        .run(),
-    ).toThrow(/CHECK constraint failed/);
-    expect(trySession(db, 's-bogus', 'omp', 'omp-telepathy')).toMatch(/CHECK constraint failed/);
-    expect(tryRun(db, 'run-bogus', 'omp', 'omp-telepathy')).toMatch(/CHECK constraint failed/);
+    // agent_invocations records the transport that actually served a turn;
+    // omp-pty is admitted there historically, so pi-pty matches.
+    db.prepare(
+      `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
+       VALUES ('inv-pi-sdk', 'run-claude', 'pi', 'pi-sdk')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO agent_invocations (agent_invocation_id, run_id, agent_provider, agent_runtime)
+       VALUES ('inv-pi-pty', 'run-claude', 'pi', 'pi-pty')`,
+    ).run();
+    expect(trySession(db, 's-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
+    expect(tryRun(db, 'run-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
     svc.close();
   });
 
   it('(g) lands the same constraints on a fresh install', () => {
     const svc = openAt(MIGRATIONS_DIR);
     const db = svc.getDb();
-    db.prepare(`INSERT INTO projects (id, name, path) VALUES (1, 'Proj', '/tmp/p122f')`).run();
+    db.prepare(`INSERT INTO projects (id, name, path) VALUES (1, 'Proj', '/tmp/p120f')`).run();
     db.prepare(
       `INSERT INTO workflows (id, project_id, name, spec_json) VALUES ('wf-1', 1, 'sprint', '{}')`,
     ).run();
     expect(trySession(db, 's-fleet', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db, 's-pi-sdk', 'pi', 'pi-sdk')).toBeNull();
     expect(trySession(db, 's-sdk', 'omp', 'omp-sdk')).toBeNull();
-    expect(tryRun(db, 'run-fleet', 'omp', 'omp-fleet')).toBeNull();
-    expect(trySession(db, 's-bogus', 'omp', 'omp-telepathy')).toMatch(/CHECK constraint failed/);
+    expect(tryRun(db, 'run-pi', 'pi', 'pi-sdk')).toBeNull();
+    expect(trySession(db, 's-bogus', 'pi', 'pi-telepathy')).toMatch(/CHECK constraint failed/);
     svc.close();
   });
 
-  it('(h) re-applying 122 after a cleared ledger marker is a harmless no-op', () => {
-    const { db, before, svc } = upgradeThrough122();
+  it('(h) re-applying 120 after a cleared ledger marker is a harmless no-op', () => {
+    const { db, before, svc } = upgradeThrough120();
     db.prepare('DELETE FROM user_preferences WHERE key = ?').run(
-      `file_migration_applied:${MIGRATION_122}`,
+      `file_migration_applied:${MIGRATION_120}`,
     );
     svc.close();
 
@@ -300,19 +321,19 @@ describe('Migration 122: omp-fleet admitted on the session + workflow-run runtim
       expect(columnNames(db2, t)).toEqual(before.columns[t]);
     }
     expect(trySession(db2, 's-fleet-again', 'omp', 'omp-fleet')).toBeNull();
+    expect(trySession(db2, 's-pi-again', 'pi', 'pi-sdk')).toBeNull();
     again.close();
   });
 
-  it('(i) no stale pre-renumber fleet migration exists in the migrations dir', () => {
-    // The ledger is keyed by FILENAME, so a resurrected 105_/107_/119_ copy of this
-    // widening would apply AGAIN after 122 — against an already-widened schema
+  it('(i) no stale pre-renumber pi-or-fleet migration exists in the migrations dir', () => {
+    // The ledger is keyed by FILENAME, so a resurrected 105_/107_ copy of this
+    // widening would apply AGAIN after 120 — against an already-widened schema
     // where its add/copy/drop sequence is still idempotent, but its existence
     // means two files claim the same widening and the next renumber war starts
     // here. Guard the invariant at the directory level.
     const names = readdirSync(MIGRATIONS_DIR);
-    expect(names).toContain(MIGRATION_122);
+    expect(names).toContain(MIGRATION_120);
     expect(names).not.toContain('105_agent_runtime_omp_fleet.sql');
     expect(names).not.toContain('107_agent_runtime_omp_fleet.sql');
-    expect(names).not.toContain('119_agent_runtime_omp_fleet.sql');
   });
 });

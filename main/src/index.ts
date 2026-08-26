@@ -59,9 +59,13 @@ import {
   isCodexPtyManagerLike,
   isCodexSdkManagerLike,
   isOmpPtyManagerLike,
+  isPiPtyManagerLike,
+  isPiSdkManagerLike,
   isOmpSdkManagerLike,
   type CodexPtyManagerLike,
   type OmpPtyManagerLike,
+  type PiPtyManagerLike,
+  type PiSdkManagerLike,
 } from './services/cliManagerFactory';
 import { AbstractCliManager } from './services/panels/cli/AbstractCliManager';
 import { panelManager } from './services/panelManager';
@@ -356,9 +360,6 @@ for (const key of [
   'CYBOFLOW_RUN_ID',
   'CYBOFLOW_SESSION_ID',
   'CYBOFLOW_ORCH_SOCKET',
-  // A hosting instance's bearer token is not only stale here, it is a live
-  // credential for ANOTHER app instance's run — strip it hardest of all.
-  'CYBOFLOW_ORCH_TOKEN',
   'CYBOFLOW_RUN_ARTIFACTS_DIR',
   'CYBOFLOW_SUBSTRATE',
   'CYBOFLOW_EXECUTION_MODEL',
@@ -585,6 +586,8 @@ let cliManagerFactory: CliManagerFactory;
 let defaultCliManager: AbstractCliManager;
 let codexPtyManager: CodexPtyManagerLike;
 let ompPtyManager: OmpPtyManagerLike;
+let piPtyManager: PiPtyManagerLike;
+let piSdkManager: PiSdkManagerLike;
 let gitDiffManager: GitDiffManager;
 let gitStatusManager: GitStatusManager;
 let executionTracker: ExecutionTracker;
@@ -1100,13 +1103,9 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      // The sandboxed preload loader resolves only 'electron' and a few node
-      // builtins, so preload.js is esbuild-bundled (scripts/bundle-preload.mjs,
-      // wired into build:main) with '@sentry/electron/preload', 'trpc-electron/main'
-      // and the shared/* siblings INLINED and 'electron' left external. That script
-      // also fails the build if a future import would reintroduce an unresolvable
-      // runtime require — which would silently take the whole bridge down here.
-      sandbox: true,
+      // Required: preload uses require('trpc-electron/main') which the sandboxed
+      // preload loader rejects (only 'electron' and relative paths resolve there).
+      sandbox: false,
     },
     ...(process.platform === 'darwin' ? {
       titleBarStyle: 'hiddenInset',
@@ -1492,10 +1491,9 @@ function runSchemaVersionGate(): boolean {
 }
 
 /**
- * Stand up every service. Resolves false when boot was aborted at one of the two
- * database gates — a migration that failed to apply, or the schema-version gate —
- * in which case NOTHING further was constructed and the caller must return
- * immediately.
+ * Stand up every service. Resolves false when boot was aborted at the
+ * schema-version gate, in which case NOTHING further was constructed and the
+ * caller must return immediately.
  */
 async function initializeServices(): Promise<boolean> {
   configManager = new ConfigManager();
@@ -1549,39 +1547,7 @@ async function initializeServices(): Promise<boolean> {
   }
 
   databaseService = new DatabaseService(dbPath);
-  try {
-    databaseService.initialize();
-  } catch (err) {
-    // Fail-closed migration gate. A .sql migration that did not apply leaves the
-    // database missing whatever it was supposed to add, and the code below is
-    // about to run against it — which surfaces as scattered "no such column"
-    // failures that trace back to nothing. Stop here, loudly, while aborting is
-    // still free: nothing cross-instance (above all the orch socket) is bound
-    // yet, exactly as at the schema-version gate below.
-    const error = err instanceof Error ? err : new Error(String(err));
-    logger.error(`[Main] Database migration failed — refusing to boot: ${error.message}`);
-    captureSeamError('boot-migration-failed', error, { platform: process.platform });
-    dialog.showMessageBoxSync({
-      type: 'error',
-      buttons: ['Quit'],
-      defaultId: 0,
-      noLink: true,
-      title: 'Cyboflow',
-      message: 'Cyboflow could not update its database',
-      detail:
-        `A database migration failed, so Cyboflow cannot safely open your data:\n\n${error.message}\n\n` +
-        'Nothing was changed — the failed migration was rolled back. Updating to ' +
-        'the latest version of Cyboflow usually resolves this; if it persists, ' +
-        'please report it with the log at ~/.cyboflow/logs.',
-    });
-    try {
-      databaseService.close();
-    } catch {
-      // Already failing; a close error must not mask the migration error.
-    }
-    app.quit();
-    return false;
-  }
+  databaseService.initialize();
 
   // The DB is open and its pre-migration user_version is known — gate NOW, while
   // aborting is still free. Everything below this line either owns cross-instance
@@ -1699,6 +1665,28 @@ async function initializeServices(): Promise<boolean> {
     throw new Error('[Main] cliManagerFactory returned a manager without the OMP PTY seams for omp-pty');
   }
   ompPtyManager = createdOmpPtyManager;
+
+  const createdPiPtyManager = await cliManagerFactory.createManager('pi-pty', {
+    sessionManager,
+    logger,
+    configManager,
+    skipValidation: true,
+  });
+  if (!isPiPtyManagerLike(createdPiPtyManager)) {
+    throw new Error('[Main] cliManagerFactory returned a manager without the Pi PTY seams for pi-pty');
+  }
+  piPtyManager = createdPiPtyManager;
+
+  const createdPiSdkManager = await cliManagerFactory.createManager('pi-sdk', {
+    sessionManager,
+    logger,
+    configManager,
+    skipValidation: true,
+  });
+  if (!isPiSdkManagerLike(createdPiSdkManager)) {
+    throw new Error('[Main] cliManagerFactory returned a manager without the Pi SDK seams for pi-sdk');
+  }
+  piSdkManager = createdPiSdkManager;
   gitDiffManager = new GitDiffManager(logger);
   gitStatusManager = new GitStatusManager(sessionManager, worktreeManager, gitDiffManager, logger);
   executionTracker = new ExecutionTracker(sessionManager, gitDiffManager);
@@ -1720,17 +1708,6 @@ async function initializeServices(): Promise<boolean> {
   // ---------------------------------------------------------------------------
   const cyboflowLogger = makeLoggerLike(logger);
   const cyboflowDb = makeDatabaseLike(databaseService);
-  // Resolved once here and threaded into every orchestrator SDK-query factory
-  // below (makeRevisionQuery, makeVerificationAgentQuery, makeRunbookDraftQuery,
-  // makeEvalJudgeQuery, makePairwiseJudgeQuery, makeSdkStructuredQuery,
-  // makeSdkTextQuery) as their leading `claudeExecutablePath` argument, and into
-  // `SessionSummarizerDeps` below. `resolveClaudeExecutablePath()` is a pure,
-  // process-lifetime-constant lookup (packaged-build asar workaround; `undefined`
-  // in dev), so resolving it once at boot and passing the value down keeps the
-  // orchestrator tree itself free of the `services/*` import — the whole point of
-  // this injection (see `orchestrator/verify/verificationAgentQuery.ts`'s module
-  // doc for why that layering matters).
-  const claudeExecutablePath = resolveClaudeExecutablePath();
   // OMP fleet runtime (omp-phase4-coexistence-adr.md §5): constructed ONLY when
   // the bridge command config resolved at boot. Unresolved ⇒ undefined ⇒ the
   // dispatch seams + picker omit OMP entirely — a half-configured bridge never
@@ -1867,7 +1844,7 @@ async function initializeServices(): Promise<boolean> {
       },
       {
         db: cyboflowDb,
-        queryFn: makeRevisionQuery(claudeExecutablePath, cyboflowLogger),
+        queryFn: makeRevisionQuery(cyboflowLogger),
         feedbackRouter: FeedbackRouter.getInstance(),
         applyTaskChange: (projectId, change) =>
           TaskChangeRouter.getInstance().applyChange(projectId, change),
@@ -2366,7 +2343,7 @@ async function initializeServices(): Promise<boolean> {
   const verificationAgentRunner = new VerificationAgentRunner({
     // The SAME binary the capability gate measured — see verifyPeekabooPath.
     peekabooBin: verifyPeekabooPath,
-    query: makeVerificationAgentQuery(claudeExecutablePath, cyboflowLogger),
+    query: makeVerificationAgentQuery(cyboflowLogger),
     // Codex runtime for a codex-pinned/inherited visual-verify agent; absent Codex CLI fails open to skipped.
     codexQuery: makeCodexVerificationAgentQuery(cyboflowLogger),
     // The workflow-defined 'visual-verify' agent + the run's provider/model, for the
@@ -2493,7 +2470,7 @@ async function initializeServices(): Promise<boolean> {
   // ------------------------------------------------------------------------
   const runbookBootstrapStamps = new RunbookBootstrapStampStore(cyboflowDb, cyboflowLogger);
   const runbookBootstrapSuppression = new BootstrapSuppressionStore(cyboflowDb, cyboflowLogger);
-  const runbookDraftQuery = makeRunbookDraftQuery(claudeExecutablePath, cyboflowLogger);
+  const runbookDraftQuery = makeRunbookDraftQuery(cyboflowLogger);
 
   const runbookBootstrapRunner = (
     args: Parameters<typeof runRunbookBootstrap>[0],
@@ -2755,7 +2732,7 @@ async function initializeServices(): Promise<boolean> {
     }
   };
   const claudeJudge = new ClaudeJudge({
-    structuredQuery: makeEvalJudgeQuery(claudeExecutablePath, cyboflowLogger),
+    structuredQuery: makeEvalJudgeQuery(cyboflowLogger),
     logger: cyboflowLogger,
   });
   const codexJudge = new CodexJudge({
@@ -2828,7 +2805,7 @@ async function initializeServices(): Promise<boolean> {
   // query fn would cross-contaminate the two panels' model provenance. No timeoutMs:
   // the factory already defaults to CODEX_EVAL_JUDGE_TIMEOUT_MS.
   const claudePairwiseJudge = new ClaudePairwiseJudge({
-    structuredQuery: makePairwiseJudgeQuery(claudeExecutablePath, cyboflowLogger),
+    structuredQuery: makePairwiseJudgeQuery(cyboflowLogger),
     logger: cyboflowLogger,
   });
   const codexPairwiseJudge = new CodexPairwiseJudge({
@@ -3140,6 +3117,8 @@ async function initializeServices(): Promise<boolean> {
     { lane: 'codex-pty', manager: codexPtyManager },
     { lane: 'omp-sdk', manager: createdOmpSdkManager },
     { lane: 'omp-pty', manager: ompPtyManager },
+    { lane: 'pi-pty', manager: piPtyManager },
+    { lane: 'pi-sdk', manager: piSdkManager },
   ];
   const managerByLane = new Map<PanelLane, AbstractCliManager>(
     laneManagers.map(({ lane, manager }) => [lane, manager]),
@@ -3464,8 +3443,8 @@ async function initializeServices(): Promise<boolean> {
       ctx: MonitorContext,
       injectEvent: (event: ClaudeStreamEvent) => void,
     ) => MonitorSession | undefined) => {
-      const structuredQuery = makeSdkStructuredQuery(claudeExecutablePath, cyboflowLogger);
-      const textQuery = makeSdkTextQuery(claudeExecutablePath, cyboflowLogger);
+      const structuredQuery = makeSdkStructuredQuery(cyboflowLogger);
+      const textQuery = makeSdkTextQuery(cyboflowLogger);
       const history = new DefaultHistoryReader(cyboflowDb, cyboflowLogger);
       // Also published to the module-scoped buildMonitorSession holder so the
       // lazy monitor rehydrator (wired in the tRPC dep-wiring block) builds
@@ -4059,7 +4038,7 @@ async function initializeServices(): Promise<boolean> {
       sdkQueryLoader: loadSdkQuery,
       // Pin the concrete snapshot id; the alias table only applies via the resolver.
       modelId: resolveModelAlias('haiku') ?? 'claude-haiku-4-5',
-      claudeExecutablePath,
+      claudeExecutablePath: resolveClaudeExecutablePath(),
     },
     cyboflowLogger,
   );
@@ -4132,6 +4111,8 @@ async function initializeServices(): Promise<boolean> {
     ompSessionManager,
     ompSdkManager: createdOmpSdkManager,
     ompPtyManager,
+    piSdkManager: createdPiSdkManager,
+    piPtyManager,
     claudeModelCatalogService: new ClaudeModelCatalogService(cyboflowLogger),
     // Live-session close-out seams for quick sessions (IDEA-030): route the
     // session merge/rebase/dismiss handlers through the SubstrateDispatchFacade
@@ -4152,6 +4133,8 @@ async function initializeServices(): Promise<boolean> {
       substrateFacade.registerPtyPanel(runId, panelId, codexPtyManager),
     registerOmpPtyPanel: (runId: string, panelId: string) =>
       substrateFacade.registerPtyPanel(runId, panelId, ompPtyManager),
+    registerPiPtyPanel: (runId: string, panelId: string) =>
+      substrateFacade.registerPtyPanel(runId, panelId, piPtyManager),
     // The SAME provider the Claude managers were injected with above, handed to
     // the IPC layer for the CODEX lanes: those spawn from ipc/ with a
     // caller-supplied runId instead of resolving the gate inside the manager, so

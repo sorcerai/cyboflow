@@ -21,7 +21,6 @@ import { spawn, type ChildProcess } from 'child_process';
 import { findNodeExecutable } from '../../utils/nodeFinder';
 import { electronRunAsNodeGuardEnv } from '../../utils/electronNodeGuard';
 import { resolveMcpServerScriptPath } from './scriptPath';
-import { orchTokenEnv } from '../orchAuthToken';
 import type { LoggerLike } from '../types';
 
 // Re-export for callers that want the status type without importing the class.
@@ -121,17 +120,10 @@ export class McpServerLifecycle {
     // CRITICAL fork-bomb guard: findNodeExecutable() may resolve to the Electron
     // app binary (packaged app, no node on PATH) — spawning it plainly boots a
     // whole new Cyboflow app in an unkillable loop. See electronNodeGuard.
-    // ONE resolution of the run identity, shared by the env var and the bearer
-    // token minted for it — they must never disagree or the socket server
-    // refuses the bind.
-    const orchestratorRunId = this.orchestratorRunIdProvider();
     const env: Record<string, string> = {
       ...this.buildSafeEnv(),
-      CYBOFLOW_RUN_ID: orchestratorRunId,
+      CYBOFLOW_RUN_ID: this.orchestratorRunIdProvider(),
       CYBOFLOW_ORCH_SOCKET: this.socketPath,
-      // Proves to OrchSocketServer that this subprocess really is the run it
-      // claims. In-memory only — never written to any config file.
-      ...orchTokenEnv(orchestratorRunId),
       ...electronRunAsNodeGuardEnv(nodePath),
     };
 
