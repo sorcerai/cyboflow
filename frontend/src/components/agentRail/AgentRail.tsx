@@ -21,13 +21,19 @@
  * layoutStore (same key it always persisted under) so the global ⌘] shortcut
  * can toggle it; width stays local — nothing else needs it.
  */
+import { GUIDED_TARGETS } from '../onboarding/guided/GuidedLeader';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { AgentThreadView } from './AgentThreadView';
 import { useLayoutStore } from '../../stores/layoutStore';
 
-/** Default expanded rail width. */
-const RAIL_DEFAULT_WIDTH = 320;
+/** Default expanded rail width. Wide enough for the thread view's composer
+ * chrome on first run (users who drag it get their own persisted width). */
+const RAIL_DEFAULT_WIDTH = 360;
+/** The previous default. A stored width of exactly this was stamped by the
+ * mount write below, not chosen by anyone, so it does not outrank the current
+ * default. See initialAgentRailWidth. */
+const SUPERSEDED_DEFAULT_WIDTH = 320;
 /** Resize clamp: never shrink below a usable column. */
 const RAIL_MIN_WIDTH = 260;
 /** Resize clamp: cap at the smaller of an absolute ceiling or ~50% of viewport. */
@@ -50,6 +56,16 @@ export function clampAgentRailWidth(w: number): number {
   return Math.max(RAIL_MIN_WIDTH, Math.min(maxAgentRailWidth(), w));
 }
 
+/** The width to open at: a stored width, unless it is the superseded default,
+ * which every existing install holds whether or not its user ever resized. */
+export function initialAgentRailWidth(stored: string | null): number {
+  const parsed = stored !== null ? parseInt(stored, 10) : NaN;
+  if (!Number.isFinite(parsed) || parsed === SUPERSEDED_DEFAULT_WIDTH) {
+    return clampAgentRailWidth(RAIL_DEFAULT_WIDTH);
+  }
+  return clampAgentRailWidth(parsed);
+}
+
 /**
  * Gate predicate for the App.tsx mount: the rail shows on every
  * landing-family surface — everywhere except the session workspace (which
@@ -65,22 +81,17 @@ export function AgentRail() {
   // 'cyboflow.agentRail.collapsed' key as before) so ⌘] can reach it.
   const collapsed = useLayoutStore((s) => s.agentRailCollapsed);
   const handleToggleCollapse = useLayoutStore((s) => s.toggleAgentRail);
-  const [width, setWidth] = useState<number>(() => {
-    const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(WIDTH_KEY) : null;
-    const parsed = saved !== null ? parseInt(saved, 10) : NaN;
-    return clampAgentRailWidth(Number.isFinite(parsed) ? parsed : RAIL_DEFAULT_WIDTH);
-  });
+  const [width, setWidth] = useState<number>(() =>
+    initialAgentRailWidth(typeof localStorage !== 'undefined' ? localStorage.getItem(WIDTH_KEY) : null),
+  );
   const [isResizing, setIsResizing] = useState(false);
   const startXRef = useRef<number>(0);
   const startWidthRef = useRef<number>(0);
 
-  // Persist the chosen width. (Brand-new key — no migrateLocalStorageKey needed.)
-  useEffect(() => {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(WIDTH_KEY, width.toString());
-    }
-  }, [width]);
-
+  // The width is written to storage only from the drag handler below, never
+  // from an effect on [width] — a mount, a React.StrictMode double-mount, or
+  // a viewport change can never stamp the default (or anything else) into
+  // storage; only an actual user drag does.
   const handleResizeDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
@@ -95,7 +106,11 @@ export function AgentRail() {
     // The rail sits on the right, so dragging its LEFT edge leftward (smaller
     // clientX) grows it.
     const deltaX = startXRef.current - e.clientX;
-    setWidth(clampAgentRailWidth(startWidthRef.current + deltaX));
+    const next = clampAgentRailWidth(startWidthRef.current + deltaX);
+    setWidth(next);
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(WIDTH_KEY, String(next));
+    }
   }, []);
 
   const handleResizeUp = useCallback(() => {
@@ -160,7 +175,10 @@ export function AgentRail() {
       />
 
       {/* Header: collapse chevron, glyph mark, title/subtitle, GLOBAL chip. */}
-      <div className="flex items-center gap-2 border-b border-border-primary p-3">
+      <div
+        className="flex items-center gap-2 border-b border-border-primary p-3"
+        data-guided-target={GUIDED_TARGETS.assistantHeader}
+      >
         <button
           type="button"
           data-testid="agent-rail-collapse"

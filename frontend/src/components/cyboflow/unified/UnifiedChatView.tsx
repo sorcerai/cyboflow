@@ -126,6 +126,12 @@ export interface UnifiedChatViewProps {
   bottomSlot?: ReactNode;
   /** Stable id for the (controlled) prompt rail — runId for runs, panelId for quick. */
   railId?: string;
+  /**
+   * Drop the prompt-history rail AND its toggle regardless of width — for hosts
+   * whose column is too purpose-built for it (the onboarding tour's guided
+   * thread box, where the transcript needs the full width).
+   */
+  hidePromptRail?: boolean;
 
   // -- pending sends (optimistic echo) -------------------------------------
   /**
@@ -161,6 +167,7 @@ export function UnifiedChatView({
   renderToolCallExtra,
   bottomSlot,
   railId = 'unified-chat',
+  hidePromptRail = false,
   pendingSends,
   onReopenPending,
 }: UnifiedChatViewProps): ReactElement {
@@ -371,7 +378,7 @@ export function UnifiedChatView({
 
   // Auto-hide the fixed-width (230px) prompt rail when the chat host is too
   // narrow to fit it AND a usable transcript/composer. The host width depends on
-  // the window, the resizable app sidebar, and the 296px right rail, so this is
+  // the window, the resizable app sidebar, and the right rail, so this is
   // measured on the element (ResizeObserver), not a window breakpoint. Below the
   // threshold the rail would squeeze the main column toward 0 (dead composer).
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -388,7 +395,7 @@ export function UnifiedChatView({
     return () => observer.disconnect();
   }, []);
 
-  const showRail = !isInteractive && !hostTooNarrowForRail;
+  const showRail = !isInteractive && !hostTooNarrowForRail && !hidePromptRail;
 
   return (
     <div className="flex h-full" ref={rootRef}>
