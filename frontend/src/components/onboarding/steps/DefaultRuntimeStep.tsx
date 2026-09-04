@@ -33,6 +33,7 @@ const PROVIDER_BLURBS: Record<AgentProvider, string> = {
   codex: 'ChatGPT-authenticated runtime, billed against your existing plan.',
   omp: 'Multi-provider runtime — see its v1 limits in the launch wizard.',
   pi: 'The terminal coding agent OMP forked from — multi-provider models via its own accounts.',
+  agy: 'Google DeepMind Antigravity CLI — multi-modal and reasoning models.',
 };
 
 export function DefaultRuntimeStep({
